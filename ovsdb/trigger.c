@@ -26,6 +26,7 @@
 #include "jsonrpc.h"
 #include "ovsdb.h"
 #include "ovsdb-error.h"
+#include "row-cache.h"
 #include "openvswitch/poll-loop.h"
 #include "server.h"
 #include "transaction.h"
@@ -246,6 +247,16 @@ ovsdb_trigger_try(struct ovsdb_trigger *t, long long int now)
                 t->role, t->id, now - t->created, &t->timeout_msec,
                 &durable, &forwarding_needed, &result);
             if (!txn) {
+                if (result && t->db->disk_store_mode
+                    && !t->waiting_for_data) {
+                    /* In disk-store mode, a failed transaction may be
+                     * due to rows that are still loading from disk.
+                     * Park this trigger and retry after the I/O worker
+                     * pool signals that rows have been loaded. */
+                    json_destroy(result);
+                    t->waiting_for_data = true;
+                    return false;
+                }
                 if (result) {
                     /* Complete.  There was an error but we still represent it
                      * in JSON-RPC as a successful result. */
@@ -256,6 +267,9 @@ ovsdb_trigger_try(struct ovsdb_trigger *t, long long int now)
                 }
                 return false;
             }
+            /* If we were previously parked and now succeeded, clear
+             * the waiting flag. */
+            t->waiting_for_data = false;
 
             if (forwarding_needed) {
                 /* Transaction is good, but we don't need it. */

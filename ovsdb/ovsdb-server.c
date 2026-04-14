@@ -64,6 +64,7 @@
 #include "perf-counter.h"
 #include "ovsdb-util.h"
 #include "worker-pool.h"
+#include "lazy-load.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_server);
@@ -914,10 +915,12 @@ main(int argc, char *argv[])
     /* Create I/O worker pool for async disk loading (Phase 2). */
     io_worker_pool = ovsdb_worker_pool_create(
         OVSDB_IO_WORKER_THREADS, "io-worker");
+    ovsdb_lazy_load_init(io_worker_pool);
 
     main_loop(&server_config, jsonrpc, &all_dbs, unixctl, &remotes,
               run_process, &exiting);
 
+    ovsdb_lazy_load_destroy();
     ovsdb_worker_pool_destroy(io_worker_pool);
     io_worker_pool = NULL;
 

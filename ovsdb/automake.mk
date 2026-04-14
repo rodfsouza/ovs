@@ -14,6 +14,8 @@ ovsdb_libovsdb_la_SOURCES = \
 	ovsdb/execution.c \
 	ovsdb/file.c \
 	ovsdb/file.h \
+	ovsdb/lazy-load.c \
+	ovsdb/lazy-load.h \
 	ovsdb/jsonrpc-server.c \
 	ovsdb/jsonrpc-server.h \
 	ovsdb/log.c \

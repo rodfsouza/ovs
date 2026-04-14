@@ -72,6 +72,9 @@ struct ovsdb_table {
     /* Disk-backed storage (Phase 1).  NULL if disabled. */
     struct ovsdb_row_cache *cache;
     struct ovsdb_disk_store *disk_store;
+
+    /* Back-pointer to owning database (for lazy-load). */
+    struct ovsdb *db;
 };
 
 struct ovsdb_table *ovsdb_table_create(struct ovsdb_table_schema *);

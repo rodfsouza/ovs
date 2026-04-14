@@ -27,6 +27,8 @@
 #include "row.h"
 #include "row-cache.h"
 #include "disk-store.h"
+#include "lazy-load.h"
+#include "ovsdb.h"
 #include "transaction.h"
 
 static void
@@ -306,6 +308,7 @@ ovsdb_table_create(struct ovsdb_table_schema *ts)
     table->log = false;
     table->cache = NULL;
     table->disk_store = NULL;
+    table->db = NULL;
 
     return table;
 }
@@ -372,16 +375,45 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
         }
     }
 
-    /* Cache miss — load from disk store (Phase 1).
-     * Requires both disk_store and cache to be enabled. */
+    /* Disk-store path (Phase 1+2).
+     * Check row state in cache to decide: return cached row,
+     * submit async load, or wait for in-progress load. */
     if (table->disk_store && table->cache) {
-        row = ovsdb_disk_store_read_row(
-            table->disk_store,
-            CONST_CAST(struct ovsdb_table *, table), uuid);
-        if (row) {
-            ovsdb_row_cache_insert(table->cache, row,
-                                   ovsdb_row_count_atoms(row));
-            return row;
+        enum ovsdb_row_state state;
+        state = ovsdb_row_cache_get_state(table->cache, uuid);
+
+        switch (state) {
+        case OVSDB_ROW_CACHED:
+            /* Already loaded — return it. */
+            return ovsdb_row_cache_lookup(table->cache, uuid);
+
+        case OVSDB_ROW_LOADING:
+            /* Load in progress — caller must park. */
+            return NULL;
+
+        case OVSDB_ROW_UNLOADED:
+            /* Submit async load if worker pool available. */
+            if (table->db
+                && ovsdb_lazy_load_request(
+                       table->db,
+                       CONST_CAST(struct ovsdb_table *, table),
+                       uuid)) {
+                ovsdb_row_cache_set_state(
+                    table->cache, uuid, OVSDB_ROW_LOADING);
+                return NULL;  /* Caller must park. */
+            }
+            /* No worker pool — fall back to sync load. */
+            row = ovsdb_disk_store_read_row(
+                table->disk_store,
+                CONST_CAST(struct ovsdb_table *, table),
+                uuid);
+            if (row) {
+                ovsdb_row_cache_insert(
+                    table->cache, row,
+                    ovsdb_row_count_atoms(row));
+                return row;
+            }
+            break;
         }
     }
 

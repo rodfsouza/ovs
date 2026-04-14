@@ -476,7 +476,9 @@ ovsdb_create(struct ovsdb_schema *schema, struct ovsdb_storage *storage)
     if (schema) {
         SHASH_FOR_EACH (node, &schema->tables) {
             struct ovsdb_table_schema *ts = node->data;
-            shash_add(&db->tables, node->name, ovsdb_table_create(ts));
+            struct ovsdb_table *table = ovsdb_table_create(ts);
+            table->db = db;
+            shash_add(&db->tables, node->name, table);
         }
 
         /* Set all the refTables. */
