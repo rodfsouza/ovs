@@ -41,4 +41,10 @@ bool ovsdb_lazy_load_request(struct ovsdb *db,
                              struct ovsdb_table *table,
                              const struct uuid *uuid);
 
+/* Returns true if the worker pool has pending or in-flight load
+ * jobs.  Used by the trigger subsystem to decide whether a failed
+ * transaction should be parked (rows may still be loading) or
+ * completed as a real error (no loads in flight). */
+bool ovsdb_lazy_load_has_pending(void);
+
 #endif /* ovsdb/lazy-load.h */

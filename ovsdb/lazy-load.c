@@ -40,9 +40,15 @@ struct row_load_request {
 };
 
 /* Worker function: runs in a background thread.
- * Reads a single row from the disk store.  The disk store's
- * pread() is thread-safe (each call uses its own fd offset
- * via pread, not lseek+read). */
+ *
+ * Reads a single row from the disk store.  Thread safety:
+ *   - pread() is used for disk I/O (thread-safe, no shared offset).
+ *   - table->disk_store and table->schema are read-only after
+ *     startup and are never modified while the server is running.
+ *     Schema changes (ovsdb_replace) disconnect all clients first,
+ *     draining all in-flight triggers and loads.
+ *   - ovsdb_row_create() accesses table->schema->columns which is
+ *     immutable after ovsdb_create(). */
 static void *
 row_load_worker(void *arg)
 {
@@ -69,11 +75,9 @@ row_load_done(void *result, void *aux)
     if (row) {
         size_t n_atoms = ovsdb_row_count_atoms(row);
 
+        /* Insert sets state to OVSDB_ROW_CACHED automatically. */
         ovsdb_row_cache_insert(req->table->cache, row,
                                n_atoms);
-        ovsdb_row_cache_set_state(req->table->cache,
-                                  &req->uuid,
-                                  OVSDB_ROW_CACHED);
 
         /* Wake the trigger subsystem so parked triggers
          * that were waiting for this row get retried. */
@@ -127,4 +131,10 @@ ovsdb_lazy_load_request(struct ovsdb *db,
                              row_load_worker, req,
                              row_load_done, req);
     return true;
+}
+
+bool
+ovsdb_lazy_load_has_pending(void)
+{
+    return lazy_pool && ovsdb_worker_pool_has_pending(lazy_pool);
 }

@@ -96,6 +96,63 @@ AT_CHECK([grep -c '"error"' stdout], [1], [ignore])
 OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 AT_CLEANUP
 
+AT_SETUP([binary serve - concurrent queries on large binary DB])
+AT_KEYWORDS([ovsdb binary-serve concurrent])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert many rows to exercise the lazy-load path.
+for i in $(seq 1 50); do
+    AT_CHECK([ovsdb-tool transact db \
+      '["ordinals",
+        {"op": "insert",
+         "table": "ordinals",
+         "row": {"number": '$i', "name": "row'$i'"}}]'],
+      [0], [ignore])
+done
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Send multiple queries concurrently.
+for i in 1 2 3 4 5; do
+    ovsdb-client transact unix:db.sock \
+      '["ordinals",
+        {"op": "select",
+         "table": "ordinals",
+         "where": []}]' > result$i.json 2>/dev/null &
+done
+wait
+dnl All should succeed and contain data.
+for i in 1 2 3 4 5; do
+    AT_CHECK([test -s result$i.json])
+    AT_CHECK([grep -c '"row1"' result$i.json], [0], [ignore])
+done
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+AT_SETUP([binary serve - real error not parked indefinitely])
+AT_KEYWORDS([ovsdb binary-serve error])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Send a malformed transaction — this should return an error
+dnl immediately, not park forever.
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "mutate",
+     "table": "ordinals",
+     "where": [["name", "==", "nonexistent"]],
+     "mutations": [["number", "+=", 1]]}]'], [0], [stdout])
+dnl Should complete quickly (not hang) and contain a result.
+AT_CHECK([test -s stdout])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
 AT_SETUP([binary serve - lazy-load C unit tests])
 AT_KEYWORDS([ovsdb binary-serve lazy-load])
 AT_CHECK([ovstest test-lazy-load], [0], [test-lazy-load: ok

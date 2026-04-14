@@ -24,6 +24,7 @@
 #include "file.h"
 #include "openvswitch/json.h"
 #include "jsonrpc.h"
+#include "lazy-load.h"
 #include "ovsdb.h"
 #include "ovsdb-error.h"
 #include "row-cache.h"
@@ -248,11 +249,14 @@ ovsdb_trigger_try(struct ovsdb_trigger *t, long long int now)
                 &durable, &forwarding_needed, &result);
             if (!txn) {
                 if (result && t->db->disk_store_mode
-                    && !t->waiting_for_data) {
+                    && !t->waiting_for_data
+                    && ovsdb_lazy_load_has_pending()) {
                     /* In disk-store mode, a failed transaction may be
                      * due to rows that are still loading from disk.
-                     * Park this trigger and retry after the I/O worker
-                     * pool signals that rows have been loaded. */
+                     * Only park if there are actually loads in flight;
+                     * otherwise this is a real error (constraint
+                     * violation, RBAC, etc.) that should be returned
+                     * to the client. */
                     json_destroy(result);
                     t->waiting_for_data = true;
                     return false;

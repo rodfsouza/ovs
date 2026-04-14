@@ -452,7 +452,12 @@ convert_binary_to_json(const char *db_name,
                   src_name);
     }
 
-    /* Create an in-memory database and replay rows. */
+    /* Create an in-memory database and replay rows.
+     *
+     * Rows are inserted directly into table->rows hmap, bypassing
+     * ovsdb_txn_row_insert() and secondary indexes.  This is safe
+     * because write_standalone_db() serializes from table->rows
+     * without consulting indexes. */
     struct ovsdb *ovsdb = ovsdb_create(
         ovsdb_schema_clone(schema), NULL);
 
