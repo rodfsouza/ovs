@@ -111,7 +111,7 @@ ovsdb_worker_pool_create(size_t n_threads, const char *name)
         char thread_name[16];
 
         snprintf(thread_name, sizeof thread_name,
-                 "%.8s_%"PRIuSIZE, name, i);
+                 "%.11s_%02u", name, (unsigned int) i);
         pool->threads[i] = ovs_thread_create(thread_name,
                                              ovsdb_worker_thread,
                                              pool);
