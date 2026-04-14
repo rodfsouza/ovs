@@ -1,0 +1,7 @@
+AT_BANNER([OVSDB -- disk store unit tests])
+
+AT_SETUP([disk store - C unit tests])
+AT_KEYWORDS([ovsdb disk-store])
+AT_CHECK([ovstest test-disk-store], [0], [test-disk-store: ok
+])
+AT_CLEANUP

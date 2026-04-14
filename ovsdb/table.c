@@ -25,6 +25,8 @@
 #include "ovsdb-parser.h"
 #include "ovsdb-types.h"
 #include "row.h"
+#include "row-cache.h"
+#include "disk-store.h"
 #include "transaction.h"
 
 static void
@@ -302,6 +304,8 @@ ovsdb_table_create(struct ovsdb_table_schema *ts)
     }
     hmap_init(&table->rows);
     table->log = false;
+    table->cache = NULL;
+    table->disk_store = NULL;
 
     return table;
 }
@@ -335,6 +339,13 @@ ovsdb_table_destroy(struct ovsdb_table *table)
         }
         free(table->indexes);
 
+        if (table->cache) {
+            ovsdb_row_cache_destroy(table->cache);
+        }
+        if (table->disk_store) {
+            ovsdb_disk_store_close(table->disk_store);
+        }
+
         ovsdb_table_schema_destroy(table->schema);
         free(table);
     }
@@ -345,8 +356,30 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
 {
     struct ovsdb_row *row;
 
+    /* Fast path: search in-memory rows hmap. */
     HMAP_FOR_EACH_WITH_HASH (row, hmap_node, uuid_hash(uuid), &table->rows) {
         if (uuid_equals(ovsdb_row_get_uuid(row), uuid)) {
+            return row;
+        }
+    }
+
+    /* Check the row cache (Phase 1). */
+    if (table->cache) {
+        row = ovsdb_row_cache_lookup(table->cache, uuid);
+        if (row) {
+            return row;
+        }
+    }
+
+    /* Cache miss — load from disk store (Phase 1).
+     * Requires both disk_store and cache to be enabled. */
+    if (table->disk_store && table->cache) {
+        row = ovsdb_disk_store_read_row(
+            table->disk_store,
+            CONST_CAST(struct ovsdb_table *, table), uuid);
+        if (row) {
+            ovsdb_row_cache_insert(table->cache, row,
+                                   ovsdb_row_count_atoms(row));
             return row;
         }
     }

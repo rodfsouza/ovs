@@ -1,0 +1,49 @@
+AT_BANNER([OVSDB -- standalone snapshot threading])
+
+AT_SETUP([standalone snapshot - non-blocking])
+AT_KEYWORDS([ovsdb snapshot threading])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+OVS_VSWITCHD_START
+dnl Insert enough data to trigger snapshot conditions.
+for i in $(seq 1 200); do
+    AT_CHECK([ovs-vsctl add-port br0 p$i -- \
+              set Interface p$i type=internal], [0])
+done
+dnl Trigger a snapshot by sending an appctl command.
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/compact], [0])
+dnl Verify server remained responsive during snapshot by running
+dnl a command that requires the main loop to process.
+AT_CHECK([ovs-vsctl list-ports br0 | wc -l], [0], [200
+])
+dnl Check logs for the compaction thread message.
+AT_CHECK([grep -c "Compaction thread" ovsdb-server.log], [0], [ignore])
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
+AT_SETUP([standalone snapshot - data integrity after restart])
+AT_KEYWORDS([ovsdb snapshot integrity])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+OVS_VSWITCHD_START
+dnl Insert known data.
+for i in $(seq 1 50); do
+    AT_CHECK([ovs-vsctl add-port br0 port$i -- \
+              set Interface port$i type=internal], [0])
+done
+dnl Trigger compaction to write a clean snapshot.
+AT_CHECK([ovs-appctl -t ovsdb-server ovsdb-server/compact], [0])
+dnl Stop and restart.
+OVS_APP_EXIT_AND_WAIT([ovs-vswitchd])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Restart from the compacted snapshot.
+AT_CHECK([ovsdb-server --detach --no-chdir --pidfile \
+          --remote=punix:$OVS_RUNDIR/db.sock \
+          --unixctl=$OVS_RUNDIR/ovsdb-server.ctl \
+          $OVS_DBDIR/conf.db])
+AT_CHECK([ovs-vswitchd --detach --no-chdir --pidfile \
+          --enable-dummy=override \
+          unix:$OVS_RUNDIR/db.sock])
+dnl Verify all data survived.
+AT_CHECK([ovs-vsctl list-ports br0 | wc -l], [0], [50
+])
+OVS_VSWITCHD_STOP
+AT_CLEANUP

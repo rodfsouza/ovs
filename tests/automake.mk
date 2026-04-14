@@ -489,7 +489,10 @@ tests_ovstest_SOURCES = \
 	tests/test-bitmap.c \
 	tests/test-vconn.c \
 	tests/test-aa.c \
-	tests/test-stopwatch.c
+	tests/test-stopwatch.c \
+	tests/test-disk-store.c \
+	tests/test-row-cache.c \
+	tests/test-worker-pool.c
 
 if !WIN32
 tests_ovstest_SOURCES += \
@@ -502,7 +505,7 @@ tests_ovstest_SOURCES += \
 	tests/test-netlink-policy.c
 endif
 
-tests_ovstest_LDADD = lib/libopenvswitch.la
+tests_ovstest_LDADD = ovsdb/libovsdb.la lib/libopenvswitch.la
 
 noinst_PROGRAMS += tests/test-stream
 tests_test_stream_SOURCES = tests/test-stream.c

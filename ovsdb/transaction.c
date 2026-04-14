@@ -31,6 +31,8 @@
 #include "ovsdb.h"
 #include "ovs-thread.h"
 #include "row.h"
+#include "row-cache.h"
+#include "disk-store.h"
 #include "storage.h"
 #include "table.h"
 #include "uuid.h"
@@ -551,6 +553,48 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
     }
 
     ovsdb_txn_row_log(txn_row);
+
+    /* Write-back to disk store and update cache (Phase 1).
+     * Errors are logged but not propagated; the in-memory
+     * commit has already succeeded at this point. */
+    if (txn_row->table->disk_store) {
+        struct ovsdb_error *ds_err = NULL;
+        if (txn_row->new) {
+            ds_err = ovsdb_disk_store_write_row(
+                txn_row->table->disk_store, txn_row->new);
+        } else if (txn_row->old) {
+            ds_err = ovsdb_disk_store_delete_row(
+                txn_row->table->disk_store,
+                ovsdb_row_get_uuid(txn_row->old));
+        }
+        if (ds_err) {
+            static struct vlog_rate_limit rl
+                = VLOG_RATE_LIMIT_INIT(1, 5);
+            char *s = ovsdb_error_to_string_free(ds_err);
+            VLOG_WARN_RL(&rl, "disk store write-back: %s", s);
+            free(s);
+        }
+    }
+    /* Update cache bookkeeping (Phase 1).
+     *
+     * We do NOT insert txn_row->new into the cache here because
+     * the row is already owned by table->rows hmap.  Double
+     * ownership would cause use-after-free on eviction.
+     *
+     * For deletes, remove from cache so stale entries are not
+     * served.  Unpin any row that was pinned during modify. */
+    if (txn_row->table->cache) {
+        if (txn_row->old) {
+            ovsdb_row_cache_unpin(txn_row->table->cache,
+                                  ovsdb_row_get_uuid(txn_row->old));
+            if (!txn_row->new) {
+                ovsdb_row_cache_remove(
+                    txn_row->table->cache,
+                    ovsdb_row_get_uuid(txn_row->old));
+            }
+        }
+    }
+
     ovsdb_txn_row_prefree(txn_row);
     if (txn_row->new) {
         txn_row->new->n_refs = txn_row->n_refs;
@@ -1523,6 +1567,13 @@ ovsdb_txn_row_modify(struct ovsdb_txn *txn, const struct ovsdb_row *ro_row_,
         }
     } else {
         struct ovsdb_table *table = ro_row->table;
+
+        /* Pin the row in cache to prevent eviction during
+         * the transaction (Phase 1). */
+        if (table->cache) {
+            ovsdb_row_cache_pin(table->cache,
+                                ovsdb_row_get_uuid(ro_row));
+        }
 
         *rw_row = ovsdb_row_clone(ro_row);
         (*rw_row)->n_refs = ro_row->n_refs;

@@ -1,0 +1,7 @@
+AT_BANNER([OVSDB -- worker pool and lazy loading])
+
+AT_SETUP([worker pool - C unit tests])
+AT_KEYWORDS([ovsdb worker-pool])
+AT_CHECK([ovstest test-worker-pool], [0], [test-worker-pool: ok
+])
+AT_CLEANUP

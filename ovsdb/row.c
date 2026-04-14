@@ -175,6 +175,27 @@ ovsdb_row_datum_clone(const struct ovsdb_row *old)
 }
 
 
+/* Returns the total number of atoms across all columns of 'row'.
+ * For map columns, both keys and values are counted. */
+size_t
+ovsdb_row_count_atoms(const struct ovsdb_row *row)
+{
+    const struct ovsdb_table *table = row->table;
+    const struct shash_node *node;
+    size_t n = 0;
+
+    SHASH_FOR_EACH (node, &table->schema->columns) {
+        const struct ovsdb_column *column = node->data;
+        const struct ovsdb_datum *datum = &row->fields[column->index];
+
+        n += datum->n;
+        if (column->type.value.type != OVSDB_TYPE_VOID) {
+            n += datum->n;  /* Map: count values too. */
+        }
+    }
+    return n;
+}
+
 /* The caller is responsible for ensuring that 'row' has been removed from its
  * table and that it is not participating in a transaction. */
 void

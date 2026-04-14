@@ -1,0 +1,7 @@
+AT_BANNER([OVSDB -- row cache unit tests])
+
+AT_SETUP([row cache - C unit tests])
+AT_KEYWORDS([ovsdb row-cache])
+AT_CHECK([ovstest test-row-cache], [0], [test-row-cache: ok
+])
+AT_CLEANUP

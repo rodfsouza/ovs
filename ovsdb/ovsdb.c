@@ -672,13 +672,7 @@ ovsdb_snapshot(struct ovsdb *db, bool trim_memory OVS_UNUSED)
     uint64_t elapsed, start_time = time_msec();
     struct ovsdb_compaction_state *state;
 
-    if (!applied_index) {
-        /* Parallel compaction is not supported for standalone databases. */
-        state = xzalloc(sizeof *state);
-        state->data = ovsdb_to_txn_json(db,
-                                        "compacting database online", true);
-        state->schema = ovsdb_schema_to_json(db->schema);
-    } else if (ovsdb_snapshot_ready(db)) {
+    if (ovsdb_snapshot_ready(db)) {
         xpthread_join(db->snap_state->thread, NULL);
 
         state = db->snap_state;
@@ -687,7 +681,10 @@ ovsdb_snapshot(struct ovsdb *db, bool trim_memory OVS_UNUSED)
         ovsdb_destroy(state->db);
         seq_destroy(state->done);
     } else {
-        /* Creating a thread. */
+        /* Launch background compaction thread for both standalone and
+         * clustered databases.  Clone the database to allow the main
+         * thread to continue processing while serialization happens
+         * in the background. */
         ovs_assert(!db->snap_state);
         state = xzalloc(sizeof *state);
 

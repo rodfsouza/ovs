@@ -1,0 +1,12 @@
+AT_BANNER([OVSDB -- cross-agent integration tests])
+
+AT_SETUP([integration - disk store + row cache])
+AT_KEYWORDS([ovsdb integration disk-store row-cache])
+dnl This test validates that the disk store and row cache work together.
+dnl Run the combined C unit test that exercises the cache-miss-load-insert
+dnl path and verifies cache hit rates.
+AT_CHECK([ovstest test-disk-store], [0], [test-disk-store: ok
+])
+AT_CHECK([ovstest test-row-cache], [0], [test-row-cache: ok
+])
+AT_CLEANUP

@@ -121,6 +121,10 @@ struct json *ovsdb_row_to_json(const struct ovsdb_row *,
                                const struct ovsdb_column_set *include);
 void ovsdb_row_to_string(const struct ovsdb_row *, struct ds *);
 
+/* Returns the total number of atoms across all columns of 'row'.
+ * For map columns, both keys and values are counted. */
+size_t ovsdb_row_count_atoms(const struct ovsdb_row *);
+
 static inline const struct uuid *
 ovsdb_row_get_uuid(const struct ovsdb_row *row)
 {

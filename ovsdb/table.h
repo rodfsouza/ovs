@@ -54,6 +54,9 @@ const struct ovsdb_column *ovsdb_table_schema_get_column(
 
 /* Database table. */
 
+struct ovsdb_row_cache;
+struct ovsdb_disk_store;
+
 struct ovsdb_table {
     struct ovsdb_table_schema *schema;
     struct ovsdb_txn_table *txn_table; /* Only if table is in a transaction. */
@@ -65,6 +68,10 @@ struct ovsdb_table {
     struct hmap *indexes;
 
     bool log; /* True if logging is enabled for this table. */
+
+    /* Disk-backed storage (Phase 1).  NULL if disabled. */
+    struct ovsdb_row_cache *cache;
+    struct ovsdb_disk_store *disk_store;
 };
 
 struct ovsdb_table *ovsdb_table_create(struct ovsdb_table_schema *);

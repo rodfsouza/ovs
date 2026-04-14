@@ -63,6 +63,7 @@ ovsdb_trigger_init(struct ovsdb_session *session, struct ovsdb *db,
     trigger->read_only = read_only;
     trigger->role = nullable_xstrdup(role);
     trigger->id = nullable_xstrdup(id);
+    trigger->waiting_for_data = false;
     return ovsdb_trigger_try(trigger, now);
 }
 
@@ -186,7 +187,8 @@ ovsdb_trigger_run(struct ovsdb *db, long long int now)
 
         if (run_triggers
             || now - t->created >= t->timeout_msec
-            || t->progress || t->txn_forward) {
+            || t->progress || t->txn_forward
+            || t->waiting_for_data) {
             if (ovsdb_trigger_try(t, now)) {
                 disconnect_all = true;
             }

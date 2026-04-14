@@ -63,9 +63,15 @@
 #include "unixctl.h"
 #include "perf-counter.h"
 #include "ovsdb-util.h"
+#include "worker-pool.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_server);
+
+/* Worker pool for async I/O and serialization (Phase 2).
+ * Initialized in main(), destroyed after main_loop(). */
+#define OVSDB_IO_WORKER_THREADS 4
+static struct ovsdb_worker_pool *io_worker_pool;
 
 /* SSL configuration. */
 static char *private_key_file;
@@ -359,6 +365,11 @@ main_loop(struct server_config *config,
                 log_and_free_error(ovsdb_snapshot(db->db, trim_memory));
             }
         }
+        /* Drain completed I/O worker jobs (Phase 2). */
+        if (io_worker_pool) {
+            ovsdb_worker_pool_run(io_worker_pool);
+        }
+
         if (run_process) {
             process_run();
             if (process_exited(run_process)) {
@@ -389,6 +400,10 @@ main_loop(struct server_config *config,
             ovsdb_storage_wait(db->db->storage);
             ovsdb_storage_read_wait(db->db->storage);
             ovsdb_snapshot_wait(db->db);
+        }
+        /* Register I/O worker pool completion with poll (Phase 2). */
+        if (io_worker_pool) {
+            ovsdb_worker_pool_wait(io_worker_pool);
         }
         if (run_process) {
             process_wait(run_process);
@@ -888,8 +903,15 @@ main(int argc, char *argv[])
     unixctl_command_register("ovsdb-server/disable-monitor-cond", "", 0, 0,
                              ovsdb_server_disable_monitor_cond, jsonrpc);
 
+    /* Create I/O worker pool for async disk loading (Phase 2). */
+    io_worker_pool = ovsdb_worker_pool_create(
+        OVSDB_IO_WORKER_THREADS, "io-worker");
+
     main_loop(&server_config, jsonrpc, &all_dbs, unixctl, &remotes,
               run_process, &exiting);
+
+    ovsdb_worker_pool_destroy(io_worker_pool);
+    io_worker_pool = NULL;
 
     SHASH_FOR_EACH_SAFE (node, &all_dbs) {
         struct db *db = node->data;

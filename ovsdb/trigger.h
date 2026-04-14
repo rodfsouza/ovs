@@ -66,6 +66,14 @@ struct ovsdb_trigger {
     bool read_only;             /* Database is in read only mode. */
     char *role;                 /* Role, for role-based access controls. */
     char *id;                   /* ID, for role-based access controls. */
+
+    /* Lazy-load data wait (Phase 2).
+     *
+     * When true, the trigger is parked because one or more rows
+     * it references are not yet loaded from disk.  The trigger
+     * will be retried on the next ovsdb_trigger_run() after the
+     * worker pool signals that the row has been loaded. */
+    bool waiting_for_data;
 };
 
 bool ovsdb_trigger_init(struct ovsdb_session *, struct ovsdb *,

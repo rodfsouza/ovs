@@ -9,6 +9,8 @@ ovsdb_libovsdb_la_SOURCES = \
 	ovsdb/column.h \
 	ovsdb/condition.c \
 	ovsdb/condition.h \
+	ovsdb/disk-store.c \
+	ovsdb/disk-store.h \
 	ovsdb/execution.c \
 	ovsdb/file.c \
 	ovsdb/file.h \
@@ -38,6 +40,8 @@ ovsdb_libovsdb_la_SOURCES = \
 	ovsdb/relay.h \
 	ovsdb/row.c \
 	ovsdb/row.h \
+	ovsdb/row-cache.c \
+	ovsdb/row-cache.h \
 	ovsdb/server.c \
 	ovsdb/server.h \
 	ovsdb/storage.c \
@@ -51,7 +55,9 @@ ovsdb_libovsdb_la_SOURCES = \
 	ovsdb/transaction-forward.c \
 	ovsdb/transaction-forward.h \
 	ovsdb/ovsdb-util.c \
-	ovsdb/ovsdb-util.h
+	ovsdb/ovsdb-util.h \
+	ovsdb/worker-pool.c \
+	ovsdb/worker-pool.h
 ovsdb_libovsdb_la_CFLAGS = $(AM_CFLAGS)
 ovsdb_libovsdb_la_CPPFLAGS = $(AM_CPPFLAGS)
 
