@@ -30,7 +30,9 @@
 #include "ovsdb-error.h"
 #include "ovsdb-parser.h"
 #include "ovsdb-types.h"
+#include "disk-store.h"
 #include "row.h"
+#include "row-cache.h"
 #include "seq.h"
 #include "simap.h"
 #include "storage.h"
@@ -723,6 +725,53 @@ ovsdb_snapshot(struct ovsdb *db, bool trim_memory OVS_UNUSED)
 
     free(state);
     return error;
+}
+
+/* Callback for ovsdb_disk_store_for_each_uuid(). */
+static void
+add_unloaded_cb(const struct uuid *uuid, void *aux)
+{
+    struct ovsdb_row_cache *cache = aux;
+    ovsdb_row_cache_add_unloaded(cache, uuid);
+}
+
+/* Attaches the binary disk store from storage to each table,
+ * creating a row cache per table and populating it with UNLOADED
+ * entries from the on-disk index.  After this call, rows are
+ * loaded on demand via ovsdb_table_get_row(). */
+void
+ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
+{
+    struct ovsdb_disk_store *ds;
+
+    if (!db->storage) {
+        return;
+    }
+    ds = ovsdb_storage_get_disk_store(db->storage);
+    if (!ds) {
+        return;
+    }
+
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &db->tables) {
+        struct ovsdb_table *table = node->data;
+
+        /* Disk store is shared — table does not own it. */
+        table->disk_store = ds;
+        table->cache = ovsdb_row_cache_create(cache_max_atoms);
+
+        /* Populate cache with UNLOADED entries from the
+         * on-disk index.  This walks the in-memory index
+         * only — no disk I/O. */
+        ovsdb_disk_store_for_each_uuid(
+            ds, node->name, add_unloaded_cb, table->cache);
+
+        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed "
+                 "from disk store",
+                 db->name, node->name,
+                 ovsdb_row_cache_count(table->cache));
+    }
+    db->disk_store_mode = true;
 }
 
 void

@@ -73,6 +73,14 @@ VLOG_DEFINE_THIS_MODULE(ovsdb_server);
 #define OVSDB_IO_WORKER_THREADS 4
 static struct ovsdb_worker_pool *io_worker_pool;
 
+/* If true, ovsdb-server opens BINARYV1 databases natively using the
+ * disk store engine with an in-memory row cache.  Rows are loaded
+ * from disk on demand via the I/O worker pool. */
+static bool disk_store_enabled;
+
+/* Default maximum atom count for the per-table row cache. */
+#define OVSDB_CACHE_MAX_ATOMS 1000000
+
 /* SSL configuration. */
 static char *private_key_file;
 static char *certificate_file;
@@ -1202,7 +1210,17 @@ open_db(struct server_config *server_config,
      * modes only. */
     ovsdb_txn_history_init(db->db, model == SM_RELAY || model == SM_CLUSTERED);
 
-    read_db(server_config, db);
+    /* If disk-store mode is enabled and the storage is a binary
+     * disk store, attach cache and disk store to tables and skip
+     * the JSON log replay (rows load on demand). */
+    if (disk_store_enabled
+        && ovsdb_storage_is_disk_store(storage)) {
+        ovsdb_attach_disk_store(db->db, OVSDB_CACHE_MAX_ATOMS);
+        VLOG_INFO("%s: opened in binary disk store mode",
+                  db->db->name);
+    } else {
+        read_db(server_config, db);
+    }
 
     error = (db->db->name[0] == '_'
              ? ovsdb_error(NULL, "%s: names beginning with \"_\" are reserved",
@@ -2632,6 +2650,7 @@ parse_options(int argc, char *argv[],
         OPT_FILE_COLUMN_DIFF,
         OPT_FILE_NO_DATA_CONVERSION,
         OPT_CONFIG_FILE,
+        OPT_DISK_STORE,
         VLOG_OPTION_ENUMS,
         DAEMON_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
@@ -2660,6 +2679,7 @@ parse_options(int argc, char *argv[],
         {"disable-file-no-data-conversion", no_argument, NULL,
          OPT_FILE_NO_DATA_CONVERSION},
         {"config-file", required_argument, NULL, OPT_CONFIG_FILE},
+        {"disk-store", no_argument, NULL, OPT_DISK_STORE},
         {NULL, 0, NULL, 0},
     };
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
@@ -2763,6 +2783,10 @@ parse_options(int argc, char *argv[],
         case OPT_CONFIG_FILE:
             config_file_path = abs_file_name(ovs_dbdir(), optarg);
             add_default_db = false;
+            break;
+
+        case OPT_DISK_STORE:
+            disk_store_enabled = true;
             break;
 
         case '?':

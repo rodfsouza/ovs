@@ -62,10 +62,21 @@ struct ovsdb_error *ovsdb_disk_store_compact(
     struct ovsdb_disk_store *)
     OVS_WARN_UNUSED_RESULT;
 
-/* Format detection and schema extraction.
- * These work on filenames and do not require an open store. */
+/* Format detection and schema extraction. */
 bool ovsdb_disk_store_is_binary(const char *filename);
 struct ovsdb_schema *ovsdb_disk_store_read_schema(
     const char *filename);
+
+/* Accessors for an open store. */
+struct ovsdb_schema *ovsdb_disk_store_get_schema(
+    const struct ovsdb_disk_store *);
+const char *ovsdb_disk_store_get_filename(
+    const struct ovsdb_disk_store *);
+
+/* UUID iteration (no disk I/O — walks in-memory index).
+ * Calls 'cb' once for each non-deleted row UUID in 'table_name'. */
+void ovsdb_disk_store_for_each_uuid(
+    struct ovsdb_disk_store *, const char *table_name,
+    void (*cb)(const struct uuid *, void *aux), void *aux);
 
 #endif /* ovsdb/disk-store.h */

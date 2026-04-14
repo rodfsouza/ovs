@@ -342,9 +342,10 @@ ovsdb_table_destroy(struct ovsdb_table *table)
         if (table->cache) {
             ovsdb_row_cache_destroy(table->cache);
         }
-        if (table->disk_store) {
-            ovsdb_disk_store_close(table->disk_store);
-        }
+        /* disk_store is a shared pointer owned by ovsdb_storage.
+         * Do NOT close it here — it is closed via
+         * ovsdb_storage_close(). */
+        table->disk_store = NULL;
 
         ovsdb_table_schema_destroy(table->schema);
         free(table);

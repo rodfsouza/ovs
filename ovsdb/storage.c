@@ -34,17 +34,18 @@
 VLOG_DEFINE_THIS_MODULE(storage);
 
 struct ovsdb_storage {
-    /* There are three kinds of storage:
+    /* There are four kinds of storage:
      *
-     *    - Standalone, backed by a disk file.  'log' is nonnull, 'raft' is
-     *      null.
+     *    - Standalone, backed by a JSON disk file.  'log' is nonnull.
      *
-     *    - Clustered, backed by a Raft cluster.  'log' is null, 'raft' is
-     *      nonnull.
+     *    - Clustered, backed by a Raft cluster.  'raft' is nonnull.
      *
-     *    - Memory only, unbacked.  'log' and 'raft' are null. */
+     *    - Binary, backed by a BINARYV1 disk store.  'ds' is nonnull.
+     *
+     *    - Memory only, unbacked.  All three are null. */
     struct ovsdb_log *log;
     struct raft *raft;
+    struct ovsdb_disk_store *ds;  /* Binary disk store (Phase 1). */
 
     char *unbacked_name; /* Name of the unbacked storage. */
 
@@ -66,18 +67,21 @@ ovsdb_storage_open__(const char *filename, bool rw, bool allow_clustered,
 {
     *storagep = NULL;
 
-    /* Probe for binary disk store format first.  If the file begins
-     * with the BINARYV1 magic, it is not a JSON or Raft log and must
-     * be opened via the disk store path.
-     *
-     * For now, binary databases are not directly served by
-     * ovsdb-server via this storage layer.  Return an error
-     * indicating the format so callers can handle it. */
+    /* Probe for binary disk store format.  If the file begins with
+     * the BINARYV1 magic, open it via the disk store engine. */
     if (ovsdb_disk_store_is_binary(filename)) {
-        return ovsdb_error(NULL,
-                           "%s: binary disk store format; "
-                           "use ovsdb-tool convert-format to "
-                           "convert to JSON first", filename);
+        struct ovsdb_disk_store *ds;
+        ds = ovsdb_disk_store_open(filename, NULL);
+        if (!ds) {
+            return ovsdb_error(NULL,
+                               "%s: failed to open binary "
+                               "disk store", filename);
+        }
+        struct ovsdb_storage *storage = xzalloc(sizeof *storage);
+        storage->ds = ds;
+        schedule_next_snapshot(storage, false);
+        *storagep = storage;
+        return NULL;
     }
 
     struct ovsdb_log *log;
@@ -155,6 +159,7 @@ ovsdb_storage_close(struct ovsdb_storage *storage)
     if (storage) {
         ovsdb_log_close(storage->log);
         raft_close(storage->raft);
+        ovsdb_disk_store_close(storage->ds);
         ovsdb_error_destroy(storage->error);
         free(storage->unbacked_name);
         free(storage);
@@ -164,13 +169,31 @@ ovsdb_storage_close(struct ovsdb_storage *storage)
 const char *
 ovsdb_storage_get_model(const struct ovsdb_storage *storage)
 {
-    return storage->raft ? "clustered" : "standalone";
+    if (storage->raft) {
+        return "clustered";
+    } else if (storage->ds) {
+        return "standalone";  /* Binary is standalone. */
+    } else {
+        return "standalone";
+    }
 }
 
 bool
 ovsdb_storage_is_clustered(const struct ovsdb_storage *storage)
 {
     return storage->raft != NULL;
+}
+
+bool
+ovsdb_storage_is_disk_store(const struct ovsdb_storage *storage)
+{
+    return storage->ds != NULL;
+}
+
+struct ovsdb_disk_store *
+ovsdb_storage_get_disk_store(const struct ovsdb_storage *storage)
+{
+    return storage->ds;
 }
 
 bool
@@ -351,6 +374,23 @@ ovsdb_storage_read(struct ovsdb_storage *storage,
 struct ovsdb_schema *
 ovsdb_storage_read_schema(struct ovsdb_storage *storage)
 {
+    /* Binary disk store: schema is embedded in the store. */
+    if (storage->ds) {
+        struct ovsdb_schema *s;
+        s = ovsdb_disk_store_get_schema(storage->ds);
+        if (s) {
+            return ovsdb_schema_clone(s);
+        }
+        /* Fallback: read from file. */
+        s = ovsdb_disk_store_read_schema(
+            ovsdb_disk_store_get_filename(storage->ds));
+        if (!s) {
+            ovs_fatal(0, "failed to read schema from binary "
+                      "disk store");
+        }
+        return s;
+    }
+
     ovs_assert(storage->log);
 
     struct json *txn_json;

@@ -1254,6 +1254,39 @@ compact_error:
     return error;
 }
 
+/* Calls 'cb' once for each non-deleted UUID in 'table_name'.
+ * Walks the in-memory index only — no disk I/O. */
+void
+ovsdb_disk_store_for_each_uuid(struct ovsdb_disk_store *store,
+                               const char *table_name,
+                               void (*cb)(const struct uuid *,
+                                          void *aux),
+                               void *aux)
+{
+    struct disk_store_index_entry *e;
+
+    HMAP_FOR_EACH (e, hmap_node, &store->index) {
+        if (!e->deleted
+            && !strcmp(e->table_name, table_name)) {
+            cb(&e->uuid, aux);
+        }
+    }
+}
+
+/* Returns the schema associated with 'store', or NULL. */
+struct ovsdb_schema *
+ovsdb_disk_store_get_schema(const struct ovsdb_disk_store *store)
+{
+    return store ? store->schema : NULL;
+}
+
+/* Returns the filename of 'store'. */
+const char *
+ovsdb_disk_store_get_filename(const struct ovsdb_disk_store *store)
+{
+    return store ? store->filename : NULL;
+}
+
 /* Returns true if 'filename' begins with the BINARYV1 magic. */
 bool
 ovsdb_disk_store_is_binary(const char *filename)

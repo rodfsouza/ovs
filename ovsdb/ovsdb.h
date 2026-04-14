@@ -126,6 +126,9 @@ struct ovsdb {
 
     /* Database compaction. */
     struct ovsdb_compaction_state *snap_state;
+
+    /* Binary disk store mode (Phase 1+2). */
+    bool disk_store_mode;
 };
 
 /* Total number of 'weak reference' objects in all databases
@@ -161,5 +164,8 @@ bool ovsdb_snapshot_in_progress(struct ovsdb *);
 bool ovsdb_snapshot_ready(struct ovsdb *);
 
 void ovsdb_replace(struct ovsdb *dst, struct ovsdb *src);
+
+/* Binary disk store mode (Phase 1+2). */
+void ovsdb_attach_disk_store(struct ovsdb *, size_t cache_max_atoms);
 
 #endif /* ovsdb/ovsdb.h */

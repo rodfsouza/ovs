@@ -1,0 +1,43 @@
+AT_BANNER([OVSDB -- native binary database serving])
+
+AT_SETUP([binary serve - server starts with --disk-store])
+AT_KEYWORDS([ovsdb binary-serve disk-store])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert data before converting.
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "one"}}]'], [0], [ignore])
+dnl Convert to binary.
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-tool db-format db], [0], [binaryv1
+])
+dnl Start ovsdb-server with --disk-store flag.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Verify the server is responsive.
+AT_CHECK([ovsdb-client list-dbs unix:db.sock], [0], [ordinals
+])
+dnl Clean up.
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+AT_SETUP([binary serve - db-format detection by server])
+AT_KEYWORDS([ovsdb binary-serve])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl Without --disk-store, the server should still open
+dnl (storage layer now opens binary natively).
+AT_CHECK([ovsdb-server --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+AT_CHECK([ovsdb-client list-dbs unix:db.sock], [0], [ordinals
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
