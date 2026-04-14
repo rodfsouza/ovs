@@ -35,18 +35,19 @@ The new infrastructure addresses all three problems through three phases:
   databases.  No configuration required -- takes effect immediately on
   upgrade.
 
-- **Phase 1** (binary disk store + row cache): Available as a C library
-  and via `ovsdb-tool` CLI.  Use `ovsdb-tool convert-format` to convert
-  existing JSON databases to binary format and back.
+- **Phase 1** (binary disk store + row cache): Available via
+  `ovsdb-tool convert-format` CLI and the C library.
 
-- **Phase 2** (I/O worker pool): Infrastructure is in place.  Worker pool
-  starts automatically with ovsdb-server (4 threads).  Lazy loading is
-  not yet wired to the startup path.
+- **Phase 2** (I/O worker pool + lazy loading): Fully wired.  The worker
+  pool (4 threads) loads rows from disk asynchronously.  Triggers park
+  while waiting for row data and resume automatically.
 
-- **`ovsdb-server` does not natively serve binary databases yet.**
-  Binary databases must be converted back to JSON before ovsdb-server
-  can open them.  Direct serving of binary format is planned for a
-  future release.
+- **Native binary serving**: ovsdb-server can open and serve BINARYV1
+  databases directly using the `--disk-store` flag.  The storage layer
+  auto-detects binary format.
+
+- **Clustered (Raft) mode is NOT supported** with binary format.  See
+  the "Limitations" section for details.
 
 ### Quick Start: Non-Blocking Snapshots (Phase 0)
 
@@ -115,33 +116,77 @@ ovsdb-tool db-is-standalone /etc/openvswitch/conf.db
 ovsdb-tool compact /etc/openvswitch/conf.db
 ```
 
-### Running ovsdb-server
+### Running ovsdb-server with Binary Databases
 
-**ovsdb-server currently requires JSON format.**  Binary databases
-must be converted to JSON before the server can open them.  A typical
-workflow:
+ovsdb-server natively opens and serves BINARYV1 databases.  Use the
+`--disk-store` flag to enable the row cache and async loading:
 
 ```bash
-# 1. Stop the server.
+# 1. Create and populate a JSON database.
+ovsdb-tool create conf.db vswitch.ovsschema
+# ... insert data via ovs-vsctl or ovsdb-client ...
+
+# 2. Stop the server.
 ovs-appctl -t ovsdb-server exit
 
-# 2. Convert to binary for offline analysis or storage.
+# 3. Convert to binary.
 ovsdb-tool convert-format conf.db binary
 
-# 3. Convert back to JSON before restarting.
+# 4. Start the server with binary support.
+ovsdb-server --disk-store \
+    --remote=punix:/var/run/openvswitch/db.sock \
+    --pidfile --detach conf.db
+
+# 5. Use normally — all ovs-vsctl / ovsdb-client commands work.
+ovs-vsctl show
+ovsdb-client list-dbs unix:/var/run/openvswitch/db.sock
+```
+
+**What `--disk-store` does**:
+
+- Attaches a per-table LRU row cache (1M atoms budget by default)
+- Populates the cache index from the disk store's UUID index (no
+  I/O -- reads only the in-memory index built at open time)
+- Rows are loaded from disk **on demand** when first accessed
+- The I/O worker pool (4 background threads) loads rows
+  asynchronously -- the main thread is not blocked
+- Client requests that reference unloaded rows are **parked**
+  (not rejected) and automatically retried once the row loads
+
+**Without `--disk-store`**: the storage layer still auto-detects
+binary format and opens it, but without the row cache and async
+loading.  All rows are accessible via synchronous disk reads.
+
+**Reverting to JSON format**:
+
+```bash
+ovs-appctl -t ovsdb-server exit
 ovsdb-tool convert-format conf.db json vswitch.ovsschema
-
-# 4. Restart the server.
-ovsdb-server --remote=punix:db.sock --detach --pidfile conf.db
+ovsdb-server --remote=punix:db.sock --pidfile --detach conf.db
 ```
 
-If ovsdb-server encounters a binary database, it will print a clear
-error message:
+### How Async Row Loading Works
+
+When a client sends a request that references a row not yet in memory:
 
 ```
-conf.db: binary disk store format; use ovsdb-tool convert-format
-to convert to JSON first
+1. Client sends transact/query
+2. ovsdb_table_get_row() checks cache state:
+   - CACHED  → return row immediately
+   - LOADING → return NULL (trigger parks)
+   - UNLOADED → submit load job to worker pool,
+                 set state to LOADING, return NULL
+3. Worker thread reads row from disk via pread()
+4. Main thread picks up result in pool_run():
+   - Insert row into cache (state = CACHED)
+   - Set run_triggers = true
+5. Parked trigger retries, finds row in cache, succeeds
+6. Client receives response
 ```
+
+For most queries this adds <1ms latency on first access.  Subsequent
+accesses hit the cache with zero disk I/O.  The LRU cache evicts
+cold rows when the atom budget is exceeded.
 
 ### Using the Binary Disk Store C API (Phase 1)
 
@@ -230,6 +275,8 @@ make check TESTSUITEFLAGS="-k row-cache"
 make check TESTSUITEFLAGS="-k worker-pool"
 make check TESTSUITEFLAGS="-k snapshot"
 make check TESTSUITEFLAGS="-k migration"
+make check TESTSUITEFLAGS="-k binary-serve"
+make check TESTSUITEFLAGS="-k lazy-load"
 
 # Or run the C unit tests directly:
 tests/ovstest test-disk-store
@@ -284,19 +331,24 @@ ovsdb-tool convert-format /etc/openvswitch/conf.db binary
 ovsdb-tool db-format /etc/openvswitch/conf.db   # "binaryv1"
 ovsdb-tool db-version /etc/openvswitch/conf.db  # schema version
 
-# 5. Convert back to JSON (required until ovsdb-server supports binary).
-ovsdb-tool convert-format /etc/openvswitch/conf.db json \
-    /usr/share/openvswitch/vswitch.ovsschema
-
-# 6. Restart.
-ovsdb-server --remote=punix:db.sock --detach --pidfile conf.db
+# 5. Start with binary support.
+ovsdb-server --disk-store \
+    --remote=punix:/var/run/openvswitch/db.sock \
+    --pidfile --detach /etc/openvswitch/conf.db
 ```
 
 **Downgrade (binary to JSON for rollback)**:
 
 ```bash
+# 1. Stop ovsdb-server.
+ovs-appctl -t ovsdb-server exit
+
+# 2. Convert back to JSON.
 ovsdb-tool convert-format /etc/openvswitch/conf.db json \
     /usr/share/openvswitch/vswitch.ovsschema
+
+# 3. Restart without --disk-store.
+ovsdb-server --remote=punix:db.sock --pidfile --detach conf.db
 ```
 
 The binary-to-JSON conversion requires the schema file because the
@@ -310,10 +362,8 @@ to reconstruct a JSON log.
   only after the new file is fully written and fsynced.
 - If the process crashes during conversion, the original file is
   untouched.
-- For Raft clusters, the binary format is local storage only.  Raft
-  replication uses JSON on the wire regardless of local format.
-  Rolling upgrades require no coordination -- nodes at different
-  format versions interoperate transparently.
+- **Do NOT use binary format with Raft clustered databases.**  The
+  binary format is standalone only.  See "Limitations" section.
 - Old OVS versions that do not understand `BINARYV1` will refuse to
   open the file with a clear error message.  Downgrade with
   `ovsdb-tool convert-format ... json <schema>` before rolling back.
@@ -602,6 +652,8 @@ Test descriptions:
 | `ovsdb-lazy-load.at`   |     1 | Runs `ovstest test-worker-pool`              |
 | `ovsdb-migration.at`   |     5 | convert-format, db-format, round-trip,       |
 |                        |       | db-is-standalone, forward compat             |
+| `ovsdb-binary-serve.at`|     5 | --disk-store startup, auto-detect, query     |
+|                        |       | data, insert, lazy-load C tests              |
 | `ovsdb-integration.at` |     2 | Disk store + row cache together              |
 
 ### Running Under Sanitizers
@@ -649,10 +701,13 @@ TSAN can be enabled for the worker pool tests by building with
 | `ovsdb/disk-store.c`   | 1,244 | Binary row storage engine               |
 | `ovsdb/row-cache.h`    |    68 | Row cache public API                    |
 | `ovsdb/row-cache.c`    |   400 | LRU cache with pinning and state        |
+| `ovsdb/lazy-load.h`    |    45 | Lazy-load subsystem public API          |
+| `ovsdb/lazy-load.c`    |   120 | Async row loading via worker pool       |
 | `ovsdb/worker-pool.h`  |    65 | Worker pool public API                  |
 | `ovsdb/worker-pool.c`  |   322 | Thread pool with seq signaling          |
 | `tests/test-disk-store.c`  | 515 | Disk store unit tests (9 tests)     |
 | `tests/test-row-cache.c`   | 450 | Row cache unit tests (12 tests)     |
+| `tests/test-lazy-load.c`    | 280 | Lazy-load unit tests (5 tests)  |
 | `tests/test-worker-pool.c` | 310 | Worker pool unit tests (5 tests)    |
 | `tests/ovsdb-snapshot.at`  |  49 | Snapshot integration tests          |
 | `tests/ovsdb-disk-store.at` |  7 | Disk store test harness             |
@@ -680,23 +735,58 @@ TSAN can be enabled for the worker pool tests by building with
 | `tests/automake.mk`     | Added test files, libovsdb to ovstest LDADD   |
 | `tests/ovsdb.at`        | Registered new test modules                   |
 
-## Limitations and Future Work
+## Limitations
 
-- **ovsdb-server does not natively serve binary databases.**  The server
-  requires JSON format.  Use `ovsdb-tool convert-format` to convert
-  between formats.  Native binary serving is planned for a future
-  release, requiring changes to `ovsdb_storage_open__()` and the
-  database replay path.
+### Raft Clustered Mode Not Supported
 
-- **Binary-to-JSON conversion requires a schema file.**  The binary
-  format stores a SHA-1 hash of the schema but not the full schema
-  definition.  The schema file must be provided as an argument to
-  `ovsdb-tool convert-format db json <schema>`.
+The binary disk store format is **standalone only**.  Clustered (Raft)
+databases cannot use `--disk-store`.  The reasons:
 
-- **Lazy loading** (Phase 2) infrastructure is in place but not wired to
-  the startup path.  `ovsdb-server` still replays the full JSON log at
-  startup.  The worker pool, trigger parking, and cache state tracker are
-  ready for connection.
+1. **Raft replication is JSON-based.**  `raft_command_execute()` takes
+   `struct json *` and replicates it as JSON to all peers.
+   `raft_install_snapshot_request` sends the full database as a JSON
+   blob.  The Raft protocol has no concept of binary rows.
+
+2. **Binary replaces the log, not complements it.**  The current design
+   uses binary as the primary storage format, replacing the JSON log
+   entirely.  In clustered mode, the Raft log is the primary storage
+   and cannot be replaced.
+
+3. **A future "local cache" architecture** could use binary as a local
+   optimization under the Raft layer — Raft continues to replicate
+   JSON; each node materializes its local copy into binary.  This is
+   a different architecture and is not yet implemented.
+
+**If you attempt to use `--disk-store` with a clustered database**,
+the server will open it but the Raft protocol will not function.
+Only use `--disk-store` with standalone databases.
+
+### Binary-to-JSON Conversion Requires Schema File
+
+The binary format stores a SHA-1 hash of the schema but not the full
+schema definition.  When converting binary to JSON, you must provide
+the schema file:
+
+```bash
+ovsdb-tool convert-format conf.db json /path/to/vswitch.ovsschema
+```
+
+### Transactions in Binary Mode
+
+Transactions submitted via `ovsdb-client transact` while running in
+binary disk-store mode execute against the in-memory cache and write
+through to the binary file on disk.  However:
+
+- **No write-ahead log (WAL)**:  If the server crashes mid-transaction,
+  the binary file may contain a partial write.  On restart, the index
+  is rebuilt from a sequential scan, and incomplete records are
+  discarded.
+- **No transaction history**:  Binary mode does not maintain the
+  transaction log used for incremental monitor updates.  Monitors
+  connected to a binary-mode database receive full snapshots, not
+  incremental diffs.
+
+### Other Limitations
 
 - **Chunked monitor protocol** (Phase 4) and **chunked Raft snapshots**
   (Phase 5) are not yet implemented.  The disk store cursor API supports
@@ -704,3 +794,7 @@ TSAN can be enabled for the worker pool tests by building with
 
 - **JSON disk cache** (Phase 3) for deferred serialization is designed
   but not yet implemented.
+
+- **Row cache budget is hardcoded** at 1,000,000 atoms
+  (`OVSDB_CACHE_MAX_ATOMS`).  A command-line option for cache sizing
+  is planned.

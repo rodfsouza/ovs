@@ -491,6 +491,7 @@ tests_ovstest_SOURCES = \
 	tests/test-aa.c \
 	tests/test-stopwatch.c \
 	tests/test-disk-store.c \
+	tests/test-lazy-load.c \
 	tests/test-row-cache.c \
 	tests/test-worker-pool.c
 

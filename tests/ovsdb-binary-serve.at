@@ -41,3 +41,63 @@ AT_CHECK([ovsdb-client list-dbs unix:db.sock], [0], [ordinals
 ])
 OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 AT_CLEANUP
+
+AT_SETUP([binary serve - query data from binary DB])
+AT_KEYWORDS([ovsdb binary-serve query])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert data.
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "one"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "two"}}]'], [0], [ignore])
+dnl Convert to binary and start server.
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Query data via ovsdb-client.
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "select",
+     "table": "ordinals",
+     "where": []}]'], [0], [stdout])
+AT_CHECK([grep -c '"one"' stdout], [0], [1
+])
+AT_CHECK([grep -c '"two"' stdout], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+AT_SETUP([binary serve - insert into binary DB])
+AT_KEYWORDS([ovsdb binary-serve transact])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Insert new data into the running binary DB.
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 42, "name": "forty-two"}}]'], [0], [stdout])
+dnl Verify no error in the result.
+AT_CHECK([grep -c '"error"' stdout], [1], [ignore])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+AT_SETUP([binary serve - lazy-load C unit tests])
+AT_KEYWORDS([ovsdb binary-serve lazy-load])
+AT_CHECK([ovstest test-lazy-load], [0], [test-lazy-load: ok
+])
+AT_CLEANUP
