@@ -1,0 +1,78 @@
+AT_BANNER([OVSDB -- format migration])
+
+AT_SETUP([migration - db-format reports json for standard db])
+AT_KEYWORDS([ovsdb migration db-format])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool db-format db], [0], [json
+])
+AT_CLEANUP
+
+AT_SETUP([migration - db-format reports binaryv1 after convert])
+AT_KEYWORDS([ovsdb migration db-format convert-format])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-tool db-format db], [0], [binaryv1
+])
+AT_CLEANUP
+
+AT_SETUP([migration - json to binary preserves data])
+AT_KEYWORDS([ovsdb migration convert-format])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert some data.
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "one"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "two"}}]'], [0], [ignore])
+dnl Convert to binary.
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-tool db-format db], [0], [binaryv1
+])
+dnl Convert back to JSON.
+AT_CHECK([ovsdb-tool convert-format db json schema], [0])
+AT_CHECK([ovsdb-tool db-format db], [0], [json
+])
+dnl Verify data survived the round-trip.
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "select",
+     "table": "ordinals",
+     "where": []}]'], [0], [stdout])
+AT_CHECK([test $(grep -c '"one"' stdout) -ge 1])
+AT_CHECK([test $(grep -c '"two"' stdout) -ge 1])
+AT_CLEANUP
+
+AT_SETUP([migration - db-is-standalone accepts binary])
+AT_KEYWORDS([ovsdb migration db-is-standalone])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-tool db-is-standalone db], [0])
+AT_CLEANUP
+
+AT_SETUP([migration - binary format version forward compat])
+AT_KEYWORDS([ovsdb migration forward-compat])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+dnl Create a file that starts with BINARYV1 but has an
+dnl unsupported format version (99).
+printf 'BINARYV1' > baddb
+printf '\x00\x00\x00\x63' >> baddb
+dd if=/dev/zero bs=1 count=24 >> baddb 2>/dev/null
+dnl ovsdb-tool db-format should still detect it as binary.
+AT_CHECK([ovsdb-tool db-format baddb], [0], [binaryv1
+])
+dnl But trying to open it via storage should fail gracefully.
+AT_CHECK([ovsdb-tool compact baddb], [1], [ignore], [ignore])
+AT_CLEANUP

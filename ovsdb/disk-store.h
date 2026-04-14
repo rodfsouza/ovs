@@ -62,4 +62,10 @@ struct ovsdb_error *ovsdb_disk_store_compact(
     struct ovsdb_disk_store *)
     OVS_WARN_UNUSED_RESULT;
 
+/* Format detection and schema extraction.
+ * These work on filenames and do not require an open store. */
+bool ovsdb_disk_store_is_binary(const char *filename);
+struct ovsdb_schema *ovsdb_disk_store_read_schema(
+    const char *filename);
+
 #endif /* ovsdb/disk-store.h */

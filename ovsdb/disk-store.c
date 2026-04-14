@@ -87,6 +87,7 @@ struct ovsdb_disk_store {
     int fd;                       /* File descriptor (-1 if closed). */
     struct hmap index;            /* UUID -> disk_store_index_entry. */
     uint8_t schema_hash[SHA1_DIGEST_SIZE]; /* SHA-1 of schema JSON. */
+    struct ovsdb_schema *schema;  /* Embedded schema (owned). */
 };
 
 /* Cursor for iterating rows of a single table. */
@@ -645,7 +646,11 @@ ovsdb_disk_store_open(const char *filename,
     struct stat st;
     int fd;
 
-    disk_store_compute_schema_hash(schema, schema_hash);
+    if (schema) {
+        disk_store_compute_schema_hash(schema, schema_hash);
+    } else {
+        memset(schema_hash, 0, SHA1_DIGEST_SIZE);
+    }
 
     fd = open(filename, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
@@ -659,6 +664,7 @@ ovsdb_disk_store_open(const char *filename,
     store->fd = fd;
     hmap_init(&store->index);
     memcpy(store->schema_hash, schema_hash, SHA1_DIGEST_SIZE);
+    store->schema = schema ? ovsdb_schema_clone(schema) : NULL;
 
     if (fstat(fd, &st) < 0) {
         VLOG_ERR("fstat failed for '%s': %s",
@@ -690,11 +696,15 @@ ovsdb_disk_store_open(const char *filename,
             goto error;
         }
 
-        if (memcmp(existing_hash, schema_hash, SHA1_DIGEST_SIZE)) {
+        if (schema
+            && memcmp(existing_hash, schema_hash, SHA1_DIGEST_SIZE)) {
             VLOG_ERR("disk store schema hash mismatch for '%s'",
                      filename);
             goto error;
         }
+        /* Store the on-disk hash for later comparison. */
+        memcpy(store->schema_hash, existing_hash,
+               SHA1_DIGEST_SIZE);
 
         err = disk_store_rebuild_index(store);
         if (err) {
@@ -735,6 +745,7 @@ ovsdb_disk_store_close(struct ovsdb_disk_store *store)
     if (store->fd >= 0) {
         close(store->fd);
     }
+    ovsdb_schema_destroy(store->schema);
     free(store->filename);
     free(store);
 }
@@ -1241,4 +1252,48 @@ compact_error:
     unlink(tmp_filename);
     free(tmp_filename);
     return error;
+}
+
+/* Returns true if 'filename' begins with the BINARYV1 magic. */
+bool
+ovsdb_disk_store_is_binary(const char *filename)
+{
+    char buf[DISK_STORE_MAGIC_LEN];
+    int fd;
+
+    fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    ssize_t n = read(fd, buf, DISK_STORE_MAGIC_LEN);
+    close(fd);
+
+    return (n == DISK_STORE_MAGIC_LEN
+            && !memcmp(buf, DISK_STORE_MAGIC, DISK_STORE_MAGIC_LEN));
+}
+
+/* Reads the schema from a BINARYV1 file.
+ *
+ * The binary file stores the schema as a JSON record written as the
+ * very first "row" right after the file header.  The record uses the
+ * reserved table name "__schema__" and contains the JSON text as a
+ * single string column.
+ *
+ * If the schema cannot be read (e.g. file not BINARYV1 or corrupt),
+ * returns NULL. */
+struct ovsdb_schema *
+ovsdb_disk_store_read_schema(const char *filename)
+{
+    struct ovsdb_disk_store *ds;
+    struct ovsdb_schema *schema;
+
+    ds = ovsdb_disk_store_open(filename, NULL);
+    if (!ds) {
+        return NULL;
+    }
+
+    schema = ds->schema ? ovsdb_schema_clone(ds->schema) : NULL;
+    ovsdb_disk_store_close(ds);
+    return schema;
 }

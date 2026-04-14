@@ -54,6 +54,9 @@ enum ovsdb_log_open_mode {
 /* 'magic' for use with ovsdb_log_open() for OVSDB databases (see ovsdb(5)). */
 #define OVSDB_MAGIC "JSON"
 
+/* Magic for the binary disk store format (see ovsdb/disk-store.h). */
+#define OVSDB_BINARY_MAGIC "BINARYV1"
+
 struct ovsdb_error *ovsdb_log_open(const char *name, const char *magic,
                                    enum ovsdb_log_open_mode,
                                    int locking, struct ovsdb_log **)

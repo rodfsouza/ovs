@@ -18,6 +18,7 @@
 
 #include "storage.h"
 #include <string.h>
+#include "disk-store.h"
 #include "log.h"
 #include "ovsdb-error.h"
 #include "openvswitch/json.h"
@@ -64,6 +65,20 @@ ovsdb_storage_open__(const char *filename, bool rw, bool allow_clustered,
                      struct ovsdb_storage **storagep)
 {
     *storagep = NULL;
+
+    /* Probe for binary disk store format first.  If the file begins
+     * with the BINARYV1 magic, it is not a JSON or Raft log and must
+     * be opened via the disk store path.
+     *
+     * For now, binary databases are not directly served by
+     * ovsdb-server via this storage layer.  Return an error
+     * indicating the format so callers can handle it. */
+    if (ovsdb_disk_store_is_binary(filename)) {
+        return ovsdb_error(NULL,
+                           "%s: binary disk store format; "
+                           "use ovsdb-tool convert-format to "
+                           "convert to JSON first", filename);
+    }
 
     struct ovsdb_log *log;
     struct ovsdb_error *error;
