@@ -107,6 +107,14 @@ DOC_SOURCE = \
 	Documentation/internals/patchwork.rst \
 	Documentation/internals/release-process.rst \
 	Documentation/internals/security.rst \
+	Documentation/internals/OVSDB-ImpactAnalysis.md \
+	Documentation/internals/ovsdb-disk-backed-storage-README.md \
+	Documentation/internals/ovsdb-disk-backed-storage-plan.md \
+	Documentation/internals/ovsdb-multithread-serialization-plan.md \
+	Documentation/internals/ovsdb-native-binary-serving-plan.md \
+	Documentation/internals/ovsdb-raft-binary-sidecar-plan.md \
+	Documentation/internals/ovsdb-tool-migration-plan.md \
+	Documentation/internals/ovsdb_architecture.md \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
 	Documentation/internals/contributing/inclusive-language.rst \

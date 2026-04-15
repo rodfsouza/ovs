@@ -100,6 +100,13 @@ TESTSUITE_AT = \
 	tests/ovsdb-idl.at \
 	tests/ovsdb-lock.at \
 	tests/ovsdb-rbac.at \
+	tests/ovsdb-binary-serve.at \
+	tests/ovsdb-disk-store.at \
+	tests/ovsdb-integration.at \
+	tests/ovsdb-lazy-load.at \
+	tests/ovsdb-migration.at \
+	tests/ovsdb-row-cache.at \
+	tests/ovsdb-snapshot.at \
 	tests/ovs-vsctl.at \
 	tests/pytest.at \
 	tests/stp.at \
