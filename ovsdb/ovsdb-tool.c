@@ -58,6 +58,9 @@ static int show_log_verbosity;
 /* --role: RBAC role to use for "transact" and "query" commands. */
 static const char *rbac_role;
 
+/* --format: Output format for "create" command ("json" or "binary"). */
+static const char *create_format;
+
 /* --cid: Cluster ID for "join-cluster" command. */
 static struct uuid cid;
 
@@ -71,6 +74,7 @@ static void parse_options(int argc, char *argv[]);
 
 static const char *default_db(void);
 static const char *default_schema(void);
+static struct ovsdb_schema *read_any_standalone_schema(const char *filename);
 
 int
 main(int argc, char *argv[])
@@ -93,12 +97,14 @@ parse_options(int argc, char *argv[])
         OPT_RBAC_ROLE = UCHAR_MAX + 1,
         OPT_CID,
         OPT_ELECTION_TIMER,
+        OPT_FORMAT,
     };
     static const struct option long_options[] = {
         {"more", no_argument, NULL, 'm'},
         {"rbac-role", required_argument, NULL, OPT_RBAC_ROLE},
         {"cid", required_argument, NULL, OPT_CID},
         {"election-timer", required_argument, NULL, OPT_ELECTION_TIMER},
+        {"format", required_argument, NULL, OPT_FORMAT},
         {"verbose", optional_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {"option", no_argument, NULL, 'o'},
@@ -139,6 +145,13 @@ parse_options(int argc, char *argv[])
             }
             break;
 
+        case OPT_FORMAT:
+            if (strcmp(optarg, "json") && strcmp(optarg, "binary")) {
+                ovs_fatal(0, "--format must be \"json\" or \"binary\"");
+            }
+            create_format = optarg;
+            break;
+
         case 'h':
             usage();
 
@@ -169,7 +182,8 @@ usage(void)
 {
     printf("%s: Open vSwitch database management utility\n"
            "usage: %s [OPTIONS] COMMAND [ARG...]\n"
-           "  create [DB [SCHEMA]]    create DB with the given SCHEMA\n"
+           "  [--format=json|binary] create [DB [SCHEMA]]\n"
+           "                          create DB with the given SCHEMA\n"
            "  [--election-timer=ms] create-cluster DB CONTENTS LOCAL\n"
            "    create clustered DB with given CONTENTS and LOCAL address\n"
            "  [--cid=UUID] join-cluster DB NAME LOCAL REMOTE...\n"
@@ -201,6 +215,7 @@ usage(void)
     printf("\
 \nOther options:\n\
   -m, --more                  increase show-log verbosity\n\
+  --format=FORMAT             database format for create (json or binary)\n\
   --rbac-role=ROLE            RBAC role for transact and query commands\n\
   -h, --help                  display this help message\n\
   -V, --version               display version information\n");
@@ -271,20 +286,31 @@ do_create(struct ovs_cmdl_context *ctx)
     const char *db_file_name = ctx->argc >= 2 ? ctx->argv[1] : default_db();
     const char *schema_file_name = ctx->argc >= 3 ? ctx->argv[2] : default_schema();
     struct ovsdb_schema *schema;
-    struct ovsdb_log *log;
-    struct json *json;
 
-    /* Read schema from file and convert to JSON. */
+    /* Read schema from file. */
     check_ovsdb_error(ovsdb_schema_from_file(schema_file_name, &schema));
-    json = ovsdb_schema_to_json(schema);
-    ovsdb_schema_destroy(schema);
 
-    /* Create database file. */
-    check_ovsdb_error(ovsdb_log_open(db_file_name, OVSDB_MAGIC,
-                                     OVSDB_LOG_CREATE_EXCL, -1, &log));
-    check_ovsdb_error(ovsdb_log_write_and_free(log, json));
-    check_ovsdb_error(ovsdb_log_commit_block(log));
-    ovsdb_log_close(log);
+    if (create_format && !strcmp(create_format, "binary")) {
+        /* Create empty binary database with schema. */
+        struct ovsdb_disk_store *ds = ovsdb_disk_store_open(db_file_name,
+                                                             schema);
+        if (!ds) {
+            ovs_fatal(0, "%s: failed to create binary database",
+                      db_file_name);
+        }
+        ovsdb_disk_store_close(ds);
+    } else {
+        /* Create JSON database (default). */
+        struct json *json = ovsdb_schema_to_json(schema);
+        struct ovsdb_log *log;
+
+        check_ovsdb_error(ovsdb_log_open(db_file_name, OVSDB_MAGIC,
+                                         OVSDB_LOG_CREATE_EXCL, -1, &log));
+        check_ovsdb_error(ovsdb_log_write_and_free(log, json));
+        check_ovsdb_error(ovsdb_log_commit_block(log));
+        ovsdb_log_close(log);
+    }
+    ovsdb_schema_destroy(schema);
 }
 
 static void
@@ -373,6 +399,83 @@ write_standalone_db(const char *file_name, const char *comment,
     return error;
 }
 
+/* Writes all rows of 'db' to a new BINARYV1 disk store at 'file_name'.
+ * Returns NULL on success, otherwise an ovsdb_error. */
+static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
+write_standalone_binary_db(const char *file_name, const struct ovsdb *db)
+{
+    struct ovsdb_disk_store *ds;
+    ds = ovsdb_disk_store_open(file_name, db->schema);
+    if (!ds) {
+        return ovsdb_error(NULL, "%s: failed to create binary disk store",
+                           file_name);
+    }
+
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &db->tables) {
+        struct ovsdb_table *table = node->data;
+        struct ovsdb_row *row;
+
+        HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+            struct ovsdb_error *error = ovsdb_disk_store_write_row(ds, row);
+            if (error) {
+                ovsdb_disk_store_close(ds);
+                remove(file_name);
+                return error;
+            }
+        }
+    }
+    ovsdb_disk_store_close(ds);
+    return NULL;
+}
+
+/* Reads a BINARYV1 database into a fully-populated in-memory ovsdb.
+ *
+ * Unlike ovsdb_file_read(), which replays transaction logs via
+ * ovsdb_storage_read() (a no-op for binary stores), this function
+ * materializes every row via cursors. */
+static struct ovsdb *
+read_binary_db(const char *filename)
+{
+    struct ovsdb_schema *schema = ovsdb_disk_store_read_schema(filename);
+    if (!schema) {
+        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
+    }
+
+    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, schema);
+    if (!ds) {
+        ovs_fatal(0, "%s: failed to open binary disk store", filename);
+    }
+
+    struct ovsdb *ovsdb = ovsdb_create(ovsdb_schema_clone(schema), NULL);
+
+    struct shash_node *tnode;
+    SHASH_FOR_EACH (tnode, &ovsdb->tables) {
+        struct ovsdb_table *table = tnode->data;
+        struct ovsdb_disk_store_cursor *cursor;
+
+        cursor = ovsdb_disk_store_cursor_open(ds, tnode->name);
+        if (!cursor) {
+            continue;
+        }
+
+        for (;;) {
+            struct ovsdb_row *row;
+            row = ovsdb_disk_store_cursor_next(cursor, table);
+            if (!row) {
+                break;
+            }
+            hmap_insert(&table->rows, &row->hmap_node,
+                        ovsdb_row_hash(row));
+        }
+        ovsdb_disk_store_cursor_close(cursor);
+    }
+
+    ovsdb_disk_store_close(ds);
+    ovsdb_schema_destroy(schema);
+    return ovsdb;
+}
+
 /* Converts a JSON database to BINARYV1 format.
  * Reads the JSON log, writes all rows to a binary disk store,
  * then atomically replaces the source file. */
@@ -389,29 +492,8 @@ convert_json_to_binary(const char *db_name)
         ovs_fatal(retval, "%s: failed to lock", src_name);
     }
 
-    /* Read the JSON database into memory. */
     struct ovsdb *ovsdb = ovsdb_file_read(src_name, false);
-
-    /* Open a new binary disk store with the same schema. */
-    struct ovsdb_disk_store *ds;
-    ds = ovsdb_disk_store_open(tmp_name, ovsdb->schema);
-    if (!ds) {
-        ovs_fatal(0, "%s: failed to create binary disk store",
-                  tmp_name);
-    }
-
-    /* Write all rows from every table. */
-    struct shash_node *node;
-    SHASH_FOR_EACH (node, &ovsdb->tables) {
-        struct ovsdb_table *table = node->data;
-        struct ovsdb_row *row;
-
-        HMAP_FOR_EACH (row, hmap_node, &table->rows) {
-            check_ovsdb_error(
-                ovsdb_disk_store_write_row(ds, row));
-        }
-    }
-    ovsdb_disk_store_close(ds);
+    check_ovsdb_error(write_standalone_binary_db(tmp_name, ovsdb));
 
     /* Atomic replace. */
 #ifdef _WIN32
@@ -430,62 +512,16 @@ convert_json_to_binary(const char *db_name)
 }
 
 /* Converts a BINARYV1 database to JSON format.
- * Reads all rows from the binary store via cursor, builds an
- * in-memory ovsdb, and writes a standard JSON log file. */
+ * Reads all rows from the binary store, builds an in-memory ovsdb,
+ * and writes a standard JSON log file. */
 static void
 convert_binary_to_json(const char *db_name,
-                       const char *schema_file)
+                       const char *schema_file OVS_UNUSED)
 {
     char *src_name = follow_symlinks(db_name);
     char *tmp_name = xasprintf("%s.json.tmp", src_name);
 
-    /* We need a schema to reconstruct the in-memory database.
-     * Read it from the provided schema file. */
-    struct ovsdb_schema *schema;
-    check_ovsdb_error(ovsdb_schema_from_file(schema_file, &schema));
-
-    /* Open the binary disk store. */
-    struct ovsdb_disk_store *ds;
-    ds = ovsdb_disk_store_open(src_name, schema);
-    if (!ds) {
-        ovs_fatal(0, "%s: failed to open binary disk store",
-                  src_name);
-    }
-
-    /* Create an in-memory database and replay rows.
-     *
-     * Rows are inserted directly into table->rows hmap, bypassing
-     * ovsdb_txn_row_insert() and secondary indexes.  This is safe
-     * because write_standalone_db() serializes from table->rows
-     * without consulting indexes. */
-    struct ovsdb *ovsdb = ovsdb_create(
-        ovsdb_schema_clone(schema), NULL);
-
-    struct shash_node *tnode;
-    SHASH_FOR_EACH (tnode, &ovsdb->tables) {
-        struct ovsdb_table *table = tnode->data;
-        struct ovsdb_disk_store_cursor *cursor;
-
-        cursor = ovsdb_disk_store_cursor_open(ds,
-                                              tnode->name);
-        if (!cursor) {
-            continue;
-        }
-
-        for (;;) {
-            struct ovsdb_row *row;
-            row = ovsdb_disk_store_cursor_next(cursor,
-                                               table);
-            if (!row) {
-                break;
-            }
-            hmap_insert(&table->rows, &row->hmap_node,
-                        ovsdb_row_hash(row));
-        }
-        ovsdb_disk_store_cursor_close(cursor);
-    }
-
-    ovsdb_disk_store_close(ds);
+    struct ovsdb *ovsdb = read_binary_db(src_name);
 
     /* Lock the destination and write JSON. */
     struct lockfile *lock = NULL;
@@ -509,7 +545,6 @@ convert_binary_to_json(const char *db_name,
     fsync_parent_dir(src_name);
 
     ovsdb_destroy(ovsdb);
-    ovsdb_schema_destroy(schema);
     lockfile_unlock(lock);
     free(tmp_name);
     free(src_name);
@@ -530,11 +565,7 @@ do_convert_format(struct ovs_cmdl_context *ctx)
         if (!ovsdb_disk_store_is_binary(db)) {
             ovs_fatal(0, "%s: already in JSON format", db);
         }
-        if (ctx->argc < 4) {
-            ovs_fatal(0, "converting binary to JSON requires a "
-                      "schema file argument");
-        }
-        convert_binary_to_json(db, ctx->argv[3]);
+        convert_binary_to_json(db, ctx->argc >= 4 ? ctx->argv[3] : NULL);
     } else {
         ovs_fatal(0, "unknown format \"%s\" (use \"json\" or "
                   "\"binary\")", format);
@@ -589,16 +620,38 @@ compact_or_convert(const char *src_name_, const char *dst_name_,
         ovs_fatal(retval, "%s: failed to lock lockfile", dst_name);
     }
 
+    /* Detect input format so we can preserve it on output. */
+    bool is_binary = ovsdb_disk_store_is_binary(src_name);
+
     /* Resulted DB will contain a single transaction without diff anyway. */
     ovsdb_file_column_diff_disable();
 
-    /* Save a copy. */
-    struct ovsdb *ovsdb = (new_schema
-                           ? ovsdb_file_read_as_schema(src_name, new_schema)
-                           : ovsdb_file_read(src_name, false));
-    ovsdb_storage_close(ovsdb->storage);
-    ovsdb->storage = NULL;
-    check_ovsdb_error(write_standalone_db(dst_name, comment, ovsdb));
+    /* Read the database. */
+    struct ovsdb *ovsdb;
+    if (is_binary) {
+        /* ovsdb_file_read() does not materialize binary rows, so use
+         * the binary-specific reader. */
+        ovsdb = read_binary_db(src_name);
+        if (new_schema) {
+            struct ovsdb *converted;
+            check_ovsdb_error(ovsdb_convert(ovsdb, new_schema, &converted));
+            ovsdb_destroy(ovsdb);
+            ovsdb = converted;
+        }
+    } else {
+        ovsdb = (new_schema
+                 ? ovsdb_file_read_as_schema(src_name, new_schema)
+                 : ovsdb_file_read(src_name, false));
+        ovsdb_storage_close(ovsdb->storage);
+        ovsdb->storage = NULL;
+    }
+
+    /* Write in the same format as the input. */
+    if (is_binary) {
+        check_ovsdb_error(write_standalone_binary_db(dst_name, ovsdb));
+    } else {
+        check_ovsdb_error(write_standalone_db(dst_name, comment, ovsdb));
+    }
     ovsdb_destroy(ovsdb);
 
     /* Replace source. */
@@ -647,7 +700,7 @@ do_needs_conversion(struct ovs_cmdl_context *ctx)
 {
     const char *db_file_name = ctx->argc >= 2 ? ctx->argv[1] : default_db();
     const char *schema_file_name = ctx->argc >= 3 ? ctx->argv[2] : default_schema();
-    struct ovsdb_schema *schema1 = read_standalone_schema(db_file_name);
+    struct ovsdb_schema *schema1 = read_any_standalone_schema(db_file_name);
     struct ovsdb_schema *schema2;
 
     check_ovsdb_error(ovsdb_schema_from_file(schema_file_name, &schema2));
@@ -660,6 +713,18 @@ static void
 do_db_name(struct ovs_cmdl_context *ctx)
 {
     const char *db_file_name = ctx->argc >= 2 ? ctx->argv[1] : default_db();
+
+    if (ovsdb_disk_store_is_binary(db_file_name)) {
+        struct ovsdb_schema *schema =
+            ovsdb_disk_store_read_schema(db_file_name);
+        if (!schema) {
+            ovs_fatal(0, "%s: cannot read schema from binary database",
+                      db_file_name);
+        }
+        puts(schema->name);
+        ovsdb_schema_destroy(schema);
+        return;
+    }
 
     struct ovsdb_log *log;
     check_ovsdb_error(ovsdb_log_open(db_file_name, OVSDB_MAGIC"|"RAFT_MAGIC,
@@ -1307,12 +1372,87 @@ do_show_log_cluster(struct ovsdb_log *log)
     smap_destroy(&names);
 }
 
+/* Binary databases have no transaction log.  Dump the current state
+ * of each table instead, matching the schema/row output style of the
+ * JSON show-log where possible. */
+static void
+do_show_log_binary(const char *filename)
+{
+    struct ovsdb_schema *schema = ovsdb_disk_store_read_schema(filename);
+    if (!schema) {
+        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
+    }
+
+    printf("format: binaryv1\n");
+    printf("schema: \"%s\" version=\"%s\" cksum=\"%s\"\n\n",
+           schema->name, schema->version, schema->cksum);
+
+    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, schema);
+    if (!ds) {
+        ovs_fatal(0, "%s: failed to open binary disk store", filename);
+    }
+
+    struct ovsdb *ovsdb = ovsdb_create(ovsdb_schema_clone(schema), NULL);
+
+    struct shash_node *tnode;
+    SHASH_FOR_EACH (tnode, &ovsdb->tables) {
+        struct ovsdb_table *table = tnode->data;
+        size_t count = ovsdb_disk_store_count(ds, tnode->name);
+
+        printf("table %s (%"PRIuSIZE" row%s):\n",
+               tnode->name, count, count == 1 ? "" : "s");
+
+        if (show_log_verbosity > 0 && count > 0) {
+            struct ovsdb_column_set columns;
+            ovsdb_column_set_init(&columns);
+            ovsdb_column_set_add_all(&columns, table);
+
+            struct ovsdb_disk_store_cursor *cursor;
+            cursor = ovsdb_disk_store_cursor_open(ds, tnode->name);
+            if (cursor) {
+                for (;;) {
+                    struct ovsdb_row *row;
+                    row = ovsdb_disk_store_cursor_next(cursor, table);
+                    if (!row) {
+                        break;
+                    }
+
+                    printf("  row "UUID_FMT":\n",
+                           UUID_ARGS(ovsdb_row_get_uuid(row)));
+
+                    if (show_log_verbosity > 1) {
+                        struct json *json = ovsdb_row_to_json(row, &columns);
+                        char *s = json_to_string(json, JSSF_SORT);
+                        printf("    %s\n", s);
+                        free(s);
+                        json_destroy(json);
+                    }
+
+                    ovsdb_row_destroy(row);
+                }
+                ovsdb_disk_store_cursor_close(cursor);
+            }
+            ovsdb_column_set_destroy(&columns);
+        }
+        putchar('\n');
+    }
+
+    ovsdb_disk_store_close(ds);
+    ovsdb_destroy(ovsdb);
+    ovsdb_schema_destroy(schema);
+}
+
 static void
 do_show_log(struct ovs_cmdl_context *ctx)
 {
     const char *db_file_name = ctx->argc >= 2 ? ctx->argv[1] : default_db();
-    struct ovsdb_log *log;
 
+    if (ovsdb_disk_store_is_binary(db_file_name)) {
+        do_show_log_binary(db_file_name);
+        return;
+    }
+
+    struct ovsdb_log *log;
     check_ovsdb_error(ovsdb_log_open(db_file_name, OVSDB_MAGIC"|"RAFT_MAGIC,
                                      OVSDB_LOG_READ_ONLY, -1, &log));
     if (!strcmp(ovsdb_log_get_magic(log), OVSDB_MAGIC)) {

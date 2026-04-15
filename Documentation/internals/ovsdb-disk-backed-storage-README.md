@@ -91,9 +91,8 @@ ovsdb-tool convert-format /etc/openvswitch/conf.db binary
 ovsdb-tool db-format /etc/openvswitch/conf.db
 # Output: "binaryv1"
 
-# Convert Binary -> JSON (requires schema file):
-ovsdb-tool convert-format /etc/openvswitch/conf.db json \
-    /usr/share/openvswitch/vswitch.ovsschema
+# Convert Binary -> JSON (schema file is optional):
+ovsdb-tool convert-format /etc/openvswitch/conf.db json
 
 # Verify:
 ovsdb-tool db-format /etc/openvswitch/conf.db
@@ -104,17 +103,54 @@ ovsdb-tool db-format /etc/openvswitch/conf.db
 uses atomic rename -- the original file is untouched until the new
 file is fully written and fsynced.
 
-Existing `ovsdb-tool` commands work with binary databases:
+### Creating Binary Databases Directly
+
+Use the `--format` flag with `ovsdb-tool create` to create a new
+database in binary format without a separate conversion step:
 
 ```bash
-# These work on both JSON and binary databases:
+# Create a binary database:
+ovsdb-tool create --format binary conf.db vswitch.ovsschema
+
+# Verify:
+ovsdb-tool db-format conf.db
+# Output: "binaryv1"
+
+# Create a JSON database (default, unchanged):
+ovsdb-tool create conf.db vswitch.ovsschema
+```
+
+### ovsdb-tool Commands and Binary Format
+
+All `ovsdb-tool` commands now fully support binary databases.
+Commands that write output (`compact`, `convert`) preserve the input
+format -- a binary database stays binary after compaction or schema
+conversion.
+
+```bash
+# These all work on both JSON and binary databases:
+ovsdb-tool db-name /etc/openvswitch/conf.db
 ovsdb-tool db-version /etc/openvswitch/conf.db
 ovsdb-tool db-cksum /etc/openvswitch/conf.db
 ovsdb-tool db-is-standalone /etc/openvswitch/conf.db
+ovsdb-tool needs-conversion /etc/openvswitch/conf.db vswitch.ovsschema
 
-# Compact a binary database (rewrites without deleted rows):
+# Compact a binary database (preserves binary format):
 ovsdb-tool compact /etc/openvswitch/conf.db
+
+# Convert schema on a binary database (preserves binary format):
+ovsdb-tool convert /etc/openvswitch/conf.db new-schema.ovsschema
+
+# Inspect a binary database (use -m for row UUIDs, -mm for row data):
+ovsdb-tool show-log /etc/openvswitch/conf.db
+ovsdb-tool -m show-log /etc/openvswitch/conf.db
+ovsdb-tool -mm show-log /etc/openvswitch/conf.db
 ```
+
+The `show-log` command adapts to the database format.  For JSON
+databases it shows the sequential transaction log.  For binary
+databases (which have no transaction log) it dumps the current state
+of each table, with increasing detail at higher verbosity levels.
 
 ### Running ovsdb-server with Binary Databases
 
@@ -161,7 +197,7 @@ loading.  All rows are accessible via synchronous disk reads.
 
 ```bash
 ovs-appctl -t ovsdb-server exit
-ovsdb-tool convert-format conf.db json vswitch.ovsschema
+ovsdb-tool convert-format conf.db json
 ovsdb-server --remote=punix:db.sock --pidfile --detach conf.db
 ```
 
@@ -344,16 +380,11 @@ ovsdb-server --disk-store \
 ovs-appctl -t ovsdb-server exit
 
 # 2. Convert back to JSON.
-ovsdb-tool convert-format /etc/openvswitch/conf.db json \
-    /usr/share/openvswitch/vswitch.ovsschema
+ovsdb-tool convert-format /etc/openvswitch/conf.db json
 
 # 3. Restart without --disk-store.
 ovsdb-server --remote=punix:db.sock --pidfile --detach conf.db
 ```
-
-The binary-to-JSON conversion requires the schema file because the
-binary format stores rows but not the full schema definition needed
-to reconstruct a JSON log.
 
 **Important notes**:
 
@@ -366,7 +397,7 @@ to reconstruct a JSON log.
   binary format is standalone only.  See "Limitations" section.
 - Old OVS versions that do not understand `BINARYV1` will refuse to
   open the file with a clear error message.  Downgrade with
-  `ovsdb-tool convert-format ... json <schema>` before rolling back.
+  `ovsdb-tool convert-format <db> json` before rolling back.
 
 ## New Components
 
@@ -728,7 +759,9 @@ TSAN can be enabled for the worker pool tests by building with
 | `ovsdb/row.h`           | Declared `ovsdb_row_count_atoms()`            |
 | `ovsdb/row.c`           | Implemented `ovsdb_row_count_atoms()`         |
 | `ovsdb/ovsdb-server.c`  | Worker pool init/run/wait/destroy             |
-| `ovsdb/ovsdb-tool.c`    | convert-format, db-format, binary-aware cmds  |
+| `ovsdb/ovsdb-tool.c`    | Full binary format support: create --format,  |
+|                         | format-preserving compact/convert, binary      |
+|                         | show-log, db-name, needs-conversion fixes      |
 | `ovsdb/storage.c`       | Binary format detection in storage open       |
 | `ovsdb/log.h`           | OVSDB_BINARY_MAGIC constant                   |
 | `ovsdb/automake.mk`     | Added new source files to libovsdb            |
@@ -760,16 +793,6 @@ databases cannot use `--disk-store`.  The reasons:
 **If you attempt to use `--disk-store` with a clustered database**,
 the server will open it but the Raft protocol will not function.
 Only use `--disk-store` with standalone databases.
-
-### Binary-to-JSON Conversion Requires Schema File
-
-The binary format stores a SHA-1 hash of the schema but not the full
-schema definition.  When converting binary to JSON, you must provide
-the schema file:
-
-```bash
-ovsdb-tool convert-format conf.db json /path/to/vswitch.ovsschema
-```
 
 ### Transactions in Binary Mode
 
