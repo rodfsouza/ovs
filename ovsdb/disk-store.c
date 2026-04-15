@@ -55,9 +55,14 @@ VLOG_DEFINE_THIS_MODULE(disk_store);
  *   8 bytes   magic ("BINARYV1")
  *   4 bytes   format_version (uint32_t, network order)
  *  20 bytes   schema_hash (SHA-1 digest)
- *   4 bytes   reserved (zero)
+ *   4 bytes   schema_json_len (uint32_t): length of embedded schema JSON
+ *             that follows the fixed header.  Zero in legacy files.
  *  ----
- *  36 bytes total
+ *  36 bytes fixed header
+ *
+ * If schema_json_len > 0, 'schema_json_len' bytes of UTF-8 schema
+ * JSON follow the fixed header.  Row data begins at offset
+ * 36 + schema_json_len.
  */
 #define DISK_STORE_HEADER_SIZE  36
 
@@ -88,6 +93,8 @@ struct ovsdb_disk_store {
     struct hmap index;            /* UUID -> disk_store_index_entry. */
     uint8_t schema_hash[SHA1_DIGEST_SIZE]; /* SHA-1 of schema JSON. */
     struct ovsdb_schema *schema;  /* Embedded schema (owned). */
+    uint32_t schema_json_len;     /* Length of embedded schema JSON.
+                                   * Zero in legacy files. */
 };
 
 /* Cursor for iterating rows of a single table. */
@@ -495,7 +502,9 @@ disk_store_compute_schema_hash(const struct ovsdb_schema *schema,
 
 static struct ovsdb_error *
 disk_store_write_header(int fd,
-                        const uint8_t schema_hash[SHA1_DIGEST_SIZE])
+                        const uint8_t schema_hash[SHA1_DIGEST_SIZE],
+                        const char *schema_json_str,
+                        uint32_t schema_json_len)
 {
     uint8_t header[DISK_STORE_HEADER_SIZE];
     uint32_t version = DISK_STORE_VERSION;
@@ -505,19 +514,29 @@ disk_store_write_header(int fd,
     memcpy(header, DISK_STORE_MAGIC, DISK_STORE_MAGIC_LEN);
     memcpy(header + 8, &version, sizeof version);
     memcpy(header + 12, schema_hash, SHA1_DIGEST_SIZE);
-    /* bytes 32..35 reserved, already zeroed. */
+    memcpy(header + 32, &schema_json_len, sizeof schema_json_len);
 
     n = write(fd, header, sizeof header);
     if (n != (ssize_t) sizeof header) {
         return ovsdb_io_error(errno, "failed to write disk store "
                               "header");
     }
+
+    /* Write embedded schema JSON after the fixed header. */
+    if (schema_json_len > 0 && schema_json_str) {
+        n = write(fd, schema_json_str, schema_json_len);
+        if (n != (ssize_t) schema_json_len) {
+            return ovsdb_io_error(errno, "failed to write embedded "
+                                  "schema JSON");
+        }
+    }
     return NULL;
 }
 
 static struct ovsdb_error *
 disk_store_read_header(int fd,
-                       uint8_t schema_hash[SHA1_DIGEST_SIZE])
+                       uint8_t schema_hash[SHA1_DIGEST_SIZE],
+                       uint32_t *schema_json_lenp)
 {
     uint8_t header[DISK_STORE_HEADER_SIZE];
     ssize_t n;
@@ -540,6 +559,7 @@ disk_store_read_header(int fd,
     }
 
     memcpy(schema_hash, header + 12, SHA1_DIGEST_SIZE);
+    memcpy(schema_json_lenp, header + 32, sizeof *schema_json_lenp);
     return NULL;
 }
 
@@ -550,7 +570,7 @@ disk_store_read_header(int fd,
 static struct ovsdb_error *
 disk_store_rebuild_index(struct ovsdb_disk_store *store)
 {
-    off_t pos = DISK_STORE_HEADER_SIZE;
+    off_t pos = DISK_STORE_HEADER_SIZE + store->schema_json_len;
     struct stat st;
 
     if (fstat(store->fd, &st) < 0) {
@@ -673,22 +693,36 @@ ovsdb_disk_store_open(const char *filename,
     }
 
     if (st.st_size == 0) {
-        /* New file: write header. */
+        /* New file: write header with embedded schema JSON. */
         struct ovsdb_error *err;
+        char *schema_str = NULL;
+        uint32_t schema_len = 0;
 
-        err = disk_store_write_header(fd, schema_hash);
+        if (schema) {
+            struct json *sj = ovsdb_schema_to_json(schema);
+            schema_str = json_to_string(sj, 0);
+            schema_len = strlen(schema_str);
+            json_destroy(sj);
+        }
+
+        err = disk_store_write_header(fd, schema_hash,
+                                      schema_str, schema_len);
+        free(schema_str);
         if (err) {
             char *msg = ovsdb_error_to_string_free(err);
             VLOG_ERR("%s", msg);
             free(msg);
             goto error;
         }
+        store->schema_json_len = schema_len;
     } else {
         /* Existing file: validate header and rebuild index. */
         uint8_t existing_hash[SHA1_DIGEST_SIZE];
+        uint32_t schema_json_len = 0;
         struct ovsdb_error *err;
 
-        err = disk_store_read_header(fd, existing_hash);
+        err = disk_store_read_header(fd, existing_hash,
+                                     &schema_json_len);
         if (err) {
             char *msg = ovsdb_error_to_string_free(err);
             VLOG_ERR("%s", msg);
@@ -705,6 +739,30 @@ ovsdb_disk_store_open(const char *filename,
         /* Store the on-disk hash for later comparison. */
         memcpy(store->schema_hash, existing_hash,
                SHA1_DIGEST_SIZE);
+        store->schema_json_len = schema_json_len;
+
+        /* If no schema was provided but the file has an embedded
+         * schema, parse it so get_schema() works. */
+        if (!store->schema && schema_json_len > 0) {
+            char *buf = xmalloc(schema_json_len + 1);
+            ssize_t n = pread(fd, buf, schema_json_len,
+                              DISK_STORE_HEADER_SIZE);
+            if (n == (ssize_t) schema_json_len) {
+                buf[schema_json_len] = '\0';
+                struct json *sj = json_from_string(buf);
+                if (sj->type != JSON_STRING) {
+                    struct ovsdb_schema *s;
+                    err = ovsdb_schema_from_json(sj, &s);
+                    if (!err) {
+                        store->schema = s;
+                    } else {
+                        ovsdb_error_destroy(err);
+                    }
+                }
+                json_destroy(sj);
+            }
+            free(buf);
+        }
 
         err = disk_store_rebuild_index(store);
         if (err) {
@@ -1159,13 +1217,39 @@ ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
         return error;
     }
 
-    /* Write header. */
-    error = disk_store_write_header(tmp_fd, store->schema_hash);
-    if (error) {
-        close(tmp_fd);
-        unlink(tmp_filename);
-        free(tmp_filename);
-        return error;
+    /* Write header with embedded schema. */
+    {
+        char *schema_str = NULL;
+        uint32_t schema_len = 0;
+
+        if (store->schema) {
+            struct json *sj = ovsdb_schema_to_json(store->schema);
+            schema_str = json_to_string(sj, 0);
+            schema_len = strlen(schema_str);
+            json_destroy(sj);
+        } else if (store->schema_json_len > 0) {
+            /* Re-read embedded schema from original file. */
+            schema_str = xmalloc(store->schema_json_len);
+            ssize_t rn = pread(store->fd, schema_str,
+                               store->schema_json_len,
+                               DISK_STORE_HEADER_SIZE);
+            if (rn == (ssize_t) store->schema_json_len) {
+                schema_len = store->schema_json_len;
+            } else {
+                free(schema_str);
+                schema_str = NULL;
+            }
+        }
+
+        error = disk_store_write_header(tmp_fd, store->schema_hash,
+                                        schema_str, schema_len);
+        free(schema_str);
+        if (error) {
+            close(tmp_fd);
+            unlink(tmp_filename);
+            free(tmp_filename);
+            return error;
+        }
     }
 
     /* Copy all non-deleted records. */
@@ -1308,13 +1392,12 @@ ovsdb_disk_store_is_binary(const char *filename)
 
 /* Reads the schema from a BINARYV1 file.
  *
- * The binary file stores the schema as a JSON record written as the
- * very first "row" right after the file header.  The record uses the
- * reserved table name "__schema__" and contains the JSON text as a
- * single string column.
+ * The file header contains a 'schema_json_len' field.  If nonzero,
+ * the full schema JSON is embedded in the file immediately after
+ * the 36-byte fixed header.  Legacy files with schema_json_len == 0
+ * do not have an embedded schema and this function returns NULL.
  *
- * If the schema cannot be read (e.g. file not BINARYV1 or corrupt),
- * returns NULL. */
+ * Returns NULL if the schema cannot be read. */
 struct ovsdb_schema *
 ovsdb_disk_store_read_schema(const char *filename)
 {
