@@ -730,7 +730,7 @@ ovsdb_disk_store_open(const char *filename,
         store->schema_json_len = schema_len;
     } else {
         /* Existing file: validate header and rebuild index. */
-        uint8_t existing_hash[SHA1_DIGEST_SIZE];
+        uint8_t existing_hash[SHA1_DIGEST_SIZE] = {0};
         uint32_t schema_json_len = 0;
         struct ovsdb_error *err;
 
