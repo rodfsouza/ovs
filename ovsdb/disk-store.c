@@ -500,6 +500,18 @@ disk_store_compute_schema_hash(const struct ovsdb_schema *schema,
     json_destroy(json);
 }
 
+/* Serializes 'schema' to a JSON string.  Returns the string (caller
+ * must free) and stores its length in '*lenp'. */
+static char *
+disk_store_schema_to_string(const struct ovsdb_schema *schema, uint32_t *lenp)
+{
+    struct json *sj = ovsdb_schema_to_json(schema);
+    char *s = json_to_string(sj, 0);
+    *lenp = strlen(s);
+    json_destroy(sj);
+    return s;
+}
+
 /* ------------------------------------------------------------------ */
 /* File header I/O.                                                    */
 /* ------------------------------------------------------------------ */
@@ -703,10 +715,7 @@ ovsdb_disk_store_open(const char *filename,
         uint32_t schema_len = 0;
 
         if (schema) {
-            struct json *sj = ovsdb_schema_to_json(schema);
-            schema_str = json_to_string(sj, 0);
-            schema_len = strlen(schema_str);
-            json_destroy(sj);
+            schema_str = disk_store_schema_to_string(schema, &schema_len);
         }
 
         err = disk_store_write_header(fd, schema_hash,
@@ -794,6 +803,7 @@ ovsdb_disk_store_open(const char *filename,
 error:
     close(fd);
     hmap_destroy(&store->index);
+    ovsdb_schema_destroy(store->schema);
     free(store->filename);
     free(store);
     return NULL;
@@ -971,27 +981,8 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
     r.size = len;
     r.pos = 0;
 
-    /* We already parsed uuid, total_len, n_columns, flags from the
-     * outer caller.  But the body starts with table name that we
-     * need to skip here. */
-
-    /* Read n_columns and flags that the caller already consumed
-     * from the header -- wait, the caller gives us data AFTER
-     * the 24-byte header.  But the 24-byte header already had
-     * n_columns and flags, so we need them passed in.  Let's
-     * re-read them from the original buffer.
-     *
-     * Actually, let's restructure: the caller reads the full
-     * record and passes us the full record bytes, plus the
-     * pre-parsed uuid.  We re-parse n_columns/flags from offsets
-     * 20 and 22 relative to the record start, but the caller
-     * passed us the body starting at offset 0 = record start.
-     */
-
-    /* Actually the caller gives us data starting AFTER the 24-byte
-     * fixed header.  So first thing in 'data' is the table name. */
-
-    /* Skip table name. */
+    /* 'data' starts AFTER the 24-byte fixed row header.
+     * First field is the table name (2-byte length + name bytes). */
     if (!disk_store_reader_get_uint16(&r, &name_len)) {
         return NULL;
     }
@@ -1254,10 +1245,8 @@ ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
 
         if (!schema_str && store->schema) {
             /* Fallback: serialize from the parsed schema. */
-            struct json *sj = ovsdb_schema_to_json(store->schema);
-            schema_str = json_to_string(sj, 0);
-            schema_len = strlen(schema_str);
-            json_destroy(sj);
+            schema_str = disk_store_schema_to_string(store->schema,
+                                                     &schema_len);
         }
 
         error = disk_store_write_header(tmp_fd, store->schema_hash,

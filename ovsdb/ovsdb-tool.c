@@ -403,6 +403,26 @@ write_standalone_db(const char *file_name, const char *comment,
     return error;
 }
 
+/* Opens a binary disk store at 'filename' and returns the store and
+ * its embedded schema.  Terminates with an error if the file cannot
+ * be opened or the schema cannot be read. */
+static void
+open_binary_ds_or_fatal(const char *filename,
+                        struct ovsdb_disk_store **dsp,
+                        struct ovsdb_schema **schemap)
+{
+    *dsp = ovsdb_disk_store_open(filename, NULL);
+    if (!*dsp) {
+        ovs_fatal(0, "%s: failed to open binary disk store", filename);
+    }
+
+    *schemap = ovsdb_disk_store_get_schema(*dsp);
+    if (!*schemap) {
+        ovsdb_disk_store_close(*dsp);
+        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
+    }
+}
+
 /* Writes all rows of 'db' to a new BINARYV1 disk store at 'file_name'.
  * Returns NULL on success, otherwise an ovsdb_error. */
 static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
@@ -441,18 +461,9 @@ write_standalone_binary_db(const char *file_name, const struct ovsdb *db)
 static struct ovsdb *
 read_binary_db(const char *filename)
 {
-    /* Open once — the store parses the embedded schema from the file
-     * header, so we don't need to provide one at open time. */
-    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, NULL);
-    if (!ds) {
-        ovs_fatal(0, "%s: failed to open binary disk store", filename);
-    }
-
-    struct ovsdb_schema *schema = ovsdb_disk_store_get_schema(ds);
-    if (!schema) {
-        ovsdb_disk_store_close(ds);
-        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
-    }
+    struct ovsdb_disk_store *ds;
+    struct ovsdb_schema *schema;
+    open_binary_ds_or_fatal(filename, &ds, &schema);
 
     struct ovsdb *ovsdb = ovsdb_create(ovsdb_schema_clone(schema), NULL);
 
@@ -521,17 +532,23 @@ convert_json_to_binary(const char *db_name)
  * Reads all rows from the binary store, builds an in-memory ovsdb,
  * and writes a standard JSON log file. */
 static void
-convert_binary_to_json(const char *db_name,
-                       const char *schema_file OVS_UNUSED)
+convert_binary_to_json(const char *db_name)
 {
     char *src_name = follow_symlinks(db_name);
     char *tmp_name = xasprintf("%s.json.tmp", src_name);
+
+    /* Lock the source to prevent concurrent writes during conversion. */
+    struct lockfile *src_lock = NULL;
+    int retval = lockfile_lock(src_name, &src_lock);
+    if (retval) {
+        ovs_fatal(retval, "%s: failed to lock", src_name);
+    }
 
     struct ovsdb *ovsdb = read_binary_db(src_name);
 
     /* Lock the destination and write JSON. */
     struct lockfile *lock = NULL;
-    int retval = lockfile_lock(tmp_name, &lock);
+    retval = lockfile_lock(tmp_name, &lock);
     if (retval) {
         ovs_fatal(retval, "%s: failed to lock", tmp_name);
     }
@@ -551,6 +568,7 @@ convert_binary_to_json(const char *db_name,
     fsync_parent_dir(src_name);
 
     ovsdb_destroy(ovsdb);
+    lockfile_unlock(src_lock);
     lockfile_unlock(lock);
     free(tmp_name);
     free(src_name);
@@ -571,7 +589,7 @@ do_convert_format(struct ovs_cmdl_context *ctx)
         if (!ovsdb_disk_store_is_binary(db)) {
             ovs_fatal(0, "%s: already in JSON format", db);
         }
-        convert_binary_to_json(db, ctx->argc >= 4 ? ctx->argv[3] : NULL);
+        convert_binary_to_json(db);
     } else {
         ovs_fatal(0, "unknown format \"%s\" (use \"json\" or "
                   "\"binary\")", format);
@@ -721,18 +739,9 @@ do_db_name(struct ovs_cmdl_context *ctx)
     const char *db_file_name = ctx->argc >= 2 ? ctx->argv[1] : default_db();
 
     if (ovsdb_disk_store_is_binary(db_file_name)) {
-        struct ovsdb_disk_store *ds =
-            ovsdb_disk_store_open(db_file_name, NULL);
-        if (!ds) {
-            ovs_fatal(0, "%s: failed to open binary disk store",
-                      db_file_name);
-        }
-        struct ovsdb_schema *schema = ovsdb_disk_store_get_schema(ds);
-        if (!schema) {
-            ovsdb_disk_store_close(ds);
-            ovs_fatal(0, "%s: cannot read schema from binary database",
-                      db_file_name);
-        }
+        struct ovsdb_disk_store *ds;
+        struct ovsdb_schema *schema;
+        open_binary_ds_or_fatal(db_file_name, &ds, &schema);
         puts(schema->name);
         ovsdb_disk_store_close(ds);
         return;
@@ -1390,16 +1399,9 @@ do_show_log_cluster(struct ovsdb_log *log)
 static void
 do_show_log_binary(const char *filename)
 {
-    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, NULL);
-    if (!ds) {
-        ovs_fatal(0, "%s: failed to open binary disk store", filename);
-    }
-
-    struct ovsdb_schema *schema = ovsdb_disk_store_get_schema(ds);
-    if (!schema) {
-        ovsdb_disk_store_close(ds);
-        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
-    }
+    struct ovsdb_disk_store *ds;
+    struct ovsdb_schema *schema;
+    open_binary_ds_or_fatal(filename, &ds, &schema);
 
     printf("format: binaryv1\n");
     printf("schema: \"%s\" version=\"%s\" cksum=\"%s\"\n\n",

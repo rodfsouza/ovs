@@ -290,6 +290,20 @@ ovsdb_storage_get_name(const struct ovsdb_storage *storage)
  *
  * If the read reaches end of file, returns NULL and stores NULL in
  * '*jsonp'. */
+/* Returns a cloned schema from the binary disk store backend.
+ * Tries the in-memory schema first, falls back to reading
+ * the embedded schema from the file header.  Returns NULL on failure. */
+static struct ovsdb_schema *
+storage_ds_clone_schema(const struct ovsdb_storage *storage)
+{
+    struct ovsdb_schema *s = ovsdb_disk_store_get_schema(storage->ds);
+    if (s) {
+        return ovsdb_schema_clone(s);
+    }
+    return ovsdb_disk_store_read_schema(
+        ovsdb_disk_store_get_filename(storage->ds));
+}
+
 struct ovsdb_error * OVS_WARN_UNUSED_RESULT
 ovsdb_storage_read(struct ovsdb_storage *storage,
                    struct ovsdb_schema **schemap,
@@ -310,19 +324,10 @@ ovsdb_storage_read(struct ovsdb_storage *storage,
          * then signal end-of-data.  There are no transaction records
          * to replay — rows are loaded on demand from disk. */
         if (storage->n_read++ == 0) {
-            struct ovsdb_schema *s = ovsdb_disk_store_get_schema(storage->ds);
-            if (s) {
-                *schemap = ovsdb_schema_clone(s);
-            } else {
-                /* Schema was not passed at open time; read it from
-                 * the file header instead. */
-                s = ovsdb_disk_store_read_schema(
-                    ovsdb_disk_store_get_filename(storage->ds));
-                if (!s) {
-                    return ovsdb_error(NULL, "failed to read schema "
-                                       "from binary disk store");
-                }
-                *schemap = s;
+            *schemap = storage_ds_clone_schema(storage);
+            if (!*schemap) {
+                return ovsdb_error(NULL, "failed to read schema "
+                                   "from binary disk store");
             }
         }
         return NULL;
@@ -397,14 +402,7 @@ ovsdb_storage_read_schema(struct ovsdb_storage *storage)
 {
     /* Binary disk store: schema is embedded in the store. */
     if (storage->ds) {
-        struct ovsdb_schema *s;
-        s = ovsdb_disk_store_get_schema(storage->ds);
-        if (s) {
-            return ovsdb_schema_clone(s);
-        }
-        /* Fallback: read from file. */
-        s = ovsdb_disk_store_read_schema(
-            ovsdb_disk_store_get_filename(storage->ds));
+        struct ovsdb_schema *s = storage_ds_clone_schema(storage);
         if (!s) {
             ovs_fatal(0, "failed to read schema from binary "
                       "disk store");
