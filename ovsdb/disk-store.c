@@ -53,16 +53,20 @@ VLOG_DEFINE_THIS_MODULE(disk_store);
 
 /* File header layout (on disk):
  *   8 bytes   magic ("BINARYV1")
- *   4 bytes   format_version (uint32_t, network order)
+ *   4 bytes   format_version (uint32_t, native byte order)
  *  20 bytes   schema_hash (SHA-1 digest)
- *   4 bytes   schema_json_len (uint32_t): length of embedded schema JSON
- *             that follows the fixed header.  Zero in legacy files.
+ *   4 bytes   schema_json_len (uint32_t, native byte order):
+ *             length of embedded schema JSON that follows the fixed
+ *             header.  Zero in legacy files.
  *  ----
  *  36 bytes fixed header
  *
  * If schema_json_len > 0, 'schema_json_len' bytes of UTF-8 schema
  * JSON follow the fixed header.  Row data begins at offset
  * 36 + schema_json_len.
+ *
+ * All integer fields use native byte order.  Files are not portable
+ * across architectures with different endianness.
  */
 #define DISK_STORE_HEADER_SIZE  36
 
@@ -750,16 +754,26 @@ ovsdb_disk_store_open(const char *filename,
             if (n == (ssize_t) schema_json_len) {
                 buf[schema_json_len] = '\0';
                 struct json *sj = json_from_string(buf);
-                if (sj->type != JSON_STRING) {
+                if (sj->type == JSON_STRING) {
+                    VLOG_WARN("%s: embedded schema JSON is malformed: "
+                              "%s", filename, json_string(sj));
+                } else {
                     struct ovsdb_schema *s;
                     err = ovsdb_schema_from_json(sj, &s);
                     if (!err) {
                         store->schema = s;
                     } else {
-                        ovsdb_error_destroy(err);
+                        char *msg = ovsdb_error_to_string_free(err);
+                        VLOG_WARN("%s: embedded schema parse error: "
+                                  "%s", filename, msg);
+                        free(msg);
                     }
                 }
                 json_destroy(sj);
+            } else {
+                VLOG_WARN("%s: short read of embedded schema "
+                          "(expected %"PRIu32" bytes)",
+                          filename, schema_json_len);
             }
             free(buf);
         }
@@ -1217,18 +1231,15 @@ ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
         return error;
     }
 
-    /* Write header with embedded schema. */
+    /* Write header with embedded schema.  Prefer re-reading the raw
+     * schema bytes from the original file to avoid schema→JSON→schema
+     * round-trip fidelity issues (e.g. key ordering differences). */
     {
         char *schema_str = NULL;
         uint32_t schema_len = 0;
 
-        if (store->schema) {
-            struct json *sj = ovsdb_schema_to_json(store->schema);
-            schema_str = json_to_string(sj, 0);
-            schema_len = strlen(schema_str);
-            json_destroy(sj);
-        } else if (store->schema_json_len > 0) {
-            /* Re-read embedded schema from original file. */
+        if (store->schema_json_len > 0) {
+            /* Re-read embedded schema bytes from original file. */
             schema_str = xmalloc(store->schema_json_len);
             ssize_t rn = pread(store->fd, schema_str,
                                store->schema_json_len,
@@ -1239,6 +1250,14 @@ ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
                 free(schema_str);
                 schema_str = NULL;
             }
+        }
+
+        if (!schema_str && store->schema) {
+            /* Fallback: serialize from the parsed schema. */
+            struct json *sj = ovsdb_schema_to_json(store->schema);
+            schema_str = json_to_string(sj, 0);
+            schema_len = strlen(schema_str);
+            json_destroy(sj);
         }
 
         error = disk_store_write_header(tmp_fd, store->schema_hash,

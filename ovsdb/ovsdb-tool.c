@@ -291,7 +291,11 @@ do_create(struct ovs_cmdl_context *ctx)
     check_ovsdb_error(ovsdb_schema_from_file(schema_file_name, &schema));
 
     if (create_format && !strcmp(create_format, "binary")) {
-        /* Create empty binary database with schema. */
+        /* Create empty binary database with schema.
+         * Fail if the file already exists, matching JSON create. */
+        if (!access(db_file_name, F_OK)) {
+            ovs_fatal(0, "%s: database already exists", db_file_name);
+        }
         struct ovsdb_disk_store *ds = ovsdb_disk_store_open(db_file_name,
                                                              schema);
         if (!ds) {
@@ -437,14 +441,17 @@ write_standalone_binary_db(const char *file_name, const struct ovsdb *db)
 static struct ovsdb *
 read_binary_db(const char *filename)
 {
-    struct ovsdb_schema *schema = ovsdb_disk_store_read_schema(filename);
-    if (!schema) {
-        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
-    }
-
-    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, schema);
+    /* Open once — the store parses the embedded schema from the file
+     * header, so we don't need to provide one at open time. */
+    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, NULL);
     if (!ds) {
         ovs_fatal(0, "%s: failed to open binary disk store", filename);
+    }
+
+    struct ovsdb_schema *schema = ovsdb_disk_store_get_schema(ds);
+    if (!schema) {
+        ovsdb_disk_store_close(ds);
+        ovs_fatal(0, "%s: cannot read schema from binary database", filename);
     }
 
     struct ovsdb *ovsdb = ovsdb_create(ovsdb_schema_clone(schema), NULL);
@@ -472,7 +479,6 @@ read_binary_db(const char *filename)
     }
 
     ovsdb_disk_store_close(ds);
-    ovsdb_schema_destroy(schema);
     return ovsdb;
 }
 
@@ -715,14 +721,20 @@ do_db_name(struct ovs_cmdl_context *ctx)
     const char *db_file_name = ctx->argc >= 2 ? ctx->argv[1] : default_db();
 
     if (ovsdb_disk_store_is_binary(db_file_name)) {
-        struct ovsdb_schema *schema =
-            ovsdb_disk_store_read_schema(db_file_name);
+        struct ovsdb_disk_store *ds =
+            ovsdb_disk_store_open(db_file_name, NULL);
+        if (!ds) {
+            ovs_fatal(0, "%s: failed to open binary disk store",
+                      db_file_name);
+        }
+        struct ovsdb_schema *schema = ovsdb_disk_store_get_schema(ds);
         if (!schema) {
+            ovsdb_disk_store_close(ds);
             ovs_fatal(0, "%s: cannot read schema from binary database",
                       db_file_name);
         }
         puts(schema->name);
-        ovsdb_schema_destroy(schema);
+        ovsdb_disk_store_close(ds);
         return;
     }
 
@@ -1378,8 +1390,14 @@ do_show_log_cluster(struct ovsdb_log *log)
 static void
 do_show_log_binary(const char *filename)
 {
-    struct ovsdb_schema *schema = ovsdb_disk_store_read_schema(filename);
+    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, NULL);
+    if (!ds) {
+        ovs_fatal(0, "%s: failed to open binary disk store", filename);
+    }
+
+    struct ovsdb_schema *schema = ovsdb_disk_store_get_schema(ds);
     if (!schema) {
+        ovsdb_disk_store_close(ds);
         ovs_fatal(0, "%s: cannot read schema from binary database", filename);
     }
 
@@ -1387,11 +1405,8 @@ do_show_log_binary(const char *filename)
     printf("schema: \"%s\" version=\"%s\" cksum=\"%s\"\n\n",
            schema->name, schema->version, schema->cksum);
 
-    struct ovsdb_disk_store *ds = ovsdb_disk_store_open(filename, schema);
-    if (!ds) {
-        ovs_fatal(0, "%s: failed to open binary disk store", filename);
-    }
-
+    /* Create a schema-only ovsdb to get the ovsdb_table structs
+     * needed for cursor iteration.  No rows are populated here. */
     struct ovsdb *ovsdb = ovsdb_create(ovsdb_schema_clone(schema), NULL);
 
     struct shash_node *tnode;
@@ -1437,9 +1452,8 @@ do_show_log_binary(const char *filename)
         putchar('\n');
     }
 
-    ovsdb_disk_store_close(ds);
     ovsdb_destroy(ovsdb);
-    ovsdb_schema_destroy(schema);
+    ovsdb_disk_store_close(ds);
 }
 
 static void

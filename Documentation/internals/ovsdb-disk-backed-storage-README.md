@@ -411,7 +411,7 @@ A storage engine that writes OVSDB rows in a compact binary format.
 +------------------------------------------------------+
 | File Header (36 bytes)                               |
 |   magic:          8 bytes  "BINARYV1"                |
-|   format_version: 4 bytes  uint32_t (network order)  |
+|   format_version: 4 bytes  uint32_t (native byte order)  |
 |   schema_hash:   20 bytes  SHA-1 of schema JSON      |
 |   reserved:       4 bytes  (zero)                    |
 +------------------------------------------------------+
@@ -438,7 +438,7 @@ A storage engine that writes OVSDB rows in a compact binary format.
 
 | OVSDB Type     | On-Disk Size                       |
 |----------------|------------------------------------|
-| INTEGER        | 8 bytes (int64_t, network order)   |
+| INTEGER        | 8 bytes (int64_t, native byte order)   |
 | REAL           | 8 bytes (double, IEEE 754)         |
 | BOOLEAN        | 1 byte                             |
 | STRING         | 4 bytes length + UTF-8 bytes       |
