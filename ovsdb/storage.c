@@ -305,7 +305,28 @@ ovsdb_storage_read(struct ovsdb_storage *storage,
     struct json *json;
     struct json *schema_json = NULL;
     struct json *txn_json = NULL;
-    if (storage->raft) {
+    if (storage->ds) {
+        /* Binary disk store: return the schema on the first call,
+         * then signal end-of-data.  There are no transaction records
+         * to replay — rows are loaded on demand from disk. */
+        if (storage->n_read++ == 0) {
+            struct ovsdb_schema *s = ovsdb_disk_store_get_schema(storage->ds);
+            if (s) {
+                *schemap = ovsdb_schema_clone(s);
+            } else {
+                /* Schema was not passed at open time; read it from
+                 * the file header instead. */
+                s = ovsdb_disk_store_read_schema(
+                    ovsdb_disk_store_get_filename(storage->ds));
+                if (!s) {
+                    return ovsdb_error(NULL, "failed to read schema "
+                                       "from binary disk store");
+                }
+                *schemap = s;
+            }
+        }
+        return NULL;
+    } else if (storage->raft) {
         json = raft_next_entry(storage->raft, txnid);
         if (!json) {
             return NULL;
