@@ -1617,11 +1617,15 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
         }
     }
     if (!m->change_set) {
-        /* Check if any monitored table needs async bulk loading from
-         * disk store.  If so, defer the initial reply until all rows
-         * are loaded by the worker pool. */
-        if (ovsdb_monitor_needs_bulk_load(m->dbmon)) {
-            ovsdb_monitor_submit_bulk_load(m->dbmon);
+        /* If any monitored table needs async bulk loading from the
+         * disk store, defer the initial reply until the worker pool
+         * has loaded all rows.  If the worker pool is unavailable,
+         * submit_bulk_load() returns 0; in that case rows would be
+         * read synchronously by ovsdb_table_for_each_row() during
+         * snapshot composition, so we proceed to the inline path
+         * rather than parking the monitor forever. */
+        if (ovsdb_monitor_needs_bulk_load(m->dbmon)
+            && ovsdb_monitor_submit_bulk_load(m->dbmon) > 0) {
             m->deferred_request_id = json_clone(request_id);
             m->initial_loading = true;
             ovs_list_push_back(&s->deferred_monitors, &m->deferred_node);
@@ -1947,7 +1951,12 @@ ovsdb_jsonrpc_monitor_complete_deferred(struct ovsdb_jsonrpc_session *s)
             continue;
         }
 
-        /* All rows loaded — compose and send the initial snapshot. */
+        /* All rows loaded — compose and send the initial snapshot.
+         * The deferred path is only entered when 'change_set' was
+         * NULL in monitor_create (i.e., a fresh subscription, not a
+         * monitor_cond_since resume), so this is always an "initial"
+         * snapshot. */
+        ovs_assert(!m->change_set);
         ovsdb_monitor_get_initial(m->dbmon, &m->change_set);
         struct json *json = ovsdb_jsonrpc_monitor_compose_update(m, true);
         json = json ? json : json_object_create();
@@ -1957,6 +1966,9 @@ ovsdb_jsonrpc_monitor_complete_deferred(struct ovsdb_jsonrpc_session *s)
                     xasprintf(UUID_FMT,
                               UUID_ARGS(ovsdb_monitor_get_last_txnid(
                                       m->dbmon))));
+            /* "found" is false because this is an initial snapshot
+             * (not a resume from a previous txn-id); mirrors the
+             * !initial value used in the inline path. */
             struct json *json_found = json_boolean_create(false);
             json = json_array_create_3(json_found, json_last_id, json);
         }

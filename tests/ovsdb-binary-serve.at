@@ -158,3 +158,50 @@ AT_KEYWORDS([ovsdb binary-serve lazy-load])
 AT_CHECK([ovstest test-lazy-load], [0], [test-lazy-load: ok
 ])
 AT_CLEANUP
+
+dnl Regression test: monitor initial snapshot must include rows
+dnl for a freshly-converted binary database.  Before the deferred
+dnl monitor fix, table->rows was empty in disk-store mode and the
+dnl monitor returned an empty initial snapshot, which broke
+dnl ovn-nbctl show and similar tools.
+AT_SETUP([binary serve - monitor returns initial rows from binary DB])
+AT_KEYWORDS([ovsdb binary-serve monitor regression])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert several rows BEFORE conversion so they live only on disk
+dnl when the server starts (not yet loaded into memory).
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "one"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "two"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 3, "name": "three"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Issue a monitor request via ovsdb-client.  Block in the
+dnl background and capture the first <table-updates> message
+dnl which carries the initial snapshot.
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monitor.out 2>monitor.err &
+mon_pid=$!
+dnl Wait briefly for the initial snapshot to arrive.
+OVS_WAIT_UNTIL([test -s monitor.out])
+kill "$mon_pid" 2>/dev/null
+wait "$mon_pid" 2>/dev/null
+dnl The snapshot must include all three rows.
+AT_CHECK([grep -c '"one"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"two"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"three"' monitor.out], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP

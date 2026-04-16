@@ -30,6 +30,9 @@
 #include "lazy-load.h"
 #include "ovsdb.h"
 #include "transaction.h"
+#include "openvswitch/vlog.h"
+
+VLOG_DEFINE_THIS_MODULE(ovsdb_table);
 
 static void
 add_column(struct ovsdb_table_schema *ts, struct ovsdb_column *column)
@@ -392,14 +395,14 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
             return NULL;
 
         case OVSDB_ROW_UNLOADED:
-            /* Submit async load if worker pool available. */
+            /* Submit async load if worker pool available.
+             * ovsdb_lazy_load_request() transitions state to
+             * LOADING internally on success. */
             if (table->db
                 && ovsdb_lazy_load_request(
                        table->db,
                        CONST_CAST(struct ovsdb_table *, table),
                        uuid)) {
-                ovsdb_row_cache_set_state(
-                    table->cache, uuid, OVSDB_ROW_LOADING);
                 return NULL;  /* Caller must park. */
             }
             /* No worker pool — fall back to sync load. */
@@ -423,8 +426,12 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
 /* Iterates all rows in 'table', calling 'cb' for each.
  *
  * If the table has a disk_store, rows are read synchronously from
- * disk via cursor.  This is intended for background threads (e.g.
- * compaction_thread) where blocking is acceptable.
+ * disk via cursor.  Intended for background threads (e.g.
+ * compaction_thread) and for ovsdb-tool callers without a cache.
+ *
+ * Rows yielded by the cursor are destroyed immediately after the
+ * callback returns; see ovsdb_table_for_each_row() docs for the
+ * lifetime contract.
  *
  * If no disk_store, iterates the in-memory table->rows hmap. */
 void
@@ -436,20 +443,24 @@ ovsdb_table_for_each_row(const struct ovsdb_table *table,
 
         cursor = ovsdb_disk_store_cursor_open(table->disk_store,
                                               table->schema->name);
-        if (cursor) {
-            struct ovsdb_row *row;
-
-            while ((row = ovsdb_disk_store_cursor_next(
-                        cursor,
-                        CONST_CAST(struct ovsdb_table *, table)))) {
-                bool cont = cb(row, aux);
-                ovsdb_row_destroy(row);
-                if (!cont) {
-                    break;
-                }
-            }
-            ovsdb_disk_store_cursor_close(cursor);
+        if (!cursor) {
+            VLOG_WARN("ovsdb_table_for_each_row: failed to open "
+                      "disk store cursor for table %s",
+                      table->schema->name);
+            return;
         }
+
+        struct ovsdb_row *row;
+        while ((row = ovsdb_disk_store_cursor_next(
+                    cursor,
+                    CONST_CAST(struct ovsdb_table *, table)))) {
+            bool cont = cb(row, aux);
+            ovsdb_row_destroy(row);
+            if (!cont) {
+                break;
+            }
+        }
+        ovsdb_disk_store_cursor_close(cursor);
     } else {
         const struct ovsdb_row *row;
 
@@ -458,6 +469,78 @@ ovsdb_table_for_each_row(const struct ovsdb_table *table,
                 break;
             }
         }
+    }
+}
+
+/* Trampoline state for ovsdb_table_for_each_loaded_row() to bridge
+ * the cache callback signature into the table callback signature
+ * and de-duplicate against table->rows. */
+struct loaded_row_aux {
+    ovsdb_table_row_cb cb;
+    void *aux;
+    const struct hmap *table_rows;  /* Skip UUIDs already yielded. */
+    bool stop;
+};
+
+static bool
+loaded_row_cb(const struct ovsdb_row *row, void *aux_)
+{
+    struct loaded_row_aux *trampoline = aux_;
+
+    /* Skip if this UUID was already yielded from table->rows. */
+    if (trampoline->table_rows) {
+        const struct uuid *uuid = ovsdb_row_get_uuid(row);
+        const struct ovsdb_row *r;
+        HMAP_FOR_EACH_WITH_HASH (r, hmap_node, uuid_hash(uuid),
+                                 trampoline->table_rows) {
+            if (uuid_equals(ovsdb_row_get_uuid(r), uuid)) {
+                return true;  /* Continue, but skip this row. */
+            }
+        }
+    }
+
+    if (!trampoline->cb(row, trampoline->aux)) {
+        trampoline->stop = true;
+        return false;
+    }
+    return true;
+}
+
+/* Iterates all currently-loaded rows in 'table' with stable row
+ * pointers.  See ovsdb_table_for_each_loaded_row() in table.h for
+ * the lifetime contract.
+ *
+ * For tables with both table->rows entries (post-startup
+ * modifications) and a row cache (disk-loaded snapshot), yields
+ * table->rows entries first and then cache CACHED entries whose
+ * UUID is not already in table->rows.  This matches the precedence
+ * of ovsdb_table_get_row(), which checks table->rows before cache.
+ *
+ * Does NOT trigger lazy loading; callers must have already
+ * submitted a bulk load and waited for completion. */
+void
+ovsdb_table_for_each_loaded_row(const struct ovsdb_table *table,
+                                ovsdb_table_row_cb cb, void *aux)
+{
+    /* First, yield rows from table->rows (most recent versions). */
+    const struct ovsdb_row *row;
+    HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+        if (!cb(row, aux)) {
+            return;
+        }
+    }
+
+    /* Then, yield cache CACHED entries that aren't already in
+     * table->rows. */
+    if (table->cache) {
+        struct loaded_row_aux trampoline = {
+            .cb = cb,
+            .aux = aux,
+            .table_rows = &table->rows,
+            .stop = false,
+        };
+        ovsdb_row_cache_for_each_loaded(table->cache, loaded_row_cb,
+                                        &trampoline);
     }
 }
 

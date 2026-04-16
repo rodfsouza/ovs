@@ -18,11 +18,14 @@
 #include "lazy-load.h"
 
 #include "disk-store.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/uuid.h"
 #include "openvswitch/vlog.h"
 #include "ovsdb.h"
 #include "row.h"
 #include "row-cache.h"
 #include "table.h"
+#include "uuid.h"
 #include "worker-pool.h"
 #include "util.h"
 
@@ -61,11 +64,34 @@ row_load_worker(void *arg)
     return row;
 }
 
+/* Returns true if 'uuid' is present in the table->rows hmap.
+ * Caller must hold no locks; runs on the main thread. */
+static bool
+row_in_table_rows(const struct ovsdb_table *table,
+                  const struct uuid *uuid)
+{
+    const struct ovsdb_row *r;
+
+    HMAP_FOR_EACH_WITH_HASH (r, hmap_node, uuid_hash(uuid),
+                             &table->rows) {
+        if (uuid_equals(ovsdb_row_get_uuid(r), uuid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Done callback: runs on the main thread during
  * ovsdb_worker_pool_run().
  *
  * Inserts the loaded row into the table's cache and signals
- * the trigger subsystem to retry parked triggers. */
+ * the trigger subsystem to retry parked triggers.
+ *
+ * Concurrency note: while this load was in flight, a transaction
+ * may have committed a newer version of the same UUID into
+ * table->rows.  In that case the loaded copy is stale and is
+ * discarded; table->rows takes precedence (matching the get_row
+ * lookup order). */
 static void
 row_load_done(void *result, void *aux)
 {
@@ -73,20 +99,29 @@ row_load_done(void *result, void *aux)
     struct row_load_request *req = aux;
 
     if (row) {
-        size_t n_atoms = ovsdb_row_count_atoms(row);
+        if (row_in_table_rows(req->table, &req->uuid)) {
+            /* Newer version exists in table->rows — discard load. */
+            ovsdb_row_destroy(row);
+            ovsdb_row_cache_remove(req->table->cache, &req->uuid);
+            VLOG_DBG("lazy-load: discarded stale load of "UUID_FMT
+                     " (newer version in table->rows)",
+                     UUID_ARGS(&req->uuid));
+        } else {
+            size_t n_atoms = ovsdb_row_count_atoms(row);
 
-        /* Insert sets state to OVSDB_ROW_CACHED automatically. */
-        ovsdb_row_cache_insert(req->table->cache, row,
-                               n_atoms);
+            /* Insert sets state to OVSDB_ROW_CACHED automatically. */
+            ovsdb_row_cache_insert(req->table->cache, row,
+                                   n_atoms);
 
-        /* Wake the trigger subsystem so parked triggers
-         * that were waiting for this row get retried. */
+            VLOG_DBG("lazy-load: loaded row "UUID_FMT
+                     " (%"PRIuSIZE" atoms)",
+                     UUID_ARGS(&req->uuid), n_atoms);
+        }
+
+        /* Wake the trigger subsystem so parked triggers that were
+         * waiting for this row get retried. */
         req->db->run_triggers = true;
         req->db->run_triggers_now = true;
-
-        VLOG_DBG("lazy-load: loaded row "UUID_FMT
-                 " (%"PRIuSIZE" atoms)",
-                 UUID_ARGS(&req->uuid), n_atoms);
     } else {
         VLOG_WARN("lazy-load: failed to load row "UUID_FMT,
                   UUID_ARGS(&req->uuid));
@@ -111,6 +146,10 @@ ovsdb_lazy_load_destroy(void)
     lazy_pool = NULL;
 }
 
+/* Submits an async row load for 'uuid' in 'table'.  On success,
+ * transitions the cache entry's state from UNLOADED to LOADING so
+ * callers do not need to do so themselves (single source of truth).
+ * Returns false if the worker pool is unavailable. */
 bool
 ovsdb_lazy_load_request(struct ovsdb *db,
                         struct ovsdb_table *table,
@@ -130,6 +169,13 @@ ovsdb_lazy_load_request(struct ovsdb *db,
     ovsdb_worker_pool_submit(lazy_pool,
                              row_load_worker, req,
                              row_load_done, req);
+
+    /* Mark the cache entry as LOADING so concurrent get_row() and
+     * bulk_request() calls don't resubmit the same UUID. */
+    if (table->cache) {
+        ovsdb_row_cache_set_state(table->cache, uuid, OVSDB_ROW_LOADING);
+    }
+
     return true;
 }
 
@@ -145,11 +191,9 @@ bulk_load_cb(const struct uuid *uuid, void *aux_)
 {
     struct bulk_load_aux *aux = aux_;
 
-    /* Submit an async load for each UNLOADED row.
-     * ovsdb_lazy_load_request() transitions state to LOADING. */
+    /* ovsdb_lazy_load_request() transitions state to LOADING on
+     * success, so we don't need to do it here. */
     if (ovsdb_lazy_load_request(aux->db, aux->table, uuid)) {
-        ovsdb_row_cache_set_state(aux->table->cache, uuid,
-                                  OVSDB_ROW_LOADING);
         aux->n_submitted++;
     }
 }

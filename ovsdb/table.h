@@ -92,12 +92,32 @@ typedef bool (*ovsdb_table_row_cb)(const struct ovsdb_row *row, void *aux);
  *
  * If the table has a disk_store, rows are read from disk via cursor
  * (synchronous I/O — intended for background threads only, e.g.
- * compaction_thread).  If no disk_store, iterates table->rows hmap.
+ * compaction_thread, or for ovsdb-tool callers that don't have a
+ * cache attached).  If no disk_store, iterates table->rows hmap.
  *
- * Rows loaded from disk are NOT inserted into the cache — the caller
- * is responsible for the returned row's lifetime via the callback. */
+ * IMPORTANT: When using the disk_store cursor path, the row pointer
+ * passed to 'cb' is destroyed immediately after the callback returns.
+ * Callers that need to retain the row (e.g. via ovsdb_row_set_add_row)
+ * must clone it; callers that consume row data inline (deep-cloning
+ * datums into JSON, etc.) are safe.
+ *
+ * For main-thread iteration where stable row pointers are required,
+ * use ovsdb_table_for_each_loaded_row() instead. */
 void ovsdb_table_for_each_row(const struct ovsdb_table *,
                               ovsdb_table_row_cb cb, void *aux);
+
+/* Iterates all currently-loaded rows in 'table', calling 'cb' for
+ * each.  The row pointer passed to 'cb' has stable lifetime (owned
+ * by table->rows hmap or by table->cache) and may be retained by
+ * the caller as long as no eviction/removal occurs.
+ *
+ * For pure in-memory tables, iterates 'table->rows'.  For tables
+ * with a row cache, iterates the cache's CACHED entries.
+ *
+ * Main-thread only.  Does NOT trigger lazy loading; callers must
+ * have already submitted a bulk load and waited for completion. */
+void ovsdb_table_for_each_loaded_row(const struct ovsdb_table *,
+                                     ovsdb_table_row_cb cb, void *aux);
 
 /* Below functions adds row modification for ovsdb table to the transaction. */
 struct ovsdb_error *ovsdb_table_execute_insert(struct ovsdb_txn *txn,

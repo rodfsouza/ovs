@@ -405,6 +405,27 @@ ovsdb_row_cache_for_each_unloaded(
     }
 }
 
+/* Calls 'cb' for each cache entry with state OVSDB_ROW_CACHED.
+ * The row pointer passed to 'cb' is owned by the cache and remains
+ * valid for the duration of the callback (and longer, as long as
+ * no eviction or removal occurs).  Stops if 'cb' returns false. */
+void
+ovsdb_row_cache_for_each_loaded(
+    struct ovsdb_row_cache *cache,
+    bool (*cb)(const struct ovsdb_row *row, void *aux),
+    void *aux)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
+        if (entry->state == OVSDB_ROW_CACHED && entry->row) {
+            if (!cb(entry->row, aux)) {
+                break;
+            }
+        }
+    }
+}
+
 /* Registers a UUID in the cache as UNLOADED (no row data yet).
  * This is used at startup to populate the index from disk
  * without loading actual row data. */

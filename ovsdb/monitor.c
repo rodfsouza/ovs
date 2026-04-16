@@ -1193,6 +1193,36 @@ ovsdb_monitor_compose_update(
     return json;
 }
 
+/* Callback context for ovsdb_monitor_compose_cond_change_update. */
+struct cond_change_aux {
+    struct ovsdb_monitor_table *mt;
+    struct ovsdb_monitor_session_condition *condition;
+    unsigned long int *changed;
+    struct json **json;
+    struct json **table_json;
+};
+
+static bool
+cond_change_row_cb(const struct ovsdb_row *row, void *aux_)
+{
+    struct cond_change_aux *aux = aux_;
+    struct json *row_json;
+
+    cooperative_multitasking_yield();
+
+    row_json = ovsdb_monitor_compose_row_update2(
+        aux->mt, aux->condition, OVSDB_ROW,
+        CONST_CAST(struct ovsdb_row *, row),
+        false, aux->changed, aux->mt->n_columns);
+    if (row_json) {
+        ovsdb_monitor_add_json_row(aux->json,
+                                   aux->mt->table->schema->name,
+                                   aux->table_json, row_json,
+                                   ovsdb_row_get_uuid(row));
+    }
+    return true;
+}
+
 static struct json*
 ovsdb_monitor_compose_cond_change_update(
                     struct ovsdb_monitor *dbmon,
@@ -1207,7 +1237,6 @@ ovsdb_monitor_compose_cond_change_update(
         struct ovsdb_condition *old_condition, *new_condition, *diff_condition;
         struct ovsdb_monitor_table *mt = node->data;
         struct json *table_json = NULL;
-        struct ovsdb_row *row;
 
         if (!ovsdb_monitor_get_table_conditions(mt,
                                                 condition,
@@ -1219,22 +1248,27 @@ ovsdb_monitor_compose_cond_change_update(
             continue;
         }
 
-        /* Iterate over all rows in table */
-        HMAP_FOR_EACH (row, hmap_node, &mt->table->rows) {
-            struct json *row_json;
-
-            cooperative_multitasking_yield();
-
-            row_json = ovsdb_monitor_compose_row_update2(mt, condition,
-                                                         OVSDB_ROW, row,
-                                                         false, changed,
-                                                         mt->n_columns);
-            if (row_json) {
-                ovsdb_monitor_add_json_row(&json, mt->table->schema->name,
-                                           &table_json, row_json,
-                                           ovsdb_row_get_uuid(row));
-            }
+        /* Submit a bulk load if the table has unloaded rows so the
+         * client eventually sees a complete picture.  We still
+         * iterate currently-loaded rows via the cache; the trigger
+         * subsystem retries pending operations as rows arrive. */
+        if (mt->table->disk_store && mt->table->cache && dbmon->db
+            && ovsdb_row_cache_has_unloaded(mt->table->cache)) {
+            ovsdb_lazy_load_bulk_request(
+                dbmon->db,
+                CONST_CAST(struct ovsdb_table *, mt->table));
         }
+
+        /* Iterate over all currently-loaded rows in the table. */
+        struct cond_change_aux aux = {
+            .mt = mt,
+            .condition = condition,
+            .changed = changed,
+            .json = &json,
+            .table_json = &table_json,
+        };
+        ovsdb_table_for_each_loaded_row(mt->table, cond_change_row_cb, &aux);
+
         ovsdb_monitor_table_condition_updated(mt, condition);
     }
     free(changed);
@@ -1534,6 +1568,20 @@ ovsdb_monitor_change_cb(const struct ovsdb_row *old,
     return true;
 }
 
+/* Callback context for ovsdb_monitor_get_initial. */
+struct monitor_initial_aux {
+    struct ovsdb_monitor_table *mt;
+    struct ovsdb_monitor_change_set_for_table *mcst;
+};
+
+static bool
+monitor_initial_row_cb(const struct ovsdb_row *row, void *aux_)
+{
+    struct monitor_initial_aux *aux = aux_;
+    ovsdb_monitor_changes_update(NULL, row, aux->mt, aux->mcst);
+    return true;
+}
+
 void
 ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
                           struct ovsdb_monitor_change_set **p_mcs)
@@ -1547,10 +1595,16 @@ ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
         LIST_FOR_EACH (mcst, list_in_change_set,
                        &change_set->change_set_for_tables) {
             if (mcst->mt->select & OJMS_INITIAL) {
-                struct ovsdb_row *row;
-                HMAP_FOR_EACH (row, hmap_node, &mcst->mt->table->rows) {
-                    ovsdb_monitor_changes_update(NULL, row, mcst->mt, mcst);
-                }
+                /* Use the loaded-row iterator so disk-store backed
+                 * tables yield rows from the cache (after bulk load
+                 * completes) rather than the empty table->rows hmap. */
+                struct monitor_initial_aux aux = {
+                    .mt = mcst->mt,
+                    .mcst = mcst,
+                };
+                ovsdb_table_for_each_loaded_row(mcst->mt->table,
+                                                monitor_initial_row_cb,
+                                                &aux);
             }
         }
     } else {

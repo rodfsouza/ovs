@@ -26,12 +26,11 @@
 #include "table.h"
 
 /* Context for linear-scan callback used when iterating via
- * ovsdb_table_for_each_row() for disk-store backed tables. */
+ * ovsdb_table_for_each_loaded_row() for disk-store backed tables. */
 struct query_scan_aux {
     const struct ovsdb_condition *cnd;
     bool (*output_row)(const struct ovsdb_row *, void *aux);
     void *output_aux;
-    bool stopped;
 };
 
 static bool
@@ -41,8 +40,7 @@ query_scan_cb(const struct ovsdb_row *row, void *aux_)
 
     if (ovsdb_condition_match_every_clause(row, aux->cnd)
         && !aux->output_row(row, aux->output_aux)) {
-        aux->stopped = true;
-        return false;
+        return false;  /* Stop iteration. */
     }
     return true;
 }
@@ -65,8 +63,9 @@ ovsdb_query(struct ovsdb_table *table, const struct ovsdb_condition *cnd,
         }
     } else if (table->disk_store && table->cache) {
         /* Disk-store path: if unloaded rows exist, submit a bulk
-         * load so the trigger can park and retry later.  Then
-         * iterate whatever is currently loaded via table iterator. */
+         * load so the trigger can park and retry later.  Iterate
+         * currently-loaded rows from the cache (stable pointers
+         * for callers that retain via ovsdb_row_set_add_row). */
         if (ovsdb_row_cache_has_unloaded(table->cache) && table->db) {
             ovsdb_lazy_load_bulk_request(table->db, table);
         }
@@ -74,9 +73,8 @@ ovsdb_query(struct ovsdb_table *table, const struct ovsdb_condition *cnd,
             .cnd = cnd,
             .output_row = output_row,
             .output_aux = aux,
-            .stopped = false,
         };
-        ovsdb_table_for_each_row(table, query_scan_cb, &scan_aux);
+        ovsdb_table_for_each_loaded_row(table, query_scan_cb, &scan_aux);
     } else {
         /* Linear scan. */
         const struct ovsdb_row *row;
