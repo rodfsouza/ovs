@@ -420,6 +420,47 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
     return NULL;
 }
 
+/* Iterates all rows in 'table', calling 'cb' for each.
+ *
+ * If the table has a disk_store, rows are read synchronously from
+ * disk via cursor.  This is intended for background threads (e.g.
+ * compaction_thread) where blocking is acceptable.
+ *
+ * If no disk_store, iterates the in-memory table->rows hmap. */
+void
+ovsdb_table_for_each_row(const struct ovsdb_table *table,
+                         ovsdb_table_row_cb cb, void *aux)
+{
+    if (table->disk_store) {
+        struct ovsdb_disk_store_cursor *cursor;
+
+        cursor = ovsdb_disk_store_cursor_open(table->disk_store,
+                                              table->schema->name);
+        if (cursor) {
+            struct ovsdb_row *row;
+
+            while ((row = ovsdb_disk_store_cursor_next(
+                        cursor,
+                        CONST_CAST(struct ovsdb_table *, table)))) {
+                bool cont = cb(row, aux);
+                ovsdb_row_destroy(row);
+                if (!cont) {
+                    break;
+                }
+            }
+            ovsdb_disk_store_cursor_close(cursor);
+        }
+    } else {
+        const struct ovsdb_row *row;
+
+        HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+            if (!cb(row, aux)) {
+                break;
+            }
+        }
+    }
+}
+
 struct ovsdb_error *
 ovsdb_table_execute_insert(struct ovsdb_txn *txn, const struct uuid *row_uuid,
                            struct ovsdb_table *table, struct json *json_row)

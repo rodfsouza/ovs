@@ -373,6 +373,38 @@ ovsdb_row_cache_set_state(struct ovsdb_row_cache *cache,
     }
 }
 
+/* Returns true if the cache has any entries in UNLOADED or LOADING state. */
+bool
+ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *cache)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
+        if (entry->state == OVSDB_ROW_UNLOADED
+            || entry->state == OVSDB_ROW_LOADING) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
+ * Does not modify entry state — caller is responsible for transitions. */
+void
+ovsdb_row_cache_for_each_unloaded(
+    struct ovsdb_row_cache *cache,
+    void (*cb)(const struct uuid *uuid, void *aux),
+    void *aux)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
+        if (entry->state == OVSDB_ROW_UNLOADED) {
+            cb(&entry->uuid, aux);
+        }
+    }
+}
+
 /* Registers a UUID in the cache as UNLOADED (no row data yet).
  * This is used at startup to populate the index from disk
  * without loading actual row data. */

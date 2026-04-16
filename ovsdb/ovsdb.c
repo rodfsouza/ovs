@@ -598,6 +598,21 @@ ovsdb_get_table(const struct ovsdb *db, const char *name)
     return shash_find_data(&db->tables, name);
 }
 
+/* Callback context for ovsdb_clone_data's row iteration. */
+struct clone_data_aux {
+    struct ovsdb_table *new_table;
+};
+
+static bool
+clone_data_row_cb(const struct ovsdb_row *row, void *aux_)
+{
+    struct clone_data_aux *aux = aux_;
+    struct ovsdb_row *new_row = ovsdb_row_datum_clone(row);
+    hmap_insert(&aux->new_table->rows, &new_row->hmap_node,
+                ovsdb_row_hash(new_row));
+    return true;
+}
+
 static struct ovsdb *
 ovsdb_clone_data(const struct ovsdb *db)
 {
@@ -608,14 +623,15 @@ ovsdb_clone_data(const struct ovsdb *db)
         struct ovsdb_table *table = node->data;
         struct ovsdb_table *new_table = shash_find_data(&new->tables,
                                                         node->name);
-        struct ovsdb_row *row, *new_row;
 
-        hmap_reserve(&new_table->rows, hmap_count(&table->rows));
-        HMAP_FOR_EACH (row, hmap_node, &table->rows) {
-            new_row = ovsdb_row_datum_clone(row);
-            hmap_insert(&new_table->rows, &new_row->hmap_node,
-                        ovsdb_row_hash(new_row));
+        /* For in-memory tables, pre-allocate the hmap.
+         * For disk-store tables, rows come from the cursor. */
+        if (!table->disk_store) {
+            hmap_reserve(&new_table->rows, hmap_count(&table->rows));
         }
+
+        struct clone_data_aux aux = { .new_table = new_table };
+        ovsdb_table_for_each_row(table, clone_data_row_cb, &aux);
     }
 
     return new;

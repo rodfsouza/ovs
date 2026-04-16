@@ -133,6 +133,49 @@ ovsdb_lazy_load_request(struct ovsdb *db,
     return true;
 }
 
+/* Callback context for bulk load. */
+struct bulk_load_aux {
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    size_t n_submitted;
+};
+
+static void
+bulk_load_cb(const struct uuid *uuid, void *aux_)
+{
+    struct bulk_load_aux *aux = aux_;
+
+    /* Submit an async load for each UNLOADED row.
+     * ovsdb_lazy_load_request() transitions state to LOADING. */
+    if (ovsdb_lazy_load_request(aux->db, aux->table, uuid)) {
+        ovsdb_row_cache_set_state(aux->table->cache, uuid,
+                                  OVSDB_ROW_LOADING);
+        aux->n_submitted++;
+    }
+}
+
+size_t
+ovsdb_lazy_load_bulk_request(struct ovsdb *db,
+                             struct ovsdb_table *table)
+{
+    if (!lazy_pool || !table->cache) {
+        return 0;
+    }
+
+    struct bulk_load_aux aux = {
+        .db = db,
+        .table = table,
+        .n_submitted = 0,
+    };
+    ovsdb_row_cache_for_each_unloaded(table->cache, bulk_load_cb, &aux);
+
+    if (aux.n_submitted) {
+        VLOG_DBG("lazy-load: submitted %"PRIuSIZE" bulk load jobs for "
+                 "table %s", aux.n_submitted, table->schema->name);
+    }
+    return aux.n_submitted;
+}
+
 bool
 ovsdb_lazy_load_has_pending(void)
 {

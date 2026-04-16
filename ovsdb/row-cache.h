@@ -59,6 +59,16 @@ void ovsdb_row_cache_set_state(struct ovsdb_row_cache *,
 void ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *,
                                   const struct uuid *);
 
+/* Returns true if the cache has any entries in UNLOADED or LOADING state. */
+bool ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *);
+
+/* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
+ * Does not modify entry state — caller is responsible for transitions. */
+void ovsdb_row_cache_for_each_unloaded(
+    struct ovsdb_row_cache *,
+    void (*cb)(const struct uuid *uuid, void *aux),
+    void *aux);
+
 /* Stats. */
 size_t ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_count(const struct ovsdb_row_cache *);

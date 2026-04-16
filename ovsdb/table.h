@@ -85,6 +85,20 @@ bool ovsdb_table_is_logging_enabled(struct ovsdb_table *table);
 const struct ovsdb_row *ovsdb_table_get_row(const struct ovsdb_table *,
                                             const struct uuid *);
 
+/* Row iteration callback.  Return true to continue, false to stop. */
+typedef bool (*ovsdb_table_row_cb)(const struct ovsdb_row *row, void *aux);
+
+/* Iterates all rows in 'table', calling 'cb' for each.
+ *
+ * If the table has a disk_store, rows are read from disk via cursor
+ * (synchronous I/O — intended for background threads only, e.g.
+ * compaction_thread).  If no disk_store, iterates table->rows hmap.
+ *
+ * Rows loaded from disk are NOT inserted into the cache — the caller
+ * is responsible for the returned row's lifetime via the callback. */
+void ovsdb_table_for_each_row(const struct ovsdb_table *,
+                              ovsdb_table_row_cb cb, void *aux);
+
 /* Below functions adds row modification for ovsdb table to the transaction. */
 struct ovsdb_error *ovsdb_table_execute_insert(struct ovsdb_txn *txn,
                                                const struct uuid *row_uuid,

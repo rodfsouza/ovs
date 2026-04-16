@@ -41,6 +41,12 @@ bool ovsdb_lazy_load_request(struct ovsdb *db,
                              struct ovsdb_table *table,
                              const struct uuid *uuid);
 
+/* Submits async load requests for ALL UNLOADED rows in 'table'.
+ * Returns the number of load jobs submitted (0 if all already
+ * loaded or no worker pool available). */
+size_t ovsdb_lazy_load_bulk_request(struct ovsdb *db,
+                                    struct ovsdb_table *table);
+
 /* Returns true if the worker pool has pending or in-flight load
  * jobs.  Used by the trigger subsystem to decide whether a failed
  * transaction should be parked (rows may still be loading) or

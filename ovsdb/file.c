@@ -420,12 +420,30 @@ ovsdb_file_change_cb(const struct ovsdb_row *old,
     return true;
 }
 
+/* Callback context for ovsdb_to_txn_json's row iteration. */
+struct txn_json_aux {
+    struct ovsdb_file_txn *ftxn;
+    bool allow_shallow_copies;
+};
+
+static bool
+txn_json_row_cb(const struct ovsdb_row *row, void *aux_)
+{
+    struct txn_json_aux *aux = aux_;
+    ovsdb_file_txn_add_row(aux->ftxn, NULL, row, NULL,
+                           aux->allow_shallow_copies);
+    return true;
+}
+
 /* Converts the database into transaction JSON representation.
  * If 'allow_shallow_copies' is false, makes sure that all the JSON
  * objects in the resulted transaction JSON are separately allocated
  * objects and not shallow clones of JSON objects already existing
  * in the database.  Useful when multiple threads are working on the
- * same database object. */
+ * same database object.
+ *
+ * When a table has a disk_store, rows are read from disk via cursor
+ * (synchronous).  This is intended for background threads. */
 struct json *
 ovsdb_to_txn_json(const struct ovsdb *db, const char *comment,
                   bool allow_shallow_copies)
@@ -434,15 +452,15 @@ ovsdb_to_txn_json(const struct ovsdb *db, const char *comment,
 
     ovsdb_file_txn_init(&ftxn);
 
+    struct txn_json_aux aux = {
+        .ftxn = &ftxn,
+        .allow_shallow_copies = allow_shallow_copies,
+    };
+
     struct shash_node *node;
     SHASH_FOR_EACH (node, &db->tables) {
         const struct ovsdb_table *table = node->data;
-        const struct ovsdb_row *row;
-
-        HMAP_FOR_EACH (row, hmap_node, &table->rows) {
-            ovsdb_file_txn_add_row(&ftxn, NULL, row, NULL,
-                                   allow_shallow_copies);
-        }
+        ovsdb_table_for_each_row(table, txn_json_row_cb, &aux);
     }
 
     return ovsdb_file_txn_annotate(ftxn.json, comment);
