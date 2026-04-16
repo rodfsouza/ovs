@@ -63,10 +63,11 @@ void ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *,
 bool ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *);
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
- * Does not modify entry state — caller is responsible for transitions. */
+ * Does not modify entry state — caller is responsible for transitions.
+ * Stops early if 'cb' returns false. */
 void ovsdb_row_cache_for_each_unloaded(
     struct ovsdb_row_cache *,
-    void (*cb)(const struct uuid *uuid, void *aux),
+    bool (*cb)(const struct uuid *uuid, void *aux),
     void *aux);
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_CACHED.
@@ -80,6 +81,7 @@ void ovsdb_row_cache_for_each_loaded(
 
 /* Stats. */
 size_t ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *);
+size_t ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_count(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_hits(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_misses(const struct ovsdb_row_cache *);

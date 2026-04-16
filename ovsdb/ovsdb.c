@@ -23,6 +23,7 @@
 
 #include "column.h"
 #include "file.h"
+#include "lazy-load.h"
 #include "monitor.h"
 #include "openvswitch/json.h"
 #include "openvswitch/poll-loop.h"
@@ -784,10 +785,25 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
         ovsdb_disk_store_for_each_uuid(
             ds, node->name, add_unloaded_cb, table->cache);
 
-        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed "
-                 "from disk store",
-                 db->name, node->name,
-                 ovsdb_row_cache_count(table->cache));
+        size_t indexed = ovsdb_row_cache_count(table->cache);
+
+        /* Warm the cache up to the per-table atom budget on a
+         * background worker pool so tools querying the table
+         * immediately after startup see CACHED rows rather than
+         * UNLOADED ones.  The bounded variant stops submitting
+         * loads before the cache would begin load-and-evict
+         * thrashing; for DBs larger than the budget, remaining
+         * UNLOADED rows are read on demand by
+         * ovsdb_table_for_each_row_from_disk() / get_row().
+         * Skips entirely when no worker pool is available. */
+        size_t warmup = 0;
+        if (ovsdb_lazy_load_pool_available()) {
+            warmup = ovsdb_lazy_load_bulk_request_until_full(db, table);
+        }
+
+        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store"
+                 " (warmup jobs: %"PRIuSIZE")",
+                 db->name, node->name, indexed, warmup);
     }
     db->disk_store_mode = true;
 }

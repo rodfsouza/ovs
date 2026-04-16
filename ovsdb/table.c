@@ -544,6 +544,118 @@ ovsdb_table_for_each_loaded_row(const struct ovsdb_table *table,
     }
 }
 
+/* Returns true if 'table->rows' already contains a row with 'uuid'. */
+static bool
+table_rows_contains(const struct ovsdb_table *table,
+                    const struct uuid *uuid)
+{
+    const struct ovsdb_row *row;
+
+    HMAP_FOR_EACH_WITH_HASH (row, hmap_node, uuid_hash(uuid),
+                             &table->rows) {
+        if (uuid_equals(ovsdb_row_get_uuid(row), uuid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Iterates every row logically present in 'table'.  See the header
+ * comment in table.h for the full lifetime contract.
+ *
+ * Implementation: yield 'table->rows' first (stable pointers), then
+ * open a disk-store cursor and walk every record whose UUID isn't
+ * already in table->rows.  For CACHED entries we prefer the stable
+ * cached pointer over the transient cursor row.  For UNLOADED entries
+ * the cursor row is handed to the callback TRANSIENTLY, after which
+ * we insert it into the cache so follow-up queries hit a warm path;
+ * LRU eviction is expected and safe because the callback has already
+ * returned (transient contract).  Insertion also transfers ownership
+ * to the cache, so we must not destroy the row on that path. */
+void
+ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *table,
+                                   ovsdb_table_row_cb cb, void *aux)
+{
+    /* Step 1: yield rows from table->rows (stable, hmap-owned). */
+    const struct ovsdb_row *row;
+    HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+        if (!cb(row, aux)) {
+            return;
+        }
+    }
+
+    /* Step 2: plain in-memory table — nothing more to iterate. */
+    if (!table->disk_store) {
+        return;
+    }
+
+    /* Step 3: walk the disk-store cursor for this table. */
+    struct ovsdb_disk_store_cursor *cursor;
+    cursor = ovsdb_disk_store_cursor_open(table->disk_store,
+                                          table->schema->name);
+    if (!cursor) {
+        VLOG_WARN("ovsdb_table_for_each_row_from_disk: failed to open "
+                  "disk store cursor for table %s",
+                  table->schema->name);
+        return;
+    }
+
+    struct ovsdb_row *disk_row;
+    while ((disk_row = ovsdb_disk_store_cursor_next(
+                cursor,
+                CONST_CAST(struct ovsdb_table *, table)))) {
+        const struct uuid *uuid = ovsdb_row_get_uuid(disk_row);
+
+        /* Step 4a: skip if already yielded via table->rows. */
+        if (table_rows_contains(table, uuid)) {
+            ovsdb_row_destroy(disk_row);
+            continue;
+        }
+
+        /* Step 4b: if CACHED, yield the stable cached pointer and
+         * drop the transient disk copy. */
+        if (table->cache) {
+            const struct ovsdb_row *cached =
+                ovsdb_row_cache_lookup(table->cache, uuid);
+            if (cached) {
+                bool cont = cb(cached, aux);
+                ovsdb_row_destroy(disk_row);
+                if (!cont) {
+                    ovsdb_disk_store_cursor_close(cursor);
+                    return;
+                }
+                continue;
+            }
+        }
+
+        /* Step 4c: UNLOADED (or no cache).  Yield the transient disk
+         * row to 'cb' first, then insert it into the cache so
+         * subsequent lookups are cheap.  Ownership transfers to the
+         * cache on insert; do not destroy afterwards. */
+        bool cont = cb(disk_row, aux);
+
+        if (table->cache) {
+            size_t n_atoms = ovsdb_row_count_atoms(disk_row);
+            ovsdb_row_cache_insert(table->cache, disk_row, n_atoms);
+            /* disk_row is now owned by the cache.  LRU eviction may
+             * destroy entries yielded EARLIER in this iteration, but
+             * the callback already consumed those (transient contract).
+             * disk_row itself is safe from self-eviction: insert places
+             * it at the MRU end of the LRU list, and evict__ sweeps
+             * from the LRU end, so the just-inserted entry is the
+             * last candidate. */
+        } else {
+            ovsdb_row_destroy(disk_row);
+        }
+
+        if (!cont) {
+            break;
+        }
+    }
+
+    ovsdb_disk_store_cursor_close(cursor);
+}
+
 struct ovsdb_error *
 ovsdb_table_execute_insert(struct ovsdb_txn *txn, const struct uuid *row_uuid,
                            struct ovsdb_table *table, struct json *json_row)

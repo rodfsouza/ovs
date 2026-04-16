@@ -26,6 +26,7 @@
 #include "monitor.h"
 #include "openvswitch/json.h"
 #include "jsonrpc.h"
+#include "lazy-load.h"
 #include "ovsdb-error.h"
 #include "ovsdb-parser.h"
 #include "ovsdb.h"
@@ -1617,15 +1618,23 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
         }
     }
     if (!m->change_set) {
-        /* If any monitored table needs async bulk loading from the
-         * disk store, defer the initial reply until the worker pool
-         * has loaded all rows.  If the worker pool is unavailable,
-         * submit_bulk_load() returns 0; in that case rows would be
-         * read synchronously by ovsdb_table_for_each_row() during
-         * snapshot composition, so we proceed to the inline path
-         * rather than parking the monitor forever. */
+        /* If any monitored table has UNLOADED/LOADING rows in its
+         * cache, prefer the async deferred path when a worker pool
+         * is available — this keeps the main thread responsive on
+         * large databases.  submit_bulk_load() is idempotent: it
+         * returns 0 for entries already in LOADING (e.g. a second
+         * monitor subscribing during in-flight warm-up), which is
+         * fine because monitor_complete_deferred() waits on
+         * all_rows_loaded() (which counts LOADING as not-loaded).
+         *
+         * If the worker pool is unavailable we fall through to the
+         * inline path; ovsdb_monitor_get_initial() now iterates via
+         * ovsdb_table_for_each_row_from_disk(), which
+         * sync-reads from disk, so the initial snapshot is still
+         * complete. */
         if (ovsdb_monitor_needs_bulk_load(m->dbmon)
-            && ovsdb_monitor_submit_bulk_load(m->dbmon) > 0) {
+            && ovsdb_lazy_load_pool_available()) {
+            ovsdb_monitor_submit_bulk_load(m->dbmon);
             m->deferred_request_id = json_clone(request_id);
             m->initial_loading = true;
             ovs_list_push_back(&s->deferred_monitors, &m->deferred_node);

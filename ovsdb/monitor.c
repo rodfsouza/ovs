@@ -1248,10 +1248,10 @@ ovsdb_monitor_compose_cond_change_update(
             continue;
         }
 
-        /* Submit a bulk load if the table has unloaded rows so the
-         * client eventually sees a complete picture.  We still
-         * iterate currently-loaded rows via the cache; the trigger
-         * subsystem retries pending operations as rows arrive. */
+        /* Submit a bulk load so follow-up cond-change updates see a
+         * warm cache.  This call is now best-effort: the iterator
+         * below already sync-reads uncached rows from disk, so the
+         * current update is complete regardless of async progress. */
         if (mt->table->disk_store && mt->table->cache && dbmon->db
             && ovsdb_row_cache_has_unloaded(mt->table->cache)) {
             ovsdb_lazy_load_bulk_request(
@@ -1259,7 +1259,11 @@ ovsdb_monitor_compose_cond_change_update(
                 CONST_CAST(struct ovsdb_table *, mt->table));
         }
 
-        /* Iterate over all currently-loaded rows in the table. */
+        /* Iterate over every row — disk-stored or cached.  The
+         * callback 'cond_change_row_cb' builds JSON inline via
+         * 'ovsdb_monitor_compose_row_update2' and records UUIDs by
+         * value, so the transient-pointer contract of
+         * 'ovsdb_table_for_each_row_from_disk' is respected. */
         struct cond_change_aux aux = {
             .mt = mt,
             .condition = condition,
@@ -1267,7 +1271,7 @@ ovsdb_monitor_compose_cond_change_update(
             .json = &json,
             .table_json = &table_json,
         };
-        ovsdb_table_for_each_loaded_row(mt->table, cond_change_row_cb, &aux);
+        ovsdb_table_for_each_row_from_disk(mt->table, cond_change_row_cb, &aux);
 
         ovsdb_monitor_table_condition_updated(mt, condition);
     }
@@ -1595,16 +1599,21 @@ ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
         LIST_FOR_EACH (mcst, list_in_change_set,
                        &change_set->change_set_for_tables) {
             if (mcst->mt->select & OJMS_INITIAL) {
-                /* Use the loaded-row iterator so disk-store backed
-                 * tables yield rows from the cache (after bulk load
-                 * completes) rather than the empty table->rows hmap. */
+                /* Use the sync-capable iterator so disk-store backed
+                 * tables yield every row — including UNLOADED ones
+                 * that weren't warmed into the cache.  The callback
+                 * 'monitor_initial_row_cb' feeds clone-on-write
+                 * 'ovsdb_monitor_changes_update', which does not
+                 * retain the transient pointer; LRU eviction of
+                 * previously-yielded rows caused by cache insertion
+                 * during this iteration is therefore safe. */
                 struct monitor_initial_aux aux = {
                     .mt = mcst->mt,
                     .mcst = mcst,
                 };
-                ovsdb_table_for_each_loaded_row(mcst->mt->table,
-                                                monitor_initial_row_cb,
-                                                &aux);
+                ovsdb_table_for_each_row_from_disk(mcst->mt->table,
+                                                   monitor_initial_row_cb,
+                                                   &aux);
             }
         }
     } else {

@@ -321,6 +321,14 @@ ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *cache)
     return cache->total_atoms;
 }
 
+/* Returns the soft atom budget of 'cache'.  Entries over this
+ * budget are eligible for LRU eviction on insert/unpin. */
+size_t
+ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *cache)
+{
+    return cache->max_atoms;
+}
+
 /* Returns the number of entries in 'cache'. */
 size_t
 ovsdb_row_cache_count(const struct ovsdb_row_cache *cache)
@@ -389,18 +397,21 @@ ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *cache)
 }
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
- * Does not modify entry state — caller is responsible for transitions. */
+ * Does not modify entry state — caller is responsible for transitions.
+ * Stops early if 'cb' returns false. */
 void
 ovsdb_row_cache_for_each_unloaded(
     struct ovsdb_row_cache *cache,
-    void (*cb)(const struct uuid *uuid, void *aux),
+    bool (*cb)(const struct uuid *uuid, void *aux),
     void *aux)
 {
     struct ovsdb_row_cache_entry *entry;
 
     HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_UNLOADED) {
-            cb(&entry->uuid, aux);
+            if (!cb(&entry->uuid, aux)) {
+                break;
+            }
         }
     }
 }

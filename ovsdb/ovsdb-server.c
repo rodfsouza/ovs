@@ -810,6 +810,15 @@ main(int argc, char *argv[])
     shash_init(&all_dbs);
     add_server_db(&server_config);
 
+    /* Create I/O worker pool for async disk loading (Phase 2) before
+     * the first open_db() call so ovsdb_attach_disk_store() can warm
+     * the cache on background workers during startup.  Previously
+     * the pool was created after reconfigure_ovsdb_server(), which
+     * meant startup warm-up was silently disabled. */
+    io_worker_pool = ovsdb_worker_pool_create(
+        OVSDB_IO_WORKER_THREADS, "io-worker");
+    ovsdb_lazy_load_init(io_worker_pool);
+
     if (!reconfigure_ovsdb_server(&server_config)) {
         ovs_fatal(0, "server configuration failed");
     }
@@ -911,11 +920,6 @@ main(int argc, char *argv[])
      * does not support the monitor_cond method.  */
     unixctl_command_register("ovsdb-server/disable-monitor-cond", "", 0, 0,
                              ovsdb_server_disable_monitor_cond, jsonrpc);
-
-    /* Create I/O worker pool for async disk loading (Phase 2). */
-    io_worker_pool = ovsdb_worker_pool_create(
-        OVSDB_IO_WORKER_THREADS, "io-worker");
-    ovsdb_lazy_load_init(io_worker_pool);
 
     main_loop(&server_config, jsonrpc, &all_dbs, unixctl, &remotes,
               run_process, &exiting);

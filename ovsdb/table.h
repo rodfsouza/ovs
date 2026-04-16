@@ -119,6 +119,26 @@ void ovsdb_table_for_each_row(const struct ovsdb_table *,
 void ovsdb_table_for_each_loaded_row(const struct ovsdb_table *,
                                      ovsdb_table_row_cb cb, void *aux);
 
+/* Iterates every row logically present in 'table', calling 'cb' for
+ * each.  Unlike ovsdb_table_for_each_loaded_row(), this variant
+ * synchronously reads uncached rows from the disk store so that the
+ * callback sees the complete table — used by main-thread serve paths
+ * (monitor initial snapshot, non-UUID query, cond-change update).
+ *
+ * For tables without a disk store, behaves exactly like
+ * HMAP_FOR_EACH on table->rows.
+ *
+ * IMPORTANT row-lifetime contract: the pointer passed to 'cb' is
+ * TRANSIENT.  It is valid only during the callback invocation.  The
+ * callback must not retain the pointer or add it to a row set.  This
+ * is because rows read from disk are inserted into table->cache
+ * after the callback returns, which may trigger LRU eviction of any
+ * other row (including ones yielded earlier in the same iteration).
+ *
+ * Main-thread only (synchronous disk I/O). */
+void ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *,
+                                        ovsdb_table_row_cb cb, void *aux);
+
 /* Below functions adds row modification for ovsdb table to the transaction. */
 struct ovsdb_error *ovsdb_table_execute_insert(struct ovsdb_txn *txn,
                                                const struct uuid *row_uuid,

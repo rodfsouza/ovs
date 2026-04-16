@@ -205,3 +205,430 @@ AT_CHECK([grep -c '"three"' monitor.out], [0], [1
 ])
 OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T1: Restart correctness — UUID lookup finds pre-existing row
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - UUID lookup after restart])
+AT_KEYWORDS([ovsdb binary-serve restart uuid])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert row and capture its UUID.
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 10, "name": "ten"}}]'], [0], [stdout])
+AT_CHECK([sed 's/.*"uuid":\[.*"\(.*\)"\].*/\1/' stdout > uuid.txt])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl First run — start and stop.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Second run — restart and query by UUID.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+uuid=$(cat uuid.txt)
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "select",
+     "table": "ordinals",
+     "where": [["_uuid", "==", ["uuid", "'$uuid'"]]]}]'], [0], [stdout])
+AT_CHECK([grep -c '"ten"' stdout], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T2: Restart correctness — non-UUID (name) lookup
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - name lookup after restart])
+AT_KEYWORDS([ovsdb binary-serve restart name])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 20, "name": "twenty"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl First run.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Restart and query by name column.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "select",
+     "table": "ordinals",
+     "where": [["name", "==", "twenty"]]}]'], [0], [stdout])
+AT_CHECK([grep -c '"twenty"' stdout], [0], [1
+])
+AT_CHECK([grep -c '"number": 20' stdout], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T3: Restart correctness — ovsdb-client dump shows full table
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - dump shows full table after restart])
+AT_KEYWORDS([ovsdb binary-serve restart dump])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "one"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "two"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 3, "name": "three"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl First run.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Restart and dump.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+AT_CHECK([ovsdb-client dump unix:db.sock ordinals], [0], [stdout])
+dnl All three rows must appear.
+AT_CHECK([grep -c '"one"' stdout], [0], [1
+])
+AT_CHECK([grep -c '"two"' stdout], [0], [1
+])
+AT_CHECK([grep -c '"three"' stdout], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T4: Restart correctness — monitor initial snapshot
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - monitor snapshot after restart])
+AT_KEYWORDS([ovsdb binary-serve restart monitor])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "alpha"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "beta"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 3, "name": "gamma"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl First run.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Restart and subscribe a monitor.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monitor.out 2>monitor.err &
+mon_pid=$!
+OVS_WAIT_UNTIL([test -s monitor.out])
+kill "$mon_pid" 2>/dev/null
+wait "$mon_pid" 2>/dev/null
+dnl Initial snapshot must contain all three rows.
+AT_CHECK([grep -c '"alpha"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"beta"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"gamma"' monitor.out], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T5: DB larger than cache budget — monitor still returns every row
+dnl
+dnl Uses a small cache budget (env var override) so the test can
+dnl exercise the "over budget" path without millions of rows.
+dnl Each ordinal row ~3-5 atoms; 20 rows ~ 60-100 atoms.
+dnl We set the budget to 10 atoms so the cache can hold roughly
+dnl 2-3 rows, forcing the iterator to sync-read the rest from disk.
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - monitor with cache smaller than DB])
+AT_KEYWORDS([ovsdb binary-serve large-db cache-budget])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert 20 rows.
+for i in $(seq 1 20); do
+    AT_CHECK([ovsdb-tool transact db \
+      '["ordinals",
+        {"op": "insert",
+         "table": "ordinals",
+         "row": {"number": '$i', "name": "row'$i'"}}]'],
+      [0], [ignore])
+done
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl Start with a tiny cache budget (env var read by ovsdb-server).
+AT_CHECK([OVS_OVSDB_CACHE_MAX_ATOMS=10 \
+          ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Monitor initial snapshot must include all 20 rows.
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monitor.out 2>monitor.err &
+mon_pid=$!
+OVS_WAIT_UNTIL([test -s monitor.out])
+kill "$mon_pid" 2>/dev/null
+wait "$mon_pid" 2>/dev/null
+AT_CHECK([grep -c '"row' monitor.out], [0], [20
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T6: Concurrent monitors during in-flight warm-up
+dnl
+dnl Subscribe two monitors back-to-back.  Both must receive the
+dnl full initial snapshot.  The second monitor arrives while warm-up
+dnl loads from the first are still in-flight (all entries are in
+dnl LOADING state), exercising the deferral guard fix (Part C).
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - concurrent monitors during warm-up])
+AT_KEYWORDS([ovsdb binary-serve concurrent monitor])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+dnl Insert enough rows to keep warm-up busy for >1 tick.
+for i in $(seq 1 50); do
+    AT_CHECK([ovsdb-tool transact db \
+      '["ordinals",
+        {"op": "insert",
+         "table": "ordinals",
+         "row": {"number": '$i', "name": "r'$i'"}}]'],
+      [0], [ignore])
+done
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Subscribe monitor A.
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monA.out 2>monA.err &
+monA_pid=$!
+dnl Subscribe monitor B immediately after A.
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monB.out 2>monB.err &
+monB_pid=$!
+dnl Wait for both to receive initial snapshots.
+OVS_WAIT_UNTIL([test -s monA.out])
+OVS_WAIT_UNTIL([test -s monB.out])
+kill "$monA_pid" "$monB_pid" 2>/dev/null
+wait "$monA_pid" "$monB_pid" 2>/dev/null
+dnl Both must have received all 50 rows.
+AT_CHECK([grep -c '"r[0-9]' monA.out | head -1 | tr -d ' '], [0], [50
+])
+AT_CHECK([grep -c '"r[0-9]' monB.out | head -1 | tr -d ' '], [0], [50
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T7: Warm-up responsiveness — main thread not blocked
+dnl
+dnl Start server on a moderately large binary DB.  Immediately issue
+dnl a lightweight list-dbs request.  It must return promptly (before
+dnl warm-up finishes), proving the main thread is responsive.
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - main thread responsive during warm-up])
+AT_KEYWORDS([ovsdb binary-serve warmup responsive])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+for i in $(seq 1 100); do
+    AT_CHECK([ovsdb-tool transact db \
+      '["ordinals",
+        {"op": "insert",
+         "table": "ordinals",
+         "row": {"number": '$i', "name": "row'$i'"}}]'],
+      [0], [ignore])
+done
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl This must return promptly, not block until warm-up completes.
+AT_CHECK([ovsdb-client --timeout=5 list-dbs unix:db.sock], [0], [ordinals
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T8: Insert after restart — new rows coexist with disk rows
+dnl
+dnl Verifies that after restart, both the pre-existing disk rows
+dnl AND newly inserted rows are visible together.  This exercises
+dnl the table->rows / cache merge in the iterator.
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - insert coexists with disk rows after restart])
+AT_KEYWORDS([ovsdb binary-serve restart insert merge])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "pre-existing"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl First run.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Restart.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+dnl Insert a new row after restart.
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "post-restart"}}]'], [0], [stdout])
+dnl Monitor must show BOTH the disk row and the new row.
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monitor.out 2>monitor.err &
+mon_pid=$!
+OVS_WAIT_UNTIL([test -s monitor.out])
+kill "$mon_pid" 2>/dev/null
+wait "$mon_pid" 2>/dev/null
+AT_CHECK([grep -c '"pre-existing"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"post-restart"' monitor.out], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T9: Multiple restarts — data persists across cycles
+dnl
+dnl Inserts data, converts to binary, restarts twice (not once).
+dnl After the second restart, both original and first-restart data
+dnl must be visible.  Exercises cache re-population from a DB that
+dnl was extended after conversion.
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - data persists across multiple restarts])
+AT_KEYWORDS([ovsdb binary-serve restart persist multi])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "original"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl Run 1: start, insert, stop.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "run1"}}]'], [0], [ignore])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Run 2: start, insert, stop.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 3, "name": "run2"}}]'], [0], [ignore])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Run 3: start, verify all three rows via monitor.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monitor.out 2>monitor.err &
+mon_pid=$!
+OVS_WAIT_UNTIL([test -s monitor.out])
+kill "$mon_pid" 2>/dev/null
+wait "$mon_pid" 2>/dev/null
+AT_CHECK([grep -c '"original"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"run1"' monitor.out], [0], [1
+])
+AT_CHECK([grep -c '"run2"' monitor.out], [0], [1
+])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
+
+dnl ---------------------------------------------------------------
+dnl T10: Delete + restart — deleted rows stay deleted
+dnl
+dnl Exercises that the disk store's "deleted" flag is respected
+dnl across restarts and that deleted rows don't appear in the
+dnl initial monitor snapshot.
+dnl ---------------------------------------------------------------
+AT_SETUP([binary serve - deleted rows stay deleted after restart])
+AT_KEYWORDS([ovsdb binary-serve restart delete])
+AT_SKIP_IF([test "$IS_WIN32" = "yes"])
+ordinal_schema > schema
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore])
+AT_CHECK([ovsdb-tool transact db \
+  '["ordinals",
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 1, "name": "keep"}},
+    {"op": "insert",
+     "table": "ordinals",
+     "row": {"number": 2, "name": "delete-me"}}]'], [0], [ignore])
+AT_CHECK([ovsdb-tool convert-format db binary], [0])
+dnl Run 1: start, delete one row, stop.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+AT_CHECK([ovsdb-client transact unix:db.sock \
+  '["ordinals",
+    {"op": "delete",
+     "table": "ordinals",
+     "where": [["name", "==", "delete-me"]]}]'], [0], [ignore])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+dnl Run 2: restart and verify.
+AT_CHECK([ovsdb-server --disk-store --detach --no-chdir \
+          --pidfile --remote=punix:db.sock \
+          --unixctl="`pwd`"/unixctl db], [0])
+ovsdb-client --timeout=10 monitor unix:db.sock ordinals ordinals \
+    > monitor.out 2>monitor.err &
+mon_pid=$!
+OVS_WAIT_UNTIL([test -s monitor.out])
+kill "$mon_pid" 2>/dev/null
+wait "$mon_pid" 2>/dev/null
+dnl "keep" must appear; "delete-me" must NOT.
+AT_CHECK([grep -c '"keep"' monitor.out], [0], [1
+])
+AT_CHECK([grep '"delete-me"' monitor.out], [1], [])
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+AT_CLEANUP
