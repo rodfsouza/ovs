@@ -114,6 +114,8 @@ DOC_SOURCE = \
 	Documentation/internals/ovsdb-native-binary-serving-plan.md \
 	Documentation/internals/ovsdb-raft-binary-sidecar-plan.md \
 	Documentation/internals/ovsdb-tool-migration-plan.md \
+	Documentation/internals/ovsdb-compressed-row-cache-plan.md \
+	Documentation/internals/ovsdb-disk-store-serve-paths-fix-plan.md \
 	Documentation/internals/ovsdb_architecture.md \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
