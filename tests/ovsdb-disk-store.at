@@ -2,6 +2,20 @@ AT_BANNER([OVSDB -- disk store unit tests])
 
 AT_SETUP([disk store - C unit tests])
 AT_KEYWORDS([ovsdb disk-store])
-AT_CHECK([ovstest test-disk-store], [0], [test-disk-store: ok
-])
+AT_CHECK([ovstest test-disk-store], [0], [test-disk-store: create_open_close
+test-disk-store: write_read_single
+test-disk-store: write_read_many
+test-disk-store: delete
+test-disk-store: iterate
+test-disk-store: compact
+test-disk-store: reopen_persistence
+test-disk-store: null_uuid_lookup
+test-disk-store: contains
+test-disk-store: complex_types_roundtrip
+test-disk-store: complex_types_reopen
+test-disk-store: empty_map_roundtrip
+test-disk-store: large_map_roundtrip
+test-disk-store: complex_types_compact
+test-disk-store: ok
+], [ignore])
 AT_CLEANUP

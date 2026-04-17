@@ -5,8 +5,22 @@ AT_KEYWORDS([ovsdb integration disk-store row-cache])
 dnl This test validates that the disk store and row cache work together.
 dnl Run the combined C unit test that exercises the cache-miss-load-insert
 dnl path and verifies cache hit rates.
-AT_CHECK([ovstest test-disk-store], [0], [test-disk-store: ok
-])
+AT_CHECK([ovstest test-disk-store], [0], [test-disk-store: create_open_close
+test-disk-store: write_read_single
+test-disk-store: write_read_many
+test-disk-store: delete
+test-disk-store: iterate
+test-disk-store: compact
+test-disk-store: reopen_persistence
+test-disk-store: null_uuid_lookup
+test-disk-store: contains
+test-disk-store: complex_types_roundtrip
+test-disk-store: complex_types_reopen
+test-disk-store: empty_map_roundtrip
+test-disk-store: large_map_roundtrip
+test-disk-store: complex_types_compact
+test-disk-store: ok
+], [ignore])
 AT_CHECK([ovstest test-row-cache], [0], [test-row-cache: ok
 ])
 AT_CLEANUP

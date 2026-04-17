@@ -870,20 +870,28 @@ disk_store_serialize_row(struct disk_store_buf *buf,
     disk_store_buf_put_uint16(buf, name_len);
     disk_store_buf_put(buf, table_name, name_len);
 
-    /* Serialize each non-standard column.
-     * For each column we write:
-     *   1 byte   column type tag (key atomic type)
+    /* Per-column layout (name-based, order-independent):
+     *   2 bytes  column name length (uint16_t)
+     *   N bytes  column name
+     *   1 byte   key type tag (ovsdb_atomic_type)
+     *   1 byte   value type tag (VOID for sets/scalars)
      *   datum    serialized datum
      */
     SHASH_FOR_EACH (node, &ts->columns) {
         const struct ovsdb_column *col = node->data;
+        uint16_t col_name_len;
 
         if (col->index < OVSDB_N_STD_COLUMNS) {
             continue;
         }
 
+        col_name_len = (uint16_t) strlen(col->name);
+        disk_store_buf_put_uint16(buf, col_name_len);
+        disk_store_buf_put(buf, col->name, col_name_len);
         disk_store_buf_put_uint8(
             buf, (uint8_t) col->type.key.type);
+        disk_store_buf_put_uint8(
+            buf, (uint8_t) col->type.value.type);
         disk_store_serialize_datum(
             buf, &row->fields[col->index], &col->type);
     }
@@ -968,13 +976,13 @@ ovsdb_disk_store_delete_row(struct ovsdb_disk_store *store,
 static struct ovsdb_row *
 disk_store_deserialize_row(const uint8_t *data, size_t len,
                            struct ovsdb_table *table,
-                           const struct uuid *uuid)
+                           const struct uuid *uuid,
+                           uint16_t n_columns)
 {
     struct disk_store_reader r;
     uint16_t name_len;
     struct ovsdb_row *row;
     const struct ovsdb_table_schema *ts = table->schema;
-    uint16_t n_columns;
     uint16_t i;
 
     r.data = data;
@@ -991,62 +999,89 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
     }
     r.pos += name_len;
 
-    /* We need n_columns.  The caller should pass it.  For now,
-     * derive from table schema. */
-    n_columns = (uint16_t)(shash_count(&ts->columns)
-                           - OVSDB_N_STD_COLUMNS);
-
     row = ovsdb_row_create(table);
     *ovsdb_row_get_uuid_rw(row) = *uuid;
 
-    /* Deserialize each column in schema order (same order we
-     * serialized: SHASH_FOR_EACH iterates in the same order
-     * for the same shash). */
-    i = 0;
-    {
-        struct shash_node *node;
+    /* Deserialize each column by name lookup.  Each on-disk column
+     * is: 2-byte name length, name, key type tag, value type tag,
+     * then the serialized datum. */
+    for (i = 0; i < n_columns; i++) {
+        uint16_t col_name_len;
+        char col_name[DISK_STORE_MAX_TABLE_NAME];
+        uint8_t key_tag, val_tag;
+        const struct ovsdb_column *col;
 
-        SHASH_FOR_EACH (node, &ts->columns) {
-            const struct ovsdb_column *col = node->data;
-            uint8_t type_tag;
+        if (!disk_store_reader_get_uint16(&r, &col_name_len)) {
+            VLOG_WARN("truncated column name length for "
+                      "row "UUID_FMT, UUID_ARGS(uuid));
+            goto error;
+        }
+        if (col_name_len >= DISK_STORE_MAX_TABLE_NAME
+            || !disk_store_reader_remaining(&r, col_name_len)) {
+            VLOG_WARN("bad column name length %"PRIu16" for "
+                      "row "UUID_FMT,
+                      col_name_len, UUID_ARGS(uuid));
+            goto error;
+        }
+        memcpy(col_name, r.data + r.pos, col_name_len);
+        col_name[col_name_len] = '\0';
+        r.pos += col_name_len;
 
-            if (col->index < OVSDB_N_STD_COLUMNS) {
-                continue;
-            }
+        if (!disk_store_reader_get_uint8(&r, &key_tag)
+            || !disk_store_reader_get_uint8(&r, &val_tag)) {
+            VLOG_WARN("truncated type tags for column '%s' "
+                      "in row "UUID_FMT,
+                      col_name, UUID_ARGS(uuid));
+            goto error;
+        }
 
-            if (i >= n_columns) {
-                break;
-            }
+        col = shash_find_data(&ts->columns, col_name);
+        if (!col) {
+            /* Unknown column -- skip its datum.  We can't know
+             * the exact size, so we must abort. */
+            VLOG_WARN("unknown column '%s' in row "UUID_FMT
+                      ", skipping rest of row",
+                      col_name, UUID_ARGS(uuid));
+            goto error;
+        }
 
-            if (!disk_store_reader_get_uint8(&r, &type_tag)) {
-                VLOG_WARN("truncated column type tag for "
-                          "row "UUID_FMT, UUID_ARGS(uuid));
-                ovsdb_row_destroy(row);
-                return NULL;
-            }
+        /* Validate type tags. */
+        if (key_tag != (uint8_t) col->type.key.type
+            || val_tag != (uint8_t) col->type.value.type) {
+            VLOG_WARN("type mismatch for column '%s' in "
+                      "row "UUID_FMT": expected (%d,%d) "
+                      "got (%d,%d)",
+                      col->name, UUID_ARGS(uuid),
+                      (int) col->type.key.type,
+                      (int) col->type.value.type,
+                      (int) key_tag, (int) val_tag);
+            goto error;
+        }
 
-            /* Destroy the default datum that ovsdb_row_create
-             * initialized, then deserialize from disk. */
-            ovsdb_datum_destroy(&row->fields[col->index],
-                                &col->type);
+        /* Destroy the default datum that ovsdb_row_create
+         * initialized, then deserialize from disk. */
+        ovsdb_datum_destroy(&row->fields[col->index],
+                            &col->type);
 
-            if (!disk_store_deserialize_datum(
-                    &r, &row->fields[col->index], &col->type)) {
-                VLOG_WARN("failed to deserialize column '%s' "
-                          "for row "UUID_FMT,
-                          col->name, UUID_ARGS(uuid));
-                /* Re-init to default so destroy is safe. */
-                ovsdb_datum_init_default(
-                    &row->fields[col->index], &col->type);
-                ovsdb_row_destroy(row);
-                return NULL;
-            }
-
-            i++;
+        if (!disk_store_deserialize_datum(
+                &r, &row->fields[col->index], &col->type)) {
+            VLOG_WARN("failed to deserialize column '%s' "
+                      "for row "UUID_FMT
+                      " at pos %"PRIuSIZE" of %"PRIuSIZE,
+                      col->name, UUID_ARGS(uuid),
+                      r.pos, r.size);
+            /* Re-init to default so destroy is safe. */
+            ovsdb_datum_init_default(
+                &row->fields[col->index], &col->type);
+            goto error;
         }
     }
 
     return row;
+
+error:
+    ovsdb_row_destroy(row);
+    return NULL;
 }
 
 struct ovsdb_row *
@@ -1089,11 +1124,13 @@ ovsdb_disk_store_read_row(struct ovsdb_disk_store *store,
     /* Body starts after the 24-byte header. */
     {
         struct ovsdb_row *row;
+        uint16_t n_columns;
         size_t body_len = entry->length - DISK_STORE_ROW_HEADER_SIZE;
 
+        memcpy(&n_columns, record + 20, sizeof n_columns);
         row = disk_store_deserialize_row(
             record + DISK_STORE_ROW_HEADER_SIZE, body_len,
-            table, uuid);
+            table, uuid, n_columns);
         free(record);
         return row;
     }
