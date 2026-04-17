@@ -386,9 +386,9 @@ for i in $(seq 1 20); do
       [0], [ignore])
 done
 AT_CHECK([ovsdb-tool convert-format db binary], [0])
-dnl Start with a tiny cache budget (env var read by ovsdb-server).
-AT_CHECK([OVS_OVSDB_CACHE_MAX_ATOMS=10 \
-          ovsdb-server --disk-store --detach --no-chdir \
+dnl Start with a tiny cache budget via --cache-max-atoms.
+AT_CHECK([ovsdb-server --disk-store --cache-max-atoms=10 \
+          --detach --no-chdir \
           --pidfile --remote=punix:db.sock \
           --unixctl="`pwd`"/unixctl db], [0])
 dnl Monitor initial snapshot must include all 20 rows.

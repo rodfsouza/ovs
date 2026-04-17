@@ -79,8 +79,11 @@ static struct ovsdb_worker_pool *io_worker_pool;
  * from disk on demand via the I/O worker pool. */
 static bool disk_store_enabled;
 
-/* Default maximum atom count for the per-table row cache. */
-#define OVSDB_CACHE_MAX_ATOMS 1000000
+/* Default maximum atom count for the per-table row cache.
+ * Overridable via --cache-max-atoms CLI flag or
+ * OVS_OVSDB_CACHE_MAX_ATOMS environment variable. */
+#define OVSDB_CACHE_MAX_ATOMS_DEFAULT 1000000
+static size_t cache_max_atoms = OVSDB_CACHE_MAX_ATOMS_DEFAULT;
 
 /* SSL configuration. */
 static char *private_key_file;
@@ -777,6 +780,20 @@ main(int argc, char *argv[])
                   &run_command, &sync_from, &sync_exclude, &active);
     is_backup = sync_from && !active;
 
+    /* Env-var override for cache budget, if --cache-max-atoms was not
+     * given on the CLI (still at default).  Useful for tests. */
+    if (cache_max_atoms == OVSDB_CACHE_MAX_ATOMS_DEFAULT) {
+        const char *env = getenv("OVS_OVSDB_CACHE_MAX_ATOMS");
+        if (env) {
+            unsigned long long int value;
+            if (str_to_ullong(env, 10, &value) && value > 0) {
+                cache_max_atoms = (size_t) value;
+                VLOG_INFO("cache-max-atoms overridden by environment: "
+                          "%"PRIuSIZE, cache_max_atoms);
+            }
+        }
+    }
+
     daemon_become_new_user(false, false);
 
     if (!config_file_path) {
@@ -1222,7 +1239,7 @@ open_db(struct server_config *server_config,
      * the JSON log replay (rows load on demand). */
     if (disk_store_enabled
         && ovsdb_storage_is_disk_store(storage)) {
-        ovsdb_attach_disk_store(db->db, OVSDB_CACHE_MAX_ATOMS);
+        ovsdb_attach_disk_store(db->db, cache_max_atoms);
         VLOG_INFO("%s: opened in binary disk store mode",
                   db->db->name);
     } else {
@@ -2658,6 +2675,7 @@ parse_options(int argc, char *argv[],
         OPT_FILE_NO_DATA_CONVERSION,
         OPT_CONFIG_FILE,
         OPT_DISK_STORE,
+        OPT_CACHE_MAX_ATOMS,
         VLOG_OPTION_ENUMS,
         DAEMON_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
@@ -2687,6 +2705,7 @@ parse_options(int argc, char *argv[],
          OPT_FILE_NO_DATA_CONVERSION},
         {"config-file", required_argument, NULL, OPT_CONFIG_FILE},
         {"disk-store", no_argument, NULL, OPT_DISK_STORE},
+        {"cache-max-atoms", required_argument, NULL, OPT_CACHE_MAX_ATOMS},
         {NULL, 0, NULL, 0},
     };
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
@@ -2796,6 +2815,16 @@ parse_options(int argc, char *argv[],
             disk_store_enabled = true;
             break;
 
+        case OPT_CACHE_MAX_ATOMS: {
+            unsigned long long int value;
+            if (!str_to_ullong(optarg, 10, &value) || value == 0) {
+                ovs_fatal(0, "--cache-max-atoms: invalid value \"%s\"",
+                          optarg);
+            }
+            cache_max_atoms = (size_t) value;
+            break;
+        }
+
         case '?':
             exit(EXIT_FAILURE);
 
@@ -2860,8 +2889,11 @@ usage(void)
            "  --no-dbs                do not add default database\n"
            "  --disable-file-column-diff\n"
            "                          don't use column diff in database file\n"
+           "  --cache-max-atoms=N     set per-table row cache atom budget\n"
+           "                          (default: %d; env: OVS_OVSDB_CACHE_MAX_ATOMS)\n"
            "  -h, --help              display this help message\n"
-           "  -V, --version           display version information\n");
+           "  -V, --version           display version information\n",
+           OVSDB_CACHE_MAX_ATOMS_DEFAULT);
     exit(EXIT_SUCCESS);
 }
 
