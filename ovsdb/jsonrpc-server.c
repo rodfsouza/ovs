@@ -1879,6 +1879,9 @@ ovsdb_jsonrpc_monitor_needs_flush(struct ovsdb_jsonrpc_session *s)
     struct ovsdb_jsonrpc_monitor *m;
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
+        if (m->initial_loading) {
+            continue;
+        }
         if (ovsdb_monitor_needs_flush(m->dbmon, m->change_set)) {
             return true;
         }
@@ -1999,6 +2002,10 @@ ovsdb_jsonrpc_monitor_flush_all(struct ovsdb_jsonrpc_session *s)
     struct ovsdb_jsonrpc_monitor *m;
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
+        if (m->initial_loading) {
+            continue;
+        }
+
         struct json *json;
 
         json = ovsdb_jsonrpc_monitor_compose_update(m, false);
