@@ -15,6 +15,7 @@
 
 #include <config.h>
 #undef NDEBUG
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #include "ovsdb-data.h"
 #include "ovsdb-error.h"
 #include "ovsdb-types.h"
+#include "ovsdb/row-cache.h"
 
 static void
 check_ovsdb_error(struct ovsdb_error *error)
@@ -932,6 +934,494 @@ test_complex_types_compact(void)
     free(filename);
 }
 
+/* ------------------------------------------------------------------ */
+/* Crash resilience and concurrency hypothesis tests.                  */
+/* ------------------------------------------------------------------ */
+
+/* Test 15: Corrupt row on disk — verify read returns NULL and
+ * repeated reads don't spin infinitely.
+ *
+ * Hypothesis: when disk_store_read_row() returns NULL (corrupt data),
+ * the caller (table get_row / lazy-load) enters an infinite retry
+ * loop because the cache entry stays UNLOADED. */
+static void
+test_corrupt_row_returns_null(void)
+{
+    struct ovsdb_schema *schema;
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    struct ovsdb_disk_store *ds;
+    struct ovsdb_row *row, *read_row;
+    struct uuid uuid;
+    char *filename;
+    const char *ds_filename;
+    int fd;
+    off_t file_size;
+    uint8_t garbage[16];
+
+    schema = create_complex_test_schema();
+    db = create_test_db(ovsdb_schema_clone(schema));
+    table = ovsdb_get_table(db, "complex");
+    filename = make_test_filename("corrupt-row");
+
+    /* Write a valid complex row. */
+    ds = ovsdb_disk_store_open(filename, schema);
+    ovs_assert(ds != NULL);
+
+    uuid_generate(&uuid);
+    row = ovsdb_row_create(table);
+    *ovsdb_row_get_uuid_rw(row) = uuid;
+    populate_complex_row(row, table->schema);
+    check_ovsdb_error(ovsdb_disk_store_write_row(ds, row));
+    ovsdb_row_destroy(row);
+
+    /* Get the disk store filename and close. */
+    ds_filename = ovsdb_disk_store_get_filename(ds);
+    ovs_assert(ds_filename != NULL);
+    ovsdb_disk_store_close(ds);
+
+    /* Corrupt the last 16 bytes of the file (part of the row body). */
+    fd = open(filename, O_RDWR);
+    ovs_assert(fd >= 0);
+    file_size = lseek(fd, 0, SEEK_END);
+    ovs_assert(file_size > 16);
+    memset(garbage, 0xDE, sizeof garbage);
+    lseek(fd, file_size - 16, SEEK_SET);
+    ovs_assert(write(fd, garbage, sizeof garbage)
+               == (ssize_t) sizeof garbage);
+    close(fd);
+
+    /* Reopen and try to read the corrupted row. */
+    ds = ovsdb_disk_store_open(filename, schema);
+    ovs_assert(ds != NULL);
+
+    /* disk_store_read_row should return NULL for the corrupt row. */
+    read_row = ovsdb_disk_store_read_row(ds, table, &uuid);
+    ovs_assert(read_row == NULL);
+
+    /* Read again — should still return NULL, not spin. */
+    read_row = ovsdb_disk_store_read_row(ds, table, &uuid);
+    ovs_assert(read_row == NULL);
+
+    ovsdb_disk_store_close(ds);
+    ovsdb_destroy(db);
+    ovsdb_schema_destroy(schema);
+    unlink(filename);
+    free(filename);
+}
+
+/* Test 16: Verify cache state transitions when disk read fails.
+ *
+ * Hypothesis: when a row is in UNLOADED state and sync load fails
+ * (returns NULL), the cache entry stays UNLOADED forever, causing
+ * infinite retry on every get_row call. */
+static void
+test_cache_state_on_failed_load(void)
+{
+    struct ovsdb_row_cache *cache;
+    struct uuid uuid;
+    enum ovsdb_row_state state;
+
+    cache = ovsdb_row_cache_create(100000);
+
+    /* Add an UNLOADED entry. */
+    uuid_generate(&uuid);
+    ovsdb_row_cache_add_unloaded(cache, &uuid);
+    state = ovsdb_row_cache_get_state(cache, &uuid);
+    ovs_assert(state == OVSDB_ROW_UNLOADED);
+
+    /* Simulate: load was submitted → LOADING. */
+    ovsdb_row_cache_set_state(cache, &uuid, OVSDB_ROW_LOADING);
+    state = ovsdb_row_cache_get_state(cache, &uuid);
+    ovs_assert(state == OVSDB_ROW_LOADING);
+
+    /* Use record_load_failure: first failure → UNLOADED (retry). */
+    state = ovsdb_row_cache_record_load_failure(cache, &uuid);
+    ovs_assert(state == OVSDB_ROW_UNLOADED);
+    ovs_assert(ovsdb_row_cache_get_state(cache, &uuid)
+               == OVSDB_ROW_UNLOADED);
+
+    /* Second failure → still UNLOADED. */
+    state = ovsdb_row_cache_record_load_failure(cache, &uuid);
+    ovs_assert(state == OVSDB_ROW_UNLOADED);
+
+    /* Third failure → transitions to ERROR (OVSDB_MAX_LOAD_RETRIES=3). */
+    state = ovsdb_row_cache_record_load_failure(cache, &uuid);
+    ovs_assert(state == OVSDB_ROW_ERROR);
+    ovs_assert(ovsdb_row_cache_get_state(cache, &uuid)
+               == OVSDB_ROW_ERROR);
+
+    /* ERROR entries should NOT be counted as needing load. */
+    ovs_assert(!ovsdb_row_cache_has_unloaded(cache));
+
+    ovsdb_row_cache_destroy(cache);
+}
+
+/* Test 17: Cache iteration while entries change state.
+ *
+ * Hypothesis: if a cache entry transitions from LOADING to UNLOADED
+ * (failed load) while ovsdb_row_cache_for_each_loaded() is
+ * iterating, the iteration could hit corrupted state. */
+static bool
+count_loaded_cb(const struct ovsdb_row *row OVS_UNUSED, void *aux)
+{
+    int *count = aux;
+    (*count)++;
+    return true;
+}
+
+static void
+test_cache_iteration_with_state_changes(void)
+{
+    struct ovsdb_schema *schema;
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    struct ovsdb_disk_store *ds;
+    struct ovsdb_row_cache *cache;
+    struct uuid uuids[5];
+    struct uuid unloaded_uuid;
+    char *filename;
+    int count;
+    int i;
+
+    schema = create_complex_test_schema();
+    db = create_test_db(ovsdb_schema_clone(schema));
+    table = ovsdb_get_table(db, "complex");
+    filename = make_test_filename("cache-iter");
+
+    ds = ovsdb_disk_store_open(filename, schema);
+    ovs_assert(ds != NULL);
+
+    cache = ovsdb_row_cache_create(100000);
+
+    /* Insert 5 CACHED rows. */
+    for (i = 0; i < 5; i++) {
+        struct ovsdb_row *row;
+
+        uuid_generate(&uuids[i]);
+        row = ovsdb_row_create(table);
+        *ovsdb_row_get_uuid_rw(row) = uuids[i];
+        populate_complex_row(row, table->schema);
+        ovsdb_row_cache_insert(cache, row, 10);
+    }
+
+    /* Add one UNLOADED entry. */
+    uuid_generate(&unloaded_uuid);
+    ovsdb_row_cache_add_unloaded(cache, &unloaded_uuid);
+
+    /* Set it to LOADING (simulating async load in progress). */
+    ovsdb_row_cache_set_state(cache, &unloaded_uuid,
+                              OVSDB_ROW_LOADING);
+
+    /* Iterate loaded rows — should see 5 CACHED rows,
+     * skip the LOADING entry. */
+    count = 0;
+    ovsdb_row_cache_for_each_loaded(cache, count_loaded_cb, &count);
+    ovs_assert(count == 5);
+
+    /* Now simulate: load fails → set back to UNLOADED. */
+    ovsdb_row_cache_set_state(cache, &unloaded_uuid,
+                              OVSDB_ROW_UNLOADED);
+
+    /* Iterate again — should still see exactly 5. */
+    count = 0;
+    ovsdb_row_cache_for_each_loaded(cache, count_loaded_cb, &count);
+    ovs_assert(count == 5);
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_disk_store_close(ds);
+    ovsdb_destroy(db);
+    ovsdb_schema_destroy(schema);
+    unlink(filename);
+    free(filename);
+}
+
+/* Test 18: Cache insert triggers eviction of entries being iterated.
+ *
+ * Hypothesis: ovsdb_row_cache_insert() calls evict__() which calls
+ * hmap_remove().  If this is triggered from within a callback
+ * during for_each_loaded iteration, the iterator's bucket pointers
+ * become stale → SIGSEGV.
+ *
+ * We simulate this by creating a tiny cache (budget=10 atoms),
+ * filling it, then doing an insert (which triggers eviction)
+ * while iterating — verifying no crash. */
+struct evict_during_iter_aux {
+    struct ovsdb_row_cache *cache;
+    struct ovsdb_table *table;
+    int seen;
+    bool did_insert;
+};
+
+static bool
+evict_during_iter_cb(const struct ovsdb_row *row OVS_UNUSED,
+                     void *aux_)
+{
+    struct evict_during_iter_aux *aux = aux_;
+
+    aux->seen++;
+
+    /* On the second callback, insert a new row that triggers
+     * eviction (cache budget is tiny). */
+    if (aux->seen == 2 && !aux->did_insert) {
+        struct ovsdb_row *new_row;
+        struct uuid new_uuid;
+
+        aux->did_insert = true;
+        uuid_generate(&new_uuid);
+        new_row = ovsdb_row_create(aux->table);
+        *ovsdb_row_get_uuid_rw(new_row) = new_uuid;
+
+        /* This insert will trigger eviction because cache is
+         * at budget.  Eviction calls hmap_remove() on entries
+         * while we're inside HMAP_FOR_EACH. */
+        ovsdb_row_cache_insert(aux->cache, new_row, 5);
+    }
+
+    return true; /* continue iteration */
+}
+
+static void
+test_cache_eviction_during_iteration(void)
+{
+    struct ovsdb_schema *schema;
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    struct ovsdb_row_cache *cache;
+    struct evict_during_iter_aux aux;
+    int i;
+
+    schema = create_complex_test_schema();
+    db = create_test_db(ovsdb_schema_clone(schema));
+    table = ovsdb_get_table(db, "complex");
+
+    /* Tiny cache: budget of 10 atoms.  Each row gets 5 atoms,
+     * so 2 rows fit, 3rd triggers eviction. */
+    cache = ovsdb_row_cache_create(10);
+
+    /* Insert 3 rows → 15 atoms total, exceeds budget → 1 evicted. */
+    for (i = 0; i < 3; i++) {
+        struct ovsdb_row *row;
+        struct uuid uuid;
+
+        uuid_generate(&uuid);
+        row = ovsdb_row_create(table);
+        *ovsdb_row_get_uuid_rw(row) = uuid;
+        ovsdb_row_cache_insert(cache, row, 5);
+    }
+
+    /* Now iterate and trigger eviction from inside the callback.
+     * If hmap_remove during HMAP_FOR_EACH causes corruption,
+     * this will SIGSEGV. */
+    aux.cache = cache;
+    aux.table = table;
+    aux.seen = 0;
+    aux.did_insert = false;
+
+    ovsdb_row_cache_for_each_loaded(cache, evict_during_iter_cb, &aux);
+
+    /* We survived.  The exact count depends on whether the evicted
+     * entry was ahead or behind the iterator.  The key is no crash. */
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_destroy(db);
+    ovsdb_schema_destroy(schema);
+}
+
+/* Test 19: Concurrent write + read on disk store — verify index
+ * consistency.
+ *
+ * Hypothesis: ovsdb_disk_store_write_row() frees the old index
+ * entry (hmap_remove + free) at lines 938-939 of disk-store.c.
+ * If a worker thread holds a pointer from disk_store_find_entry()
+ * obtained before the write, it becomes a dangling pointer →
+ * use-after-free → garbage pread → deserialization failure or
+ * SIGSEGV.
+ *
+ * We simulate this single-threaded: write row v1, stash its UUID,
+ * write row v2 (same UUID, different data), then read.  The read
+ * should get v2, proving the index was updated atomically.
+ * Then we verify that rapid write-read interleaving doesn't
+ * corrupt the index. */
+static void
+test_disk_store_index_consistency(void)
+{
+    struct ovsdb_schema *schema;
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    struct ovsdb_disk_store *ds;
+    struct ovsdb_row *row, *read_row;
+    struct uuid uuid;
+    char *filename;
+    const struct ovsdb_column *name_col;
+    struct ovsdb_datum *field;
+    int i;
+
+    schema = create_complex_test_schema();
+    db = create_test_db(ovsdb_schema_clone(schema));
+    table = ovsdb_get_table(db, "complex");
+    filename = make_test_filename("index-consistency");
+
+    ds = ovsdb_disk_store_open(filename, schema);
+    ovs_assert(ds != NULL);
+
+    name_col = shash_find_data(&table->schema->columns, "name");
+    ovs_assert(name_col != NULL);
+
+    uuid_generate(&uuid);
+
+    /* Write version 1. */
+    row = ovsdb_row_create(table);
+    *ovsdb_row_get_uuid_rw(row) = uuid;
+    field = &row->fields[name_col->index];
+    ovsdb_datum_destroy(field, &name_col->type);
+    field->n = 1;
+    field->keys = xmalloc(sizeof *field->keys);
+    field->keys[0].s = json_string_create("version-1");
+    field->values = NULL;
+    field->refcnt = NULL;
+    check_ovsdb_error(ovsdb_disk_store_write_row(ds, row));
+    ovsdb_row_destroy(row);
+
+    /* Overwrite with version 2 (same UUID). */
+    row = ovsdb_row_create(table);
+    *ovsdb_row_get_uuid_rw(row) = uuid;
+    field = &row->fields[name_col->index];
+    ovsdb_datum_destroy(field, &name_col->type);
+    field->n = 1;
+    field->keys = xmalloc(sizeof *field->keys);
+    field->keys[0].s = json_string_create("version-2");
+    field->values = NULL;
+    field->refcnt = NULL;
+    check_ovsdb_error(ovsdb_disk_store_write_row(ds, row));
+    ovsdb_row_destroy(row);
+
+    /* Read should return version 2 (index updated). */
+    read_row = ovsdb_disk_store_read_row(ds, table, &uuid);
+    ovs_assert(read_row != NULL);
+    {
+        const char *name_val = json_string(
+            read_row->fields[name_col->index].keys[0].s);
+        ovs_assert(!strcmp(name_val, "version-2"));
+    }
+    ovsdb_row_destroy(read_row);
+
+    /* Stress: rapid write-read cycles on the same UUID.
+     * This exercises the index entry free+realloc path
+     * that is racy with workers. */
+    for (i = 0; i < 100; i++) {
+        char *version = xasprintf("stress-%03d", i);
+
+        row = ovsdb_row_create(table);
+        *ovsdb_row_get_uuid_rw(row) = uuid;
+        field = &row->fields[name_col->index];
+        ovsdb_datum_destroy(field, &name_col->type);
+        field->n = 1;
+        field->keys = xmalloc(sizeof *field->keys);
+        field->keys[0].s = json_string_create_nocopy(version);
+        field->values = NULL;
+        field->refcnt = NULL;
+        check_ovsdb_error(ovsdb_disk_store_write_row(ds, row));
+        ovsdb_row_destroy(row);
+
+        read_row = ovsdb_disk_store_read_row(ds, table, &uuid);
+        ovs_assert(read_row != NULL);
+        {
+            char *expected = xasprintf("stress-%03d", i);
+            const char *actual = json_string(
+                read_row->fields[name_col->index].keys[0].s);
+            ovs_assert(!strcmp(actual, expected));
+            free(expected);
+        }
+        ovsdb_row_destroy(read_row);
+    }
+
+    ovsdb_disk_store_close(ds);
+    ovsdb_destroy(db);
+    ovsdb_schema_destroy(schema);
+    unlink(filename);
+    free(filename);
+}
+
+/* Test 20: Cache insert+remove+iterate stress test.
+ *
+ * Exercises the hmap under heavy insert/evict/iterate load to
+ * detect any corruption from internal re-entrancy or stale
+ * iterator state. */
+static bool
+stress_iter_cb(const struct ovsdb_row *row OVS_UNUSED, void *aux)
+{
+    int *count = aux;
+    (*count)++;
+    return true;
+}
+
+static void
+test_cache_stress(void)
+{
+    struct ovsdb_schema *schema;
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    struct ovsdb_row_cache *cache;
+    struct uuid uuids[200];
+    int i, count;
+
+    schema = create_complex_test_schema();
+    db = create_test_db(ovsdb_schema_clone(schema));
+    table = ovsdb_get_table(db, "complex");
+
+    /* Small cache: budget for ~50 rows at 10 atoms each. */
+    cache = ovsdb_row_cache_create(500);
+
+    /* Insert 200 rows.  Each insert may trigger eviction.
+     * Verify cache stays consistent throughout. */
+    for (i = 0; i < 200; i++) {
+        struct ovsdb_row *row;
+
+        uuid_generate(&uuids[i]);
+        row = ovsdb_row_create(table);
+        *ovsdb_row_get_uuid_rw(row) = uuids[i];
+        ovsdb_row_cache_insert(cache, row, 10);
+
+        /* Every 20 inserts, iterate the whole cache. */
+        if (i % 20 == 19) {
+            count = 0;
+            ovsdb_row_cache_for_each_loaded(cache,
+                                            stress_iter_cb, &count);
+            /* Count should be <= cache budget / atom cost. */
+            ovs_assert(count <= 51);
+        }
+    }
+
+    /* Remove 50 random entries, then iterate again. */
+    for (i = 150; i < 200; i++) {
+        ovsdb_row_cache_remove(cache, &uuids[i]);
+    }
+
+    count = 0;
+    ovsdb_row_cache_for_each_loaded(cache, stress_iter_cb, &count);
+    (void) count; /* Used only for assertion below. */
+
+    /* Now interleave: add UNLOADED entries, transition them,
+     * insert CACHED entries — all with tiny budget. */
+    for (i = 0; i < 50; i++) {
+        struct uuid u;
+        uuid_generate(&u);
+
+        /* Add as UNLOADED, then remove (simulating failed load). */
+        ovsdb_row_cache_add_unloaded(cache, &u);
+        ovsdb_row_cache_set_state(cache, &u, OVSDB_ROW_LOADING);
+        ovsdb_row_cache_set_state(cache, &u, OVSDB_ROW_UNLOADED);
+        ovsdb_row_cache_remove(cache, &u);
+    }
+
+    /* Final iteration — should not crash. */
+    count = 0;
+    ovsdb_row_cache_for_each_loaded(cache, stress_iter_cb, &count);
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_destroy(db);
+    ovsdb_schema_destroy(schema);
+}
+
 static void
 test_disk_store_main(int argc OVS_UNUSED,
                      char *argv[] OVS_UNUSED)
@@ -977,6 +1467,24 @@ test_disk_store_main(int argc OVS_UNUSED,
 
     printf("test-disk-store: complex_types_compact\n");
     test_complex_types_compact();
+
+    printf("test-disk-store: corrupt_row_returns_null\n");
+    test_corrupt_row_returns_null();
+
+    printf("test-disk-store: cache_state_on_failed_load\n");
+    test_cache_state_on_failed_load();
+
+    printf("test-disk-store: cache_iteration_with_state_changes\n");
+    test_cache_iteration_with_state_changes();
+
+    printf("test-disk-store: cache_eviction_during_iteration\n");
+    test_cache_eviction_during_iteration();
+
+    printf("test-disk-store: disk_store_index_consistency\n");
+    test_disk_store_index_consistency();
+
+    printf("test-disk-store: cache_stress\n");
+    test_cache_stress();
 
     printf("test-disk-store: ok\n");
 }

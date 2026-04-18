@@ -19,6 +19,12 @@ test-disk-store: complex_types_reopen
 test-disk-store: empty_map_roundtrip
 test-disk-store: large_map_roundtrip
 test-disk-store: complex_types_compact
+test-disk-store: corrupt_row_returns_null
+test-disk-store: cache_state_on_failed_load
+test-disk-store: cache_iteration_with_state_changes
+test-disk-store: cache_eviction_during_iteration
+test-disk-store: disk_store_index_consistency
+test-disk-store: cache_stress
 test-disk-store: ok
 ], [ignore])
 AT_CHECK([ovstest test-row-cache], [0], [test-row-cache: ok

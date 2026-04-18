@@ -38,6 +38,7 @@ struct ovsdb_row_cache_entry {
     size_t n_atoms;               /* Atom cost of this row. */
     bool pinned;                  /* If true, entry cannot be evicted. */
     enum ovsdb_row_state state;   /* Loading state (Phase 2). */
+    uint8_t load_failures;        /* Consecutive load failure count. */
 };
 
 /* An LRU cache of ovsdb_row objects, bounded by a maximum atom count.
@@ -45,7 +46,16 @@ struct ovsdb_row_cache_entry {
  * Rows may be "pinned" to prevent eviction.  When the total atom count
  * exceeds 'max_atoms', the least-recently-used unpinned entry is
  * evicted.  If every remaining entry is pinned, eviction stops and the
- * cache is allowed to exceed the limit temporarily. */
+ * cache is allowed to exceed the limit temporarily.
+ *
+ * Re-entrancy safety:  The for_each_loaded() and for_each_unloaded()
+ * functions iterate the hmap with HMAP_FOR_EACH.  If a callback
+ * triggers insert or remove (e.g., via transaction commit or sync
+ * load fallback), hmap_remove/hmap_insert during iteration corrupts
+ * the iterator.  To prevent this, the cache tracks an 'iterating'
+ * depth counter.  While iterating, evict_entry__() defers the
+ * hmap_remove and free to a 'deferred_free' list.  The deferred
+ * entries are swept after the outermost iteration completes. */
 struct ovsdb_row_cache {
     struct hmap entries;          /* Contains ovsdb_row_cache_entry. */
     struct ovs_list lru;          /* LRU list, least-recent at front. */
@@ -54,6 +64,10 @@ struct ovsdb_row_cache {
     size_t n_entries;             /* Number of entries in the cache. */
     size_t hits;                  /* Number of successful lookups. */
     size_t misses;                /* Number of failed lookups. */
+
+    /* Re-entrancy guard for safe iteration. */
+    int iterating;                /* Nesting depth of for_each_* calls. */
+    struct ovs_list deferred_free; /* Entries to free after iteration. */
 };
 
 /* ------------------------------------------------------------------
@@ -85,23 +99,61 @@ ovsdb_row_cache_touch__(struct ovsdb_row_cache *cache,
     ovs_list_push_back(&cache->lru, &entry->lru_node);
 }
 
+/* Sweeps entries on the deferred_free list, completing their removal
+ * from the hmap and freeing them.
+ * Must only be called when iterating == 0. */
+static void
+ovsdb_row_cache_sweep_deferred__(struct ovsdb_row_cache *cache)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    while (!ovs_list_is_empty(&cache->deferred_free)) {
+        entry = CONTAINER_OF(ovs_list_pop_front(&cache->deferred_free),
+                             struct ovsdb_row_cache_entry, lru_node);
+        hmap_remove(&cache->entries, &entry->hmap_node);
+        /* Row was already destroyed in evict_entry__. */
+        free(entry);
+    }
+}
+
 /* Removes and frees 'entry', destroying the contained row (if any).
  * The caller is responsible for any additional bookkeeping.
- * Entries in UNLOADED/LOADING state may have row==NULL. */
+ * Entries in UNLOADED/LOADING state may have row==NULL.
+ *
+ * If the cache is currently being iterated (iterating > 0), both
+ * the hmap_remove and free are deferred.  The entry is marked as
+ * dead (state = OVSDB_ROW_ERROR, row = NULL) so iterators skip it,
+ * but its hmap_node stays in the chain to avoid corrupting a
+ * pre-fetched HMAP_FOR_EACH_SAFE next pointer.  The actual
+ * hmap_remove + free happens in sweep_deferred__() after the
+ * outermost iteration completes. */
 static void
 ovsdb_row_cache_evict_entry__(struct ovsdb_row_cache *cache,
                               struct ovsdb_row_cache_entry *entry)
 {
-    ovs_list_remove(&entry->lru_node);
-    hmap_remove(&cache->entries, &entry->hmap_node);
-
     cache->total_atoms -= entry->n_atoms;
     cache->n_entries--;
 
-    if (entry->row) {
-        ovsdb_row_destroy(entry->row);
+    if (cache->iterating > 0) {
+        /* Defer both hmap_remove and free.  Destroy the row now
+         * to release memory, but keep the entry in the hmap so
+         * the iterator's bucket chain stays valid. */
+        ovs_list_remove(&entry->lru_node);
+        if (entry->row) {
+            ovsdb_row_destroy(entry->row);
+            entry->row = NULL;
+        }
+        entry->n_atoms = 0;
+        entry->state = OVSDB_ROW_ERROR; /* Mark dead for iterators. */
+        ovs_list_push_back(&cache->deferred_free, &entry->lru_node);
+    } else {
+        ovs_list_remove(&entry->lru_node);
+        hmap_remove(&cache->entries, &entry->hmap_node);
+        if (entry->row) {
+            ovsdb_row_destroy(entry->row);
+        }
+        free(entry);
     }
-    free(entry);
 }
 
 /* Evicts unpinned entries starting from the least-recently-used end
@@ -145,6 +197,8 @@ ovsdb_row_cache_create(size_t max_atoms)
     cache->n_entries = 0;
     cache->hits = 0;
     cache->misses = 0;
+    cache->iterating = 0;
+    ovs_list_init(&cache->deferred_free);
 
     VLOG_DBG("created row cache (max_atoms=%"PRIuSIZE")", max_atoms);
     return cache;
@@ -161,9 +215,14 @@ ovsdb_row_cache_destroy(struct ovsdb_row_cache *cache)
         return;
     }
 
+    /* Sweep any deferred entries first. */
+    ovsdb_row_cache_sweep_deferred__(cache);
+
     HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         hmap_remove(&cache->entries, &entry->hmap_node);
-        ovsdb_row_destroy(entry->row);
+        if (entry->row) {
+            ovsdb_row_destroy(entry->row);
+        }
         free(entry);
     }
 
@@ -231,6 +290,7 @@ ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
     entry->n_atoms = n_atoms;
     entry->pinned = false;
     entry->state = OVSDB_ROW_CACHED;
+    entry->load_failures = 0;
 
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
@@ -381,6 +441,31 @@ ovsdb_row_cache_set_state(struct ovsdb_row_cache *cache,
     }
 }
 
+/* Records a load failure for 'uuid'.  Returns the new state. */
+enum ovsdb_row_state
+ovsdb_row_cache_record_load_failure(struct ovsdb_row_cache *cache,
+                                    const struct uuid *uuid)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    entry = ovsdb_row_cache_find__(cache, uuid);
+    if (!entry) {
+        return OVSDB_ROW_UNLOADED;
+    }
+
+    entry->load_failures++;
+    if (entry->load_failures >= OVSDB_MAX_LOAD_RETRIES) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+        entry->state = OVSDB_ROW_ERROR;
+        VLOG_WARN_RL(&rl, "row "UUID_FMT" permanently failed "
+                     "after %d load attempts",
+                     UUID_ARGS(uuid), entry->load_failures);
+    } else {
+        entry->state = OVSDB_ROW_UNLOADED;
+    }
+    return entry->state;
+}
+
 /* Returns true if the cache has any entries in UNLOADED or LOADING state. */
 bool
 ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *cache)
@@ -407,19 +492,27 @@ ovsdb_row_cache_for_each_unloaded(
 {
     struct ovsdb_row_cache_entry *entry;
 
-    HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
+    cache->iterating++;
+    HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_UNLOADED) {
             if (!cb(&entry->uuid, aux)) {
                 break;
             }
         }
     }
+    if (--cache->iterating == 0) {
+        ovsdb_row_cache_sweep_deferred__(cache);
+    }
 }
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_CACHED.
  * The row pointer passed to 'cb' is owned by the cache and remains
  * valid for the duration of the callback (and longer, as long as
- * no eviction or removal occurs).  Stops if 'cb' returns false. */
+ * the cache is not destroyed).
+ *
+ * Re-entrancy safe: callbacks may call insert/remove/evict without
+ * corrupting the iteration — evicted entries are deferred until
+ * after the outermost iteration completes. */
 void
 ovsdb_row_cache_for_each_loaded(
     struct ovsdb_row_cache *cache,
@@ -428,12 +521,16 @@ ovsdb_row_cache_for_each_loaded(
 {
     struct ovsdb_row_cache_entry *entry;
 
-    HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
+    cache->iterating++;
+    HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_CACHED && entry->row) {
             if (!cb(entry->row, aux)) {
                 break;
             }
         }
+    }
+    if (--cache->iterating == 0) {
+        ovsdb_row_cache_sweep_deferred__(cache);
     }
 }
 
@@ -457,6 +554,7 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     entry->n_atoms = 0;
     entry->pinned = false;
     entry->state = OVSDB_ROW_UNLOADED;
+    entry->load_failures = 0;
 
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));

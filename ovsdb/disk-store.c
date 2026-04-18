@@ -33,6 +33,7 @@
 #include "openvswitch/shash.h"
 #include "openvswitch/uuid.h"
 #include "openvswitch/vlog.h"
+#include "ovs-thread.h"
 #include "row.h"
 #include "sha1.h"
 #include "table.h"
@@ -95,6 +96,10 @@ struct ovsdb_disk_store {
     char *filename;               /* Path to the data file. */
     int fd;                       /* File descriptor (-1 if closed). */
     struct hmap index;            /* UUID -> disk_store_index_entry. */
+    struct ovs_rwlock index_rwlock; /* Protects 'index' hmap.  Workers
+                                     * acquire read lock for lookups;
+                                     * main thread acquires write lock
+                                     * for insert/remove/rebuild. */
     uint8_t schema_hash[SHA1_DIGEST_SIZE]; /* SHA-1 of schema JSON. */
     struct ovsdb_schema *schema;  /* Embedded schema (owned). */
     uint32_t schema_json_len;     /* Length of embedded schema JSON.
@@ -699,6 +704,7 @@ ovsdb_disk_store_open(const char *filename,
     store->filename = xstrdup(filename);
     store->fd = fd;
     hmap_init(&store->index);
+    ovs_rwlock_init(&store->index_rwlock);
     memcpy(store->schema_hash, schema_hash, SHA1_DIGEST_SIZE);
     store->schema = schema ? ovsdb_schema_clone(schema) : NULL;
 
@@ -803,6 +809,7 @@ ovsdb_disk_store_open(const char *filename,
 error:
     close(fd);
     hmap_destroy(&store->index);
+    ovs_rwlock_destroy(&store->index_rwlock);
     ovsdb_schema_destroy(store->schema);
     free(store->filename);
     free(store);
@@ -818,11 +825,14 @@ ovsdb_disk_store_close(struct ovsdb_disk_store *store)
         return;
     }
 
+    ovs_rwlock_wrlock(&store->index_rwlock);
     HMAP_FOR_EACH_SAFE (e, hmap_node, &store->index) {
         hmap_remove(&store->index, &e->hmap_node);
         disk_store_index_entry_destroy(e);
     }
     hmap_destroy(&store->index);
+    ovs_rwlock_unlock(&store->index_rwlock);
+    ovs_rwlock_destroy(&store->index_rwlock);
 
     if (store->fd >= 0) {
         close(store->fd);
@@ -932,7 +942,9 @@ ovsdb_disk_store_write_row(struct ovsdb_disk_store *store,
                               "write failed on disk store");
     }
 
-    /* Update in-memory index. */
+    /* Update in-memory index under write lock so worker threads
+     * doing read_row don't see a freed index entry. */
+    ovs_rwlock_wrlock(&store->index_rwlock);
     old_entry = disk_store_find_entry(store, uuid);
     if (old_entry) {
         hmap_remove(&store->index, &old_entry->hmap_node);
@@ -947,6 +959,7 @@ ovsdb_disk_store_write_row(struct ovsdb_disk_store *store,
     entry->deleted = false;
     hmap_insert(&store->index, &entry->hmap_node,
                 disk_store_uuid_hash(uuid));
+    ovs_rwlock_unlock(&store->index_rwlock);
 
     disk_store_buf_destroy(&buf);
     return NULL;
@@ -958,14 +971,17 @@ ovsdb_disk_store_delete_row(struct ovsdb_disk_store *store,
 {
     struct disk_store_index_entry *entry;
 
+    ovs_rwlock_wrlock(&store->index_rwlock);
     entry = disk_store_find_entry(store, uuid);
     if (!entry) {
+        ovs_rwlock_unlock(&store->index_rwlock);
         return ovsdb_error(NULL,
                            "row "UUID_FMT" not found in disk store",
                            UUID_ARGS(uuid));
     }
 
     entry->deleted = true;
+    ovs_rwlock_unlock(&store->index_rwlock);
     return NULL;
 }
 
@@ -979,6 +995,7 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
                            const struct uuid *uuid,
                            uint16_t n_columns)
 {
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
     struct disk_store_reader r;
     uint16_t name_len;
     struct ovsdb_row *row;
@@ -1012,15 +1029,15 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
         const struct ovsdb_column *col;
 
         if (!disk_store_reader_get_uint16(&r, &col_name_len)) {
-            VLOG_WARN("truncated column name length for "
-                      "row "UUID_FMT, UUID_ARGS(uuid));
+            VLOG_WARN_RL(&rl, "truncated column name length for "
+                         "row "UUID_FMT, UUID_ARGS(uuid));
             goto error;
         }
         if (col_name_len >= DISK_STORE_MAX_TABLE_NAME
             || !disk_store_reader_remaining(&r, col_name_len)) {
-            VLOG_WARN("bad column name length %"PRIu16" for "
-                      "row "UUID_FMT,
-                      col_name_len, UUID_ARGS(uuid));
+            VLOG_WARN_RL(&rl, "bad column name length %"PRIu16
+                         " for row "UUID_FMT,
+                         col_name_len, UUID_ARGS(uuid));
             goto error;
         }
         memcpy(col_name, r.data + r.pos, col_name_len);
@@ -1029,9 +1046,9 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
 
         if (!disk_store_reader_get_uint8(&r, &key_tag)
             || !disk_store_reader_get_uint8(&r, &val_tag)) {
-            VLOG_WARN("truncated type tags for column '%s' "
-                      "in row "UUID_FMT,
-                      col_name, UUID_ARGS(uuid));
+            VLOG_WARN_RL(&rl, "truncated type tags for column "
+                         "'%s' in row "UUID_FMT,
+                         col_name, UUID_ARGS(uuid));
             goto error;
         }
 
@@ -1039,22 +1056,22 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
         if (!col) {
             /* Unknown column -- skip its datum.  We can't know
              * the exact size, so we must abort. */
-            VLOG_WARN("unknown column '%s' in row "UUID_FMT
-                      ", skipping rest of row",
-                      col_name, UUID_ARGS(uuid));
+            VLOG_WARN_RL(&rl, "unknown column '%s' in row "
+                         UUID_FMT", skipping rest of row",
+                         col_name, UUID_ARGS(uuid));
             goto error;
         }
 
         /* Validate type tags. */
         if (key_tag != (uint8_t) col->type.key.type
             || val_tag != (uint8_t) col->type.value.type) {
-            VLOG_WARN("type mismatch for column '%s' in "
-                      "row "UUID_FMT": expected (%d,%d) "
-                      "got (%d,%d)",
-                      col->name, UUID_ARGS(uuid),
-                      (int) col->type.key.type,
-                      (int) col->type.value.type,
-                      (int) key_tag, (int) val_tag);
+            VLOG_WARN_RL(&rl, "type mismatch for column '%s' "
+                         "in row "UUID_FMT": expected "
+                         "(%d,%d) got (%d,%d)",
+                         col->name, UUID_ARGS(uuid),
+                         (int) col->type.key.type,
+                         (int) col->type.value.type,
+                         (int) key_tag, (int) val_tag);
             goto error;
         }
 
@@ -1065,11 +1082,11 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
 
         if (!disk_store_deserialize_datum(
                 &r, &row->fields[col->index], &col->type)) {
-            VLOG_WARN("failed to deserialize column '%s' "
-                      "for row "UUID_FMT
-                      " at pos %"PRIuSIZE" of %"PRIuSIZE,
-                      col->name, UUID_ARGS(uuid),
-                      r.pos, r.size);
+            VLOG_WARN_RL(&rl, "failed to deserialize column "
+                         "'%s' for row "UUID_FMT
+                         " at pos %"PRIuSIZE" of %"PRIuSIZE,
+                         col->name, UUID_ARGS(uuid),
+                         r.pos, r.size);
             /* Re-init to default so destroy is safe. */
             ovsdb_datum_init_default(
                 &row->fields[col->index], &col->type);
@@ -1089,24 +1106,36 @@ ovsdb_disk_store_read_row(struct ovsdb_disk_store *store,
                           struct ovsdb_table *table,
                           const struct uuid *uuid)
 {
-    struct disk_store_index_entry *entry;
     uint8_t *record;
     ssize_t n;
     struct uuid stored_uuid;
     uint32_t total_len;
     uint16_t flags;
+    off_t offset;
+    uint32_t length;
 
-    entry = disk_store_find_entry(store, uuid);
-    if (!entry || entry->deleted) {
-        return NULL;
+    /* Copy offset/length under read lock so a concurrent write_row
+     * on the main thread cannot free the index entry while we use
+     * it.  The pread itself is outside the lock. */
+    ovs_rwlock_rdlock(&store->index_rwlock);
+    {
+        struct disk_store_index_entry *entry;
+        entry = disk_store_find_entry(store, uuid);
+        if (!entry || entry->deleted) {
+            ovs_rwlock_unlock(&store->index_rwlock);
+            return NULL;
+        }
+        offset = entry->offset;
+        length = entry->length;
     }
+    ovs_rwlock_unlock(&store->index_rwlock);
 
-    /* Read the full record. */
-    record = xmalloc(entry->length);
-    n = pread(store->fd, record, entry->length, entry->offset);
-    if (n != (ssize_t) entry->length) {
+    /* Read the full record (outside lock — pread is thread-safe). */
+    record = xmalloc(length);
+    n = pread(store->fd, record, length, offset);
+    if (n != (ssize_t) length) {
         VLOG_WARN("short read for row "UUID_FMT" at offset %lld",
-                  UUID_ARGS(uuid), (long long) entry->offset);
+                  UUID_ARGS(uuid), (long long) offset);
         free(record);
         return NULL;
     }
@@ -1125,7 +1154,7 @@ ovsdb_disk_store_read_row(struct ovsdb_disk_store *store,
     {
         struct ovsdb_row *row;
         uint16_t n_columns;
-        size_t body_len = entry->length - DISK_STORE_ROW_HEADER_SIZE;
+        size_t body_len = length - DISK_STORE_ROW_HEADER_SIZE;
 
         memcpy(&n_columns, record + 20, sizeof n_columns);
         row = disk_store_deserialize_row(

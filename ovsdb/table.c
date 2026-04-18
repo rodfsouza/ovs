@@ -394,6 +394,10 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
             /* Load in progress — caller must park. */
             return NULL;
 
+        case OVSDB_ROW_ERROR:
+            /* Load permanently failed — don't retry. */
+            return NULL;
+
         case OVSDB_ROW_UNLOADED:
             /* Submit async load if worker pool available.
              * ovsdb_lazy_load_request() transitions state to
@@ -416,6 +420,10 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
                     ovsdb_row_count_atoms(row));
                 return row;
             }
+            /* Sync load failed — record failure (may transition
+             * to ERROR after OVSDB_MAX_LOAD_RETRIES). */
+            ovsdb_row_cache_record_load_failure(
+                table->cache, uuid);
             break;
         }
     }

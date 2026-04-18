@@ -123,12 +123,18 @@ row_load_done(void *result, void *aux)
         req->db->run_triggers = true;
         req->db->run_triggers_now = true;
     } else {
-        VLOG_WARN("lazy-load: failed to load row "UUID_FMT,
-                  UUID_ARGS(&req->uuid));
-        /* Mark as UNLOADED so it can be retried. */
-        ovsdb_row_cache_set_state(req->table->cache,
-                                  &req->uuid,
-                                  OVSDB_ROW_UNLOADED);
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+        enum ovsdb_row_state new_state;
+
+        VLOG_WARN_RL(&rl, "lazy-load: failed to load row "UUID_FMT,
+                     UUID_ARGS(&req->uuid));
+        /* Record failure; transitions to ERROR after max retries. */
+        new_state = ovsdb_row_cache_record_load_failure(
+            req->table->cache, &req->uuid);
+        if (new_state == OVSDB_ROW_UNLOADED) {
+            /* Still retryable — wake triggers for next cycle. */
+            req->db->run_triggers = true;
+        }
     }
 
     free(req);

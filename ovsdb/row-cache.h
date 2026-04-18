@@ -28,7 +28,11 @@ enum ovsdb_row_state {
     OVSDB_ROW_UNLOADED,   /* UUID known, data on disk only. */
     OVSDB_ROW_LOADING,    /* Load job submitted to worker pool. */
     OVSDB_ROW_CACHED,     /* Data in memory. */
+    OVSDB_ROW_ERROR,      /* Load failed after max retries. */
 };
+
+/* Maximum consecutive load failures before marking a row as ERROR. */
+#define OVSDB_MAX_LOAD_RETRIES 3
 
 /* Lifecycle. */
 struct ovsdb_row_cache *ovsdb_row_cache_create(size_t max_atoms);
@@ -58,6 +62,14 @@ void ovsdb_row_cache_set_state(struct ovsdb_row_cache *,
                                enum ovsdb_row_state);
 void ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *,
                                   const struct uuid *);
+
+/* Records a load failure for 'uuid'.  If the failure count reaches
+ * OVSDB_MAX_LOAD_RETRIES, the entry transitions to OVSDB_ROW_ERROR
+ * and no further load attempts will be made.  Otherwise, the entry
+ * goes back to OVSDB_ROW_UNLOADED for retry.
+ * Returns the new state (OVSDB_ROW_UNLOADED or OVSDB_ROW_ERROR). */
+enum ovsdb_row_state ovsdb_row_cache_record_load_failure(
+    struct ovsdb_row_cache *, const struct uuid *);
 
 /* Returns true if the cache has any entries in UNLOADED or LOADING state. */
 bool ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *);
