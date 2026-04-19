@@ -49,8 +49,9 @@ VLOG_DEFINE_THIS_MODULE(disk_store);
 /* Row flags. */
 #define DISK_STORE_FLAG_DELETED  0x01
 
-/* Maximum table name length stored on disk. */
-#define DISK_STORE_MAX_TABLE_NAME  256
+/* Maximum table/column name length stored on disk. */
+#define DISK_STORE_MAX_TABLE_NAME   256
+#define DISK_STORE_MAX_COLUMN_NAME  256
 
 /* File header layout (on disk):
  *   8 bytes   magic ("BINARYV1")
@@ -80,6 +81,8 @@ VLOG_DEFINE_THIS_MODULE(disk_store);
  *  24 bytes total
  */
 #define DISK_STORE_ROW_HEADER_SIZE  24
+#define DISK_STORE_N_COLUMNS_OFFSET 20  /* Byte offset of n_columns
+                                         * within the row header. */
 
 /* In-memory index entry mapping UUID -> file location. */
 struct disk_store_index_entry {
@@ -616,7 +619,8 @@ disk_store_rebuild_index(struct ovsdb_disk_store *store)
 
         memcpy(&uuid, row_header, sizeof uuid);
         memcpy(&total_len, row_header + 16, sizeof total_len);
-        memcpy(&n_columns, row_header + 20, sizeof n_columns);
+        memcpy(&n_columns, row_header + DISK_STORE_N_COLUMNS_OFFSET,
+               sizeof n_columns);
         memcpy(&flags, row_header + 22, sizeof flags);
 
         if (total_len < DISK_STORE_ROW_HEADER_SIZE) {
@@ -997,7 +1001,7 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
 {
     static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
     struct disk_store_reader r;
-    uint16_t name_len;
+    uint16_t tbl_name_len;
     struct ovsdb_row *row;
     const struct ovsdb_table_schema *ts = table->schema;
     uint16_t i;
@@ -1008,13 +1012,13 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
 
     /* 'data' starts AFTER the 24-byte fixed row header.
      * First field is the table name (2-byte length + name bytes). */
-    if (!disk_store_reader_get_uint16(&r, &name_len)) {
+    if (!disk_store_reader_get_uint16(&r, &tbl_name_len)) {
         return NULL;
     }
-    if (!disk_store_reader_remaining(&r, name_len)) {
+    if (!disk_store_reader_remaining(&r, tbl_name_len)) {
         return NULL;
     }
-    r.pos += name_len;
+    r.pos += tbl_name_len;
 
     row = ovsdb_row_create(table);
     *ovsdb_row_get_uuid_rw(row) = *uuid;
@@ -1024,7 +1028,7 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
      * then the serialized datum. */
     for (i = 0; i < n_columns; i++) {
         uint16_t col_name_len;
-        char col_name[DISK_STORE_MAX_TABLE_NAME];
+        char col_name[DISK_STORE_MAX_COLUMN_NAME];
         uint8_t key_tag, val_tag;
         const struct ovsdb_column *col;
 
@@ -1033,7 +1037,7 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
                          "row "UUID_FMT, UUID_ARGS(uuid));
             goto error;
         }
-        if (col_name_len >= DISK_STORE_MAX_TABLE_NAME
+        if (col_name_len >= DISK_STORE_MAX_COLUMN_NAME
             || !disk_store_reader_remaining(&r, col_name_len)) {
             VLOG_WARN_RL(&rl, "bad column name length %"PRIu16
                          " for row "UUID_FMT
@@ -1158,7 +1162,8 @@ ovsdb_disk_store_read_row(struct ovsdb_disk_store *store,
         uint16_t n_columns;
         size_t body_len = length - DISK_STORE_ROW_HEADER_SIZE;
 
-        memcpy(&n_columns, record + 20, sizeof n_columns);
+        memcpy(&n_columns, record + DISK_STORE_N_COLUMNS_OFFSET,
+               sizeof n_columns);
         row = disk_store_deserialize_row(
             record + DISK_STORE_ROW_HEADER_SIZE, body_len,
             table, uuid, n_columns);

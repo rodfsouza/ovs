@@ -87,9 +87,10 @@ void ovsdb_row_cache_for_each_unloaded(
     void *aux);
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_CACHED.
- * The row pointer passed to 'cb' is owned by the cache and remains
- * valid for the duration of the callback (and longer, as long as
- * eviction/removal does not occur).  Stops if 'cb' returns false. */
+ * Re-entrancy safe: callbacks may call insert/remove/evict without
+ * corrupting iteration.  The row pointer passed to 'cb' remains
+ * valid for the duration of the callback.  Stops if 'cb' returns
+ * false. */
 void ovsdb_row_cache_for_each_loaded(
     struct ovsdb_row_cache *,
     bool (*cb)(const struct ovsdb_row *row, void *aux),

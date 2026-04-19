@@ -52,12 +52,13 @@ struct ovsdb_row_cache_entry {
  * cache is allowed to exceed the limit temporarily.
  *
  * Re-entrancy safety:  The for_each_loaded() and for_each_unloaded()
- * functions iterate the hmap with HMAP_FOR_EACH.  If a callback
- * triggers insert or remove (e.g., via transaction commit or sync
- * load fallback), hmap_remove/hmap_insert during iteration corrupts
- * the iterator.  To prevent this, the cache tracks an 'iterating'
- * depth counter.  While iterating, evict_entry__() defers the
- * hmap_remove and free to a 'deferred_free' list.  The deferred
+ * functions iterate the hmap with HMAP_FOR_EACH_SAFE.  If a
+ * callback triggers insert or remove (e.g., via transaction commit
+ * or sync load fallback), evict_entry__() defers both hmap_remove
+ * and free to a 'deferred_free' list while the 'iterating' depth
+ * counter is positive.  Deferred entries are marked dead
+ * (state=ERROR, row=NULL) but kept in the hmap chain so the
+ * iterator's pre-fetched next pointer stays valid.  The deferred
  * entries are swept after the outermost iteration completes. */
 struct ovsdb_row_cache {
     struct hmap entries;          /* Contains ovsdb_row_cache_entry. */
@@ -456,6 +457,9 @@ ovsdb_row_cache_record_load_failure(struct ovsdb_row_cache *cache,
     if (!entry) {
         return OVSDB_ROW_UNLOADED;
     }
+    if (entry->state == OVSDB_ROW_ERROR) {
+        return OVSDB_ROW_ERROR;
+    }
 
     entry->load_failures++;
     if (entry->load_failures >= OVSDB_MAX_LOAD_RETRIES) {
@@ -466,7 +470,7 @@ ovsdb_row_cache_record_load_failure(struct ovsdb_row_cache *cache,
                      "after %d load attempts",
                      UUID_ARGS(uuid), entry->load_failures);
     } else {
-        /* Exponential backoff: 100ms, 500ms. */
+        /* Escalating backoff: 100ms, 500ms. */
         long long int backoff_ms = entry->load_failures == 1
                                    ? 100 : 500;
         entry->state = OVSDB_ROW_UNLOADED;
@@ -518,7 +522,8 @@ ovsdb_row_cache_for_each_unloaded(
 
     cache->iterating++;
     HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
-        if (entry->state == OVSDB_ROW_UNLOADED) {
+        if (entry->state == OVSDB_ROW_UNLOADED
+            && time_msec() >= entry->retry_after) {
             if (!cb(&entry->uuid, aux)) {
                 break;
             }

@@ -124,14 +124,12 @@ row_load_done(void *result, void *aux)
         req->db->run_triggers_now = true;
     } else {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
-        enum ovsdb_row_state new_state;
 
         VLOG_WARN_RL(&rl, "lazy-load: failed to load row "UUID_FMT,
                      UUID_ARGS(&req->uuid));
         /* Record failure; transitions to ERROR after max retries. */
-        new_state = ovsdb_row_cache_record_load_failure(
+        ovsdb_row_cache_record_load_failure(
             req->table->cache, &req->uuid);
-        (void) new_state;
 
         /* Always wake triggers — either for retry (UNLOADED) or
          * so the parked trigger sees the row as absent (ERROR)
