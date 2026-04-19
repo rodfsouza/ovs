@@ -5,6 +5,8 @@ ovsdb_libovsdb_la_LDFLAGS = \
         -Wl,--version-script=$(top_builddir)/ovsdb/libovsdb.sym \
         $(AM_LDFLAGS)
 ovsdb_libovsdb_la_SOURCES = \
+	ovsdb/bloom-filter.c \
+	ovsdb/bloom-filter.h \
 	ovsdb/column.c \
 	ovsdb/column.h \
 	ovsdb/condition.c \

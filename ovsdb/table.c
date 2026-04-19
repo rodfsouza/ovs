@@ -25,6 +25,7 @@
 #include "ovsdb-parser.h"
 #include "ovsdb-types.h"
 #include "row.h"
+#include "bloom-filter.h"
 #include "row-cache.h"
 #include "disk-store.h"
 #include "lazy-load.h"
@@ -311,6 +312,7 @@ ovsdb_table_create(struct ovsdb_table_schema *ts)
     table->log = false;
     table->cache = NULL;
     table->disk_store = NULL;
+    table->bloom = NULL;
     table->db = NULL;
 
     return table;
@@ -348,6 +350,7 @@ ovsdb_table_destroy(struct ovsdb_table *table)
         if (table->cache) {
             ovsdb_row_cache_destroy(table->cache);
         }
+        ovsdb_bloom_filter_destroy(table->bloom);
         /* disk_store is a shared pointer owned by ovsdb_storage.
          * Do NOT close it here — it is closed via
          * ovsdb_storage_close(). */
@@ -399,6 +402,13 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
             return NULL;
 
         case OVSDB_ROW_UNLOADED:
+            /* Fast negative check: if the bloom filter says the
+             * UUID is definitely not on disk, skip disk I/O. */
+            if (table->bloom
+                && !ovsdb_bloom_filter_may_contain(table->bloom,
+                                                   uuid)) {
+                return NULL;
+            }
             /* If in backoff period after a failed retry, don't
              * re-submit yet — return NULL so the trigger parks
              * and retries on the next poll cycle. */

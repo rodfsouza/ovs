@@ -23,6 +23,7 @@
 
 struct json;
 struct uuid;
+struct ovsdb_bloom_filter;
 struct ovsdb_txn;
 
 /* Schema for a database table. */
@@ -72,6 +73,9 @@ struct ovsdb_table {
     /* Disk-backed storage (Phase 1).  NULL if disabled. */
     struct ovsdb_row_cache *cache;
     struct ovsdb_disk_store *disk_store;
+    struct ovsdb_bloom_filter *bloom;  /* UUID existence filter.
+                                        * NOT counted against cache
+                                        * atom budget. */
 
     /* Back-pointer to owning database (for lazy-load). */
     struct ovsdb *db;

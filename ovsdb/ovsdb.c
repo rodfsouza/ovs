@@ -21,6 +21,7 @@
 #include <malloc.h>
 #endif
 
+#include "bloom-filter.h"
 #include "column.h"
 #include "file.h"
 #include "lazy-load.h"
@@ -754,6 +755,13 @@ add_unloaded_cb(const struct uuid *uuid, void *aux)
     ovsdb_row_cache_add_unloaded(cache, uuid);
 }
 
+static void
+add_bloom_cb(const struct uuid *uuid, void *aux)
+{
+    struct ovsdb_bloom_filter *bloom = aux;
+    ovsdb_bloom_filter_add(bloom, uuid);
+}
+
 /* Attaches the binary disk store from storage to each table,
  * creating a row cache per table and populating it with UNLOADED
  * entries from the on-disk index.  After this call, rows are
@@ -786,6 +794,13 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
             ds, node->name, add_unloaded_cb, table->cache);
 
         size_t indexed = ovsdb_row_cache_count(table->cache);
+
+        /* Build a bloom filter from all indexed UUIDs.
+         * This enables fast negative lookups without touching
+         * the cache or disk.  Memory is outside the atom budget. */
+        table->bloom = ovsdb_bloom_filter_create(indexed);
+        ovsdb_disk_store_for_each_uuid(
+            ds, node->name, add_bloom_cb, table->bloom);
 
         /* Warm the cache up to the per-table atom budget on a
          * background worker pool so tools querying the table

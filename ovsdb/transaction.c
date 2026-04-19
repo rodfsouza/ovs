@@ -18,6 +18,7 @@
 #include "transaction.h"
 
 #include "bitmap.h"
+#include "bloom-filter.h"
 #include "openvswitch/dynamic-string.h"
 #include "file.h"
 #include "hash.h"
@@ -562,6 +563,13 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
         if (txn_row->new) {
             ds_err = ovsdb_disk_store_write_row(
                 txn_row->table->disk_store, txn_row->new);
+            /* Update bloom filter so future lookups for this
+             * UUID don't get a false negative. */
+            if (!ds_err && txn_row->table->bloom) {
+                ovsdb_bloom_filter_add(
+                    txn_row->table->bloom,
+                    ovsdb_row_get_uuid(txn_row->new));
+            }
         } else if (txn_row->old) {
             ds_err = ovsdb_disk_store_delete_row(
                 txn_row->table->disk_store,
