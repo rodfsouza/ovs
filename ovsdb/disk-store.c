@@ -1036,7 +1036,9 @@ disk_store_deserialize_row(const uint8_t *data, size_t len,
         if (col_name_len >= DISK_STORE_MAX_TABLE_NAME
             || !disk_store_reader_remaining(&r, col_name_len)) {
             VLOG_WARN_RL(&rl, "bad column name length %"PRIu16
-                         " for row "UUID_FMT,
+                         " for row "UUID_FMT
+                         " (database may need reconversion"
+                         " with ovsdb-tool convert-format)",
                          col_name_len, UUID_ARGS(uuid));
             goto error;
         }

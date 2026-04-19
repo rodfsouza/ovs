@@ -399,6 +399,13 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
             return NULL;
 
         case OVSDB_ROW_UNLOADED:
+            /* If in backoff period after a failed retry, don't
+             * re-submit yet — return NULL so the trigger parks
+             * and retries on the next poll cycle. */
+            if (!ovsdb_row_cache_is_retry_ready(table->cache,
+                                                uuid)) {
+                return NULL;
+            }
             /* Submit async load if worker pool available.
              * ovsdb_lazy_load_request() transitions state to
              * LOADING internally on success. */

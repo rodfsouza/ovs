@@ -131,10 +131,13 @@ row_load_done(void *result, void *aux)
         /* Record failure; transitions to ERROR after max retries. */
         new_state = ovsdb_row_cache_record_load_failure(
             req->table->cache, &req->uuid);
-        if (new_state == OVSDB_ROW_UNLOADED) {
-            /* Still retryable — wake triggers for next cycle. */
-            req->db->run_triggers = true;
-        }
+        (void) new_state;
+
+        /* Always wake triggers — either for retry (UNLOADED) or
+         * so the parked trigger sees the row as absent (ERROR)
+         * and can complete its response to the client. */
+        req->db->run_triggers = true;
+        req->db->run_triggers_now = true;
     }
 
     free(req);

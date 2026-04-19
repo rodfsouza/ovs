@@ -71,6 +71,10 @@ void ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *,
 enum ovsdb_row_state ovsdb_row_cache_record_load_failure(
     struct ovsdb_row_cache *, const struct uuid *);
 
+/* Returns true if 'uuid' is UNLOADED and backoff has elapsed. */
+bool ovsdb_row_cache_is_retry_ready(struct ovsdb_row_cache *,
+                                    const struct uuid *);
+
 /* Returns true if the cache has any entries in UNLOADED or LOADING state. */
 bool ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *);
 

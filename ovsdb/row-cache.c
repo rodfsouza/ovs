@@ -23,6 +23,7 @@
 #include "openvswitch/list.h"
 #include "openvswitch/vlog.h"
 #include "row.h"
+#include "timeval.h"
 #include "uuid.h"
 #include "util.h"
 
@@ -39,6 +40,8 @@ struct ovsdb_row_cache_entry {
     bool pinned;                  /* If true, entry cannot be evicted. */
     enum ovsdb_row_state state;   /* Loading state (Phase 2). */
     uint8_t load_failures;        /* Consecutive load failure count. */
+    long long int retry_after;    /* time_msec() before which no retry
+                                   * should be attempted (backoff). */
 };
 
 /* An LRU cache of ovsdb_row objects, bounded by a maximum atom count.
@@ -291,6 +294,7 @@ ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
     entry->pinned = false;
     entry->state = OVSDB_ROW_CACHED;
     entry->load_failures = 0;
+    entry->retry_after = 0;
 
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
@@ -457,13 +461,33 @@ ovsdb_row_cache_record_load_failure(struct ovsdb_row_cache *cache,
     if (entry->load_failures >= OVSDB_MAX_LOAD_RETRIES) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
         entry->state = OVSDB_ROW_ERROR;
+        entry->retry_after = LLONG_MAX; /* Never retry. */
         VLOG_WARN_RL(&rl, "row "UUID_FMT" permanently failed "
                      "after %d load attempts",
                      UUID_ARGS(uuid), entry->load_failures);
     } else {
+        /* Exponential backoff: 100ms, 500ms. */
+        long long int backoff_ms = entry->load_failures == 1
+                                   ? 100 : 500;
         entry->state = OVSDB_ROW_UNLOADED;
+        entry->retry_after = time_msec() + backoff_ms;
     }
     return entry->state;
+}
+
+/* Returns true if 'uuid' is in UNLOADED state and the backoff
+ * period has elapsed (ready for another load attempt). */
+bool
+ovsdb_row_cache_is_retry_ready(struct ovsdb_row_cache *cache,
+                               const struct uuid *uuid)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    entry = ovsdb_row_cache_find__(cache, uuid);
+    if (!entry || entry->state != OVSDB_ROW_UNLOADED) {
+        return false;
+    }
+    return time_msec() >= entry->retry_after;
 }
 
 /* Returns true if the cache has any entries in UNLOADED or LOADING state. */
@@ -555,6 +579,7 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     entry->pinned = false;
     entry->state = OVSDB_ROW_UNLOADED;
     entry->load_failures = 0;
+    entry->retry_after = 0;
 
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
