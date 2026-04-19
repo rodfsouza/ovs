@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "ovstest.h"
+#include "ovs-thread.h"
 #include "util.h"
 #include "openvswitch/uuid.h"
 #include "uuid.h"
@@ -219,6 +220,91 @@ test_rebuild(void)
     ovsdb_bloom_filter_destroy(bf);
 }
 
+/* Test A7: Concurrent add + may_contain from separate threads.
+ *
+ * One thread inserts UUIDs, another checks for them.  The bloom
+ * filter must never produce a false negative for a UUID that was
+ * already added before the check started (i.e., visibility of
+ * bits set by prior add() calls). */
+
+struct concurrent_ctx {
+    struct ovsdb_bloom_filter *bf;
+    struct uuid *uuids;  /* Pre-inserted UUIDs to check. */
+    int n_uuids;
+    int false_negatives;
+};
+
+static void *
+concurrent_reader(void *arg)
+{
+    struct concurrent_ctx *ctx = arg;
+    int i;
+
+    /* Check all pre-inserted UUIDs repeatedly.  They MUST be
+     * found (no false negatives).  Also check random UUIDs
+     * (false positives are OK). */
+    for (i = 0; i < ctx->n_uuids; i++) {
+        if (!ovsdb_bloom_filter_may_contain(ctx->bf,
+                                            &ctx->uuids[i])) {
+            ctx->false_negatives++;
+        }
+    }
+    return NULL;
+}
+
+static void *
+concurrent_writer(void *arg)
+{
+    struct concurrent_ctx *ctx = arg;
+    int i;
+
+    /* Insert new UUIDs concurrently with the reader. */
+    for (i = 0; i < 1000; i++) {
+        struct uuid u;
+        uuid_generate(&u);
+        ovsdb_bloom_filter_add(ctx->bf, &u);
+    }
+    return NULL;
+}
+
+static void
+test_concurrent_add_and_lookup(void)
+{
+    struct ovsdb_bloom_filter *bf;
+    struct concurrent_ctx ctx;
+    pthread_t reader_thread, writer_thread;
+    int n_pre = 500;
+    int i;
+
+    bf = ovsdb_bloom_filter_create(2000);
+
+    /* Pre-insert UUIDs that the reader will check. */
+    ctx.uuids = xmalloc(n_pre * sizeof *ctx.uuids);
+    for (i = 0; i < n_pre; i++) {
+        uuid_generate(&ctx.uuids[i]);
+        ovsdb_bloom_filter_add(bf, &ctx.uuids[i]);
+    }
+
+    ctx.bf = bf;
+    ctx.n_uuids = n_pre;
+    ctx.false_negatives = 0;
+
+    /* Launch reader and writer concurrently. */
+    reader_thread = ovs_thread_create(
+        "bf-reader", concurrent_reader, &ctx);
+    writer_thread = ovs_thread_create(
+        "bf-writer", concurrent_writer, &ctx);
+
+    xpthread_join(reader_thread, NULL);
+    xpthread_join(writer_thread, NULL);
+
+    /* Pre-inserted UUIDs must NEVER have false negatives. */
+    ovs_assert(ctx.false_negatives == 0);
+
+    free(ctx.uuids);
+    ovsdb_bloom_filter_destroy(bf);
+}
+
 static void
 test_bloom_filter_main(int argc OVS_UNUSED,
                        char *argv[] OVS_UNUSED)
@@ -240,6 +326,9 @@ test_bloom_filter_main(int argc OVS_UNUSED,
 
     printf("test-bloom-filter: rebuild\n");
     test_rebuild();
+
+    printf("test-bloom-filter: concurrent_add_and_lookup\n");
+    test_concurrent_add_and_lookup();
 
     printf("test-bloom-filter: ok\n");
 }

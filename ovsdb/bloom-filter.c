@@ -21,6 +21,7 @@
 
 #include "openvswitch/uuid.h"
 #include "hash.h"
+#include "ovs-atomic.h"
 #include "util.h"
 
 /* Bloom filter parameters.
@@ -40,9 +41,9 @@
 #define BLOOM_NUM_HASHES    7
 
 struct ovsdb_bloom_filter {
-    uint8_t *bits;       /* Bit array. */
-    size_t n_bits;       /* Total bits (always a multiple of 8). */
-    size_t n_keys;       /* Number of keys inserted. */
+    atomic_uint8_t *bits; /* Bit array (atomic for thread safety). */
+    size_t n_bits;        /* Total bits (always a multiple of 8). */
+    size_t n_keys;        /* Number of keys inserted. */
 };
 
 /* Returns the bit index for hash function 'i' given two base
@@ -103,7 +104,9 @@ ovsdb_bloom_filter_add(struct ovsdb_bloom_filter *bf,
 
     for (i = 0; i < BLOOM_NUM_HASHES; i++) {
         size_t bit = bloom_bit_index(h1, h2, i, bf->n_bits);
-        bf->bits[bit / 8] |= (uint8_t)(1u << (bit % 8));
+        uint8_t old;
+        atomic_or_relaxed(&bf->bits[bit / 8],
+                          (uint8_t)(1u << (bit % 8)), &old);
     }
 
     bf->n_keys++;
@@ -126,7 +129,9 @@ ovsdb_bloom_filter_may_contain(const struct ovsdb_bloom_filter *bf,
 
     for (i = 0; i < BLOOM_NUM_HASHES; i++) {
         size_t bit = bloom_bit_index(h1, h2, i, bf->n_bits);
-        if (!(bf->bits[bit / 8] & (1u << (bit % 8)))) {
+        uint8_t byte;
+        atomic_read_relaxed(&bf->bits[bit / 8], &byte);
+        if (!(byte & (1u << (bit % 8)))) {
             return false;  /* Definitely not in the set. */
         }
     }
@@ -138,7 +143,11 @@ void
 ovsdb_bloom_filter_clear(struct ovsdb_bloom_filter *bf)
 {
     if (bf) {
-        memset(bf->bits, 0, bf->n_bits / 8);
+        size_t i;
+        size_t n_bytes = bf->n_bits / 8;
+        for (i = 0; i < n_bytes; i++) {
+            atomic_store_relaxed(&bf->bits[i], 0);
+        }
         bf->n_keys = 0;
     }
 }

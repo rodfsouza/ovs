@@ -33,8 +33,10 @@ struct uuid;
  * Memory usage: approximately n_expected * 10 / 8 bytes.
  * For 100K keys = ~122 KB.  For 1M keys = ~1.2 MB.
  *
- * Thread safety: concurrent reads are safe.  Writes (add)
- * are NOT thread-safe and must be externally synchronized. */
+ * Thread safety: uses atomic bit operations internally.
+ * Concurrent add() and may_contain() from different threads
+ * are safe — may_contain() never produces false negatives
+ * even during a concurrent add(). */
 
 struct ovsdb_bloom_filter;
 
