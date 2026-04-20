@@ -94,10 +94,6 @@ bool ovsdb_monitor_needs_flush(struct ovsdb_monitor *,
 void ovsdb_monitor_get_initial(struct ovsdb_monitor *,
                                struct ovsdb_monitor_change_set **);
 
-/* Disk-store lazy-load helpers. */
-bool ovsdb_monitor_needs_bulk_load(const struct ovsdb_monitor *);
-size_t ovsdb_monitor_submit_bulk_load(struct ovsdb_monitor *);
-bool ovsdb_monitor_all_rows_loaded(const struct ovsdb_monitor *);
 void ovsdb_monitor_get_changes_after(const struct uuid *txn_uuid,
         struct ovsdb_monitor *, struct ovsdb_monitor_change_set **);
 

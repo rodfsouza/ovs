@@ -33,7 +33,6 @@
 #include "simap.h"
 #include "hash.h"
 #include "table.h"
-#include "lazy-load.h"
 #include "row-cache.h"
 #include "timeval.h"
 #include "transaction.h"
@@ -1248,16 +1247,9 @@ ovsdb_monitor_compose_cond_change_update(
             continue;
         }
 
-        /* Submit a bulk load so follow-up cond-change updates see a
-         * warm cache.  This call is now best-effort: the iterator
-         * below already sync-reads uncached rows from disk, so the
-         * current update is complete regardless of async progress. */
-        if (mt->table->disk_store && mt->table->cache && dbmon->db
-            && ovsdb_row_cache_has_unloaded(mt->table->cache)) {
-            ovsdb_lazy_load_bulk_request(
-                dbmon->db,
-                CONST_CAST(struct ovsdb_table *, mt->table));
-        }
+        /* No bulk load.  The filtered disk iterator below reads
+         * rows synchronously without cache pollution.  The cache
+         * warms naturally via point queries. */
 
         /* Iterate over every row — disk-stored or cached.  The
          * callback 'cond_change_row_cb' builds JSON inline via
@@ -1632,62 +1624,6 @@ ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
     *p_mcs = dbmon->init_change_set;
 }
 
-/* Returns true if any monitored table has a disk_store attached,
- * meaning rows are lazily loaded and a bulk load is needed before
- * composing the initial snapshot. */
-bool
-ovsdb_monitor_needs_bulk_load(const struct ovsdb_monitor *dbmon)
-{
-    struct shash_node *node;
-
-    SHASH_FOR_EACH (node, &dbmon->tables) {
-        struct ovsdb_monitor_table *mt = node->data;
-        if (mt->table->disk_store && mt->table->cache) {
-            if (ovsdb_row_cache_has_unloaded(mt->table->cache)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/* Submits async bulk load requests for all UNLOADED rows in every
- * monitored table that has a disk_store.  Returns the total number
- * of load jobs submitted. */
-size_t
-ovsdb_monitor_submit_bulk_load(struct ovsdb_monitor *dbmon)
-{
-    size_t total = 0;
-    struct shash_node *node;
-
-    SHASH_FOR_EACH (node, &dbmon->tables) {
-        struct ovsdb_monitor_table *mt = node->data;
-        if (mt->table->disk_store && mt->table->cache) {
-            total += ovsdb_lazy_load_bulk_request(
-                dbmon->db,
-                CONST_CAST(struct ovsdb_table *, mt->table));
-        }
-    }
-    return total;
-}
-
-/* Returns true if all rows in every monitored table with a
- * disk_store are loaded (no UNLOADED or LOADING entries remain). */
-bool
-ovsdb_monitor_all_rows_loaded(const struct ovsdb_monitor *dbmon)
-{
-    struct shash_node *node;
-
-    SHASH_FOR_EACH (node, &dbmon->tables) {
-        struct ovsdb_monitor_table *mt = node->data;
-        if (mt->table->disk_store && mt->table->cache) {
-            if (ovsdb_row_cache_has_unloaded(mt->table->cache)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
 
 static bool
 ovsdb_monitor_history_change_cb(const struct ovsdb_row *old,
