@@ -1271,8 +1271,7 @@ ovsdb_monitor_compose_cond_change_update(
             .json = &json,
             .table_json = &table_json,
         };
-        ovsdb_table_for_each_row_from_disk_filtered(
-            mt->table, NULL, false, cond_change_row_cb, &aux);
+        ovsdb_table_for_each_row_from_disk(mt->table, cond_change_row_cb, &aux);
 
         ovsdb_monitor_table_condition_updated(mt, condition);
     }
@@ -1612,17 +1611,9 @@ ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
                     .mt = mcst->mt,
                     .mcst = mcst,
                 };
-                /* Predicate pushdown: don't cache rows during
-                 * monitor initial snapshot.  The callback clones
-                 * what it needs; caching ALL rows pollutes the
-                 * LRU and evicts rows needed by point queries. */
-                ovsdb_table_for_each_row_from_disk_filtered(
-                    mcst->mt->table,
-                    NULL,   /* No condition — monitors see all rows;
-                             * per-session filtering is done later in
-                             * ovsdb_monitor_compose_row_update2(). */
-                    false,  /* Don't cache — avoid pollution. */
-                    monitor_initial_row_cb, &aux);
+                ovsdb_table_for_each_row_from_disk(mcst->mt->table,
+                                                   monitor_initial_row_cb,
+                                                   &aux);
             }
         }
     } else {

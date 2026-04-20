@@ -143,18 +143,6 @@ void ovsdb_table_for_each_loaded_row(const struct ovsdb_table *,
 void ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *,
                                         ovsdb_table_row_cb cb, void *aux);
 
-/* Filtered variant with predicate pushdown.  If 'cond' is non-NULL,
- * only rows matching the condition are yielded (and optionally cached).
- * 'cache_matches': if true, matching UNLOADED rows are inserted into
- * the table's cache; if false, rows are yielded transiently and
- * destroyed after the callback (avoids cache pollution). */
-struct ovsdb_condition;
-void ovsdb_table_for_each_row_from_disk_filtered(
-    const struct ovsdb_table *,
-    const struct ovsdb_condition *cond,
-    bool cache_matches,
-    ovsdb_table_row_cb cb, void *aux);
-
 /* Below functions adds row modification for ovsdb table to the transaction. */
 struct ovsdb_error *ovsdb_table_execute_insert(struct ovsdb_txn *txn,
                                                const struct uuid *row_uuid,

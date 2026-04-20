@@ -19,8 +19,10 @@
 
 #include "column.h"
 #include "condition.h"
+#include "disk-store.h"
 #include "ovsdb.h"
 #include "row.h"
+#include "row-cache.h"
 #include "table.h"
 
 void
@@ -39,15 +41,79 @@ ovsdb_query(struct ovsdb_table *table, const struct ovsdb_condition *cnd,
             ovsdb_condition_match_every_clause(row, cnd)) {
             output_row(row, aux);
         }
-    } else if (table->disk_store) {
-        /* Predicate pushdown: use the filtered disk iterator.
-         * Condition is evaluated at the storage layer — only
-         * matching rows are yielded and cached.  Non-matching
-         * rows are deserialized and immediately destroyed. */
-        ovsdb_table_for_each_row_from_disk_filtered(
-            table, cnd, true, output_row, aux);
+    } else if (table->disk_store && table->cache) {
+        /* Condition-aware disk scan: read rows one at a time
+         * from disk, check condition, cache only matches.
+         * This avoids cache pollution — non-matching rows are
+         * deserialized and immediately discarded without ever
+         * entering the cache or evicting useful entries.
+         *
+         * First, yield matches from table->rows (in-memory
+         * modifications take precedence over disk).  Then scan
+         * disk rows via cursor, skipping UUIDs already in
+         * table->rows. */
+        const struct ovsdb_row *mem_row;
+        struct ovsdb_disk_store_cursor *cursor;
+        struct ovsdb_row *disk_row;
+        bool stop = false;
+
+        HMAP_FOR_EACH (mem_row, hmap_node, &table->rows) {
+            if (ovsdb_condition_match_every_clause(mem_row, cnd)
+                && !output_row(mem_row, aux)) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop) {
+            goto query_done;
+        }
+
+        /* Scan disk rows with condition filtering. */
+        cursor = ovsdb_disk_store_cursor_open(
+            table->disk_store, table->schema->name);
+        if (!cursor) {
+            goto query_done;
+        }
+
+        while ((disk_row = ovsdb_disk_store_cursor_next(
+                    cursor,
+                    CONST_CAST(struct ovsdb_table *, table)))) {
+            const struct uuid *uuid = ovsdb_row_get_uuid(disk_row);
+            const struct ovsdb_row *dup;
+
+            /* Skip if this UUID is in table->rows (already
+             * yielded above, in-memory version takes precedence). */
+            HMAP_FOR_EACH_WITH_HASH (dup, hmap_node,
+                                     uuid_hash(uuid),
+                                     &table->rows) {
+                if (uuid_equals(ovsdb_row_get_uuid(dup), uuid)) {
+                    goto skip_disk_row;
+                }
+            }
+
+            if (ovsdb_condition_match_every_clause(disk_row, cnd)) {
+                /* Match: yield to callback first, then cache.
+                 * Yielding before cache transfer avoids the
+                 * case where insert + eviction drops the row. */
+                bool cont = output_row(disk_row, aux);
+                size_t atoms = ovsdb_row_count_atoms(disk_row);
+                ovsdb_row_cache_insert(table->cache,
+                                       disk_row, atoms);
+                if (!cont) {
+                    ovsdb_disk_store_cursor_close(cursor);
+                    goto query_done;
+                }
+                continue;
+            }
+
+        skip_disk_row:
+            ovsdb_row_destroy(disk_row);
+        }
+        ovsdb_disk_store_cursor_close(cursor);
+    query_done:
+        ;
     } else {
-        /* Linear scan (in-memory tables without disk store). */
+        /* Linear scan. */
         const struct ovsdb_row *row;
 
         HMAP_FOR_EACH_SAFE (row, hmap_node, &table->rows) {
