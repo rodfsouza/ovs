@@ -114,6 +114,8 @@ static void ovsdb_jsonrpc_monitor_preremove_db(struct ovsdb_jsonrpc_session *,
                                                struct ovsdb *);
 static void ovsdb_jsonrpc_monitor_remove_all(struct ovsdb_jsonrpc_session *);
 static void ovsdb_jsonrpc_monitor_flush_all(struct ovsdb_jsonrpc_session *);
+static void ovsdb_jsonrpc_monitor_complete_deferred(
+    struct ovsdb_jsonrpc_session *);
 static bool ovsdb_jsonrpc_monitor_needs_flush(struct ovsdb_jsonrpc_session *);
 static struct json *ovsdb_jsonrpc_monitor_compose_update(
     struct ovsdb_jsonrpc_monitor *monitor, bool initial);
@@ -582,6 +584,7 @@ struct ovsdb_jsonrpc_session {
 
     /* Monitors. */
     struct hmap monitors;       /* Hmap of "struct ovsdb_jsonrpc_monitor"s. */
+    struct ovs_list deferred_monitors; /* Monitors awaiting initial data. */
 
     /* Network connectivity. */
     struct jsonrpc_session *js;  /* JSON-RPC session. */
@@ -614,6 +617,7 @@ ovsdb_jsonrpc_session_create(struct ovsdb_jsonrpc_remote *remote,
     ovs_list_push_back(&remote->sessions, &s->node);
     hmap_init(&s->triggers);
     hmap_init(&s->monitors);
+    ovs_list_init(&s->deferred_monitors);
     s->js = js;
     s->js_seqno = jsonrpc_session_get_seqno(js);
     s->read_only = read_only;
@@ -666,6 +670,7 @@ ovsdb_jsonrpc_session_run(struct ovsdb_jsonrpc_session *s)
     }
 
     ovsdb_jsonrpc_trigger_complete_done(s);
+    ovsdb_jsonrpc_monitor_complete_deferred(s);
 
     if (!jsonrpc_session_get_backlog(s->js)) {
         struct jsonrpc_msg *msg;
@@ -1361,6 +1366,10 @@ struct ovsdb_jsonrpc_monitor {
     enum ovsdb_monitor_version version;
     struct ovsdb_monitor_session_condition *condition;/* Session's condition */
 
+    /* Deferred initial snapshot for disk-store lazy loading. */
+    struct json *deferred_request_id;  /* Non-NULL while loading. */
+    bool initial_loading;              /* True if bulk load in progress. */
+    struct ovs_list deferred_node;     /* In session's deferred_monitors. */
 };
 
 static struct ovsdb_jsonrpc_monitor *
@@ -1609,13 +1618,29 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
         }
     }
     if (!m->change_set) {
-        /* Generate initial snapshot synchronously via the
-         * filtered disk iterator (cache_matches=false).  No
-         * async bulk-load — loading entire tables (1M+ rows)
-         * into cache pollutes the LRU and evicts rows needed
-         * by point queries.  The iterator reads from disk
-         * without caching; the callback clones what it needs
-         * into the change set. */
+        /* If any monitored table has UNLOADED/LOADING rows in its
+         * cache, prefer the async deferred path when a worker pool
+         * is available — this keeps the main thread responsive on
+         * large databases.  submit_bulk_load() is idempotent: it
+         * returns 0 for entries already in LOADING (e.g. a second
+         * monitor subscribing during in-flight warm-up), which is
+         * fine because monitor_complete_deferred() waits on
+         * all_rows_loaded() (which counts LOADING as not-loaded).
+         *
+         * If the worker pool is unavailable we fall through to the
+         * inline path; ovsdb_monitor_get_initial() now iterates via
+         * ovsdb_table_for_each_row_from_disk(), which
+         * sync-reads from disk, so the initial snapshot is still
+         * complete. */
+        if (ovsdb_monitor_needs_bulk_load(m->dbmon)
+            && ovsdb_lazy_load_pool_available()) {
+            ovsdb_monitor_submit_bulk_load(m->dbmon);
+            m->deferred_request_id = json_clone(request_id);
+            m->initial_loading = true;
+            ovs_list_push_back(&s->deferred_monitors, &m->deferred_node);
+            return NULL;  /* Reply deferred — sent by
+                           * monitor_complete_deferred(). */
+        }
         ovsdb_monitor_get_initial(m->dbmon, &m->change_set);
         initial = true;
     }
@@ -1854,6 +1879,9 @@ ovsdb_jsonrpc_monitor_needs_flush(struct ovsdb_jsonrpc_session *s)
     struct ovsdb_jsonrpc_monitor *m;
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
+        if (m->initial_loading) {
+            continue;
+        }
         if (ovsdb_monitor_needs_flush(m->dbmon, m->change_set)) {
             return true;
         }
@@ -1877,6 +1905,10 @@ ovsdb_jsonrpc_monitor_destroy(struct ovsdb_jsonrpc_monitor *m,
     }
 
     json_destroy(m->monitor_id);
+    if (m->initial_loading) {
+        ovs_list_remove(&m->deferred_node);
+    }
+    json_destroy(m->deferred_request_id);
     hmap_remove(&m->session->monitors, &m->node);
     ovsdb_monitor_remove_jsonrpc_monitor(m->dbmon, m, m->change_set);
     ovsdb_monitor_session_condition_destroy(m->condition);
@@ -1913,12 +1945,66 @@ ovsdb_jsonrpc_server_get_uuid(const struct ovsdb_jsonrpc_server *s)
     return &s->up.uuid;
 }
 
+/* Checks deferred monitors whose initial data was being loaded
+ * asynchronously via the worker pool.  When all rows for a monitor's
+ * tables are loaded, compose the initial snapshot and send the
+ * deferred reply.  Called from the session run loop. */
+static void
+ovsdb_jsonrpc_monitor_complete_deferred(struct ovsdb_jsonrpc_session *s)
+{
+    struct ovsdb_jsonrpc_monitor *m;
+
+    LIST_FOR_EACH_SAFE (m, deferred_node, &s->deferred_monitors) {
+        if (!m->initial_loading) {
+            continue;
+        }
+
+        if (!ovsdb_monitor_all_rows_loaded(m->dbmon)) {
+            continue;
+        }
+
+        /* All rows loaded — compose and send the initial snapshot.
+         * The deferred path is only entered when 'change_set' was
+         * NULL in monitor_create (i.e., a fresh subscription, not a
+         * monitor_cond_since resume), so this is always an "initial"
+         * snapshot. */
+        ovs_assert(!m->change_set);
+        ovsdb_monitor_get_initial(m->dbmon, &m->change_set);
+        struct json *json = ovsdb_jsonrpc_monitor_compose_update(m, true);
+        json = json ? json : json_object_create();
+
+        if (m->version == OVSDB_MONITOR_V3) {
+            struct json *json_last_id = json_string_create_nocopy(
+                    xasprintf(UUID_FMT,
+                              UUID_ARGS(ovsdb_monitor_get_last_txnid(
+                                      m->dbmon))));
+            /* "found" is false because this is an initial snapshot
+             * (not a resume from a previous txn-id); mirrors the
+             * !initial value used in the inline path. */
+            struct json *json_found = json_boolean_create(false);
+            json = json_array_create_3(json_found, json_last_id, json);
+        }
+
+        struct jsonrpc_msg *reply = jsonrpc_create_reply(
+            json, m->deferred_request_id);
+        ovsdb_jsonrpc_session_send(s, reply);
+
+        json_destroy(m->deferred_request_id);
+        m->deferred_request_id = NULL;
+        m->initial_loading = false;
+        ovs_list_remove(&m->deferred_node);
+    }
+}
+
 static void
 ovsdb_jsonrpc_monitor_flush_all(struct ovsdb_jsonrpc_session *s)
 {
     struct ovsdb_jsonrpc_monitor *m;
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
+        if (m->initial_loading) {
+            continue;
+        }
 
         struct json *json;
 

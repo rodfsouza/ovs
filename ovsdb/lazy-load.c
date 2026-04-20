@@ -186,8 +186,127 @@ ovsdb_lazy_load_request(struct ovsdb *db,
     return true;
 }
 
+/* Callback context for bulk load. */
+struct bulk_load_aux {
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    size_t n_submitted;
+};
+
+static bool
+bulk_load_cb(const struct uuid *uuid, void *aux_)
+{
+    struct bulk_load_aux *aux = aux_;
+
+    /* ovsdb_lazy_load_request() transitions state to LOADING on
+     * success, so we don't need to do it here. */
+    if (ovsdb_lazy_load_request(aux->db, aux->table, uuid)) {
+        aux->n_submitted++;
+    }
+    return true;  /* Continue iterating. */
+}
+
+size_t
+ovsdb_lazy_load_bulk_request(struct ovsdb *db,
+                             struct ovsdb_table *table)
+{
+    if (!lazy_pool || !table->cache) {
+        return 0;
+    }
+
+    struct bulk_load_aux aux = {
+        .db = db,
+        .table = table,
+        .n_submitted = 0,
+    };
+    ovsdb_row_cache_for_each_unloaded(table->cache, bulk_load_cb, &aux);
+
+    if (aux.n_submitted) {
+        VLOG_DBG("lazy-load: submitted %"PRIuSIZE" bulk load jobs for "
+                 "table %s", aux.n_submitted, table->schema->name);
+    }
+    return aux.n_submitted;
+}
+
+/* Rough estimate of how many atoms a single row occupies.  Used by
+ * the bounded warm-up to decide when to stop submitting loads.  Set
+ * conservatively low so we tend to fill rather than under-fill; LRU
+ * eviction on actual insert handles the real cap. */
+#define OVSDB_WARMUP_AVG_ATOMS_PER_ROW 16
+
+/* Callback context for bounded bulk load. */
+struct bounded_bulk_load_aux {
+    struct ovsdb *db;
+    struct ovsdb_table *table;
+    size_t n_submitted;
+    size_t max_submissions;  /* Cap, computed from cache budget. */
+};
+
+static bool
+bounded_bulk_load_cb(const struct uuid *uuid, void *aux_)
+{
+    struct bounded_bulk_load_aux *aux = aux_;
+
+    if (aux->n_submitted >= aux->max_submissions) {
+        return false;  /* Cache would overflow; stop iterating. */
+    }
+    if (ovsdb_lazy_load_request(aux->db, aux->table, uuid)) {
+        aux->n_submitted++;
+    }
+    return true;
+}
+
+size_t
+ovsdb_lazy_load_bulk_request_until_full(struct ovsdb *db,
+                                        struct ovsdb_table *table)
+{
+    if (!lazy_pool || !table->cache) {
+        return 0;
+    }
+
+    size_t max_atoms = ovsdb_row_cache_max_atoms(table->cache);
+    size_t total_atoms = ovsdb_row_cache_n_atoms(table->cache);
+
+    if (total_atoms >= max_atoms) {
+        return 0;  /* Cache already at budget. */
+    }
+
+    size_t remaining_atoms = max_atoms - total_atoms;
+    size_t max_submissions = remaining_atoms / OVSDB_WARMUP_AVG_ATOMS_PER_ROW;
+
+    if (max_submissions == 0) {
+        /* Budget too tight even for a single estimated row; submit
+         * one job anyway so tiny caches aren't completely cold. */
+        max_submissions = 1;
+    }
+
+    struct bounded_bulk_load_aux aux = {
+        .db = db,
+        .table = table,
+        .n_submitted = 0,
+        .max_submissions = max_submissions,
+    };
+    ovsdb_row_cache_for_each_unloaded(table->cache, bounded_bulk_load_cb,
+                                      &aux);
+
+    if (aux.n_submitted) {
+        VLOG_DBG("lazy-load: warm-up submitted %"PRIuSIZE" bulk load jobs "
+                 "for table %s (cap=%"PRIuSIZE", budget=%"PRIuSIZE"/%"
+                 PRIuSIZE" atoms)",
+                 aux.n_submitted, table->schema->name, max_submissions,
+                 total_atoms, max_atoms);
+    }
+    return aux.n_submitted;
+}
+
 bool
 ovsdb_lazy_load_has_pending(void)
 {
     return lazy_pool && ovsdb_worker_pool_has_pending(lazy_pool);
+}
+
+bool
+ovsdb_lazy_load_pool_available(void)
+{
+    return lazy_pool != NULL;
 }
