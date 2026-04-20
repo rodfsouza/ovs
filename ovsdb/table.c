@@ -26,6 +26,7 @@
 #include "ovsdb-types.h"
 #include "row.h"
 #include "bloom-filter.h"
+#include "condition.h"
 #include "row-cache.h"
 #include "disk-store.h"
 #include "lazy-load.h"
@@ -585,25 +586,37 @@ table_rows_contains(const struct ovsdb_table *table,
     return false;
 }
 
-/* Iterates every row logically present in 'table'.  See the header
- * comment in table.h for the full lifetime contract.
+/* Iterates every row logically present in 'table' that matches
+ * the optional condition 'cond' (NULL means match all).
+ *
+ * If 'cache_matches' is true, matching UNLOADED rows are inserted
+ * into the cache after the callback returns.  If false, rows are
+ * yielded transiently and destroyed after the callback — this
+ * avoids cache pollution for full-table scans like monitor
+ * initial snapshots.
  *
  * Implementation: yield 'table->rows' first (stable pointers), then
  * open a disk-store cursor and walk every record whose UUID isn't
- * already in table->rows.  For CACHED entries we prefer the stable
- * cached pointer over the transient cursor row.  For UNLOADED entries
- * the cursor row is handed to the callback TRANSIENTLY, after which
- * we insert it into the cache so follow-up queries hit a warm path;
- * LRU eviction is expected and safe because the callback has already
- * returned (transient contract).  Insertion also transfers ownership
- * to the cache, so we must not destroy the row on that path. */
+ * already in table->rows.  Predicate pushdown: the condition is
+ * evaluated BEFORE the callback/cache — non-matching rows are
+ * deserialized and immediately destroyed, never entering the cache
+ * or triggering LRU eviction. */
 void
-ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *table,
-                                   ovsdb_table_row_cb cb, void *aux)
+ovsdb_table_for_each_row_from_disk_filtered(
+    const struct ovsdb_table *table,
+    const struct ovsdb_condition *cond,
+    bool cache_matches,
+    ovsdb_table_row_cb cb, void *aux)
 {
-    /* Step 1: yield rows from table->rows (stable, hmap-owned). */
     const struct ovsdb_row *row;
+    struct ovsdb_disk_store_cursor *cursor;
+    struct ovsdb_row *disk_row;
+
+    /* Step 1: yield rows from table->rows (stable, hmap-owned). */
     HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+        if (cond && !ovsdb_condition_match_every_clause(row, cond)) {
+            continue;
+        }
         if (!cb(row, aux)) {
             return;
         }
@@ -615,17 +628,15 @@ ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *table,
     }
 
     /* Step 3: walk the disk-store cursor for this table. */
-    struct ovsdb_disk_store_cursor *cursor;
     cursor = ovsdb_disk_store_cursor_open(table->disk_store,
                                           table->schema->name);
     if (!cursor) {
-        VLOG_WARN("ovsdb_table_for_each_row_from_disk: failed to open "
-                  "disk store cursor for table %s",
+        VLOG_WARN("for_each_row_from_disk_filtered: failed to "
+                  "open disk store cursor for table %s",
                   table->schema->name);
         return;
     }
 
-    struct ovsdb_row *disk_row;
     while ((disk_row = ovsdb_disk_store_cursor_next(
                 cursor,
                 CONST_CAST(struct ovsdb_table *, table)))) {
@@ -637,48 +648,68 @@ ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *table,
             continue;
         }
 
-        /* Step 4b: if CACHED, yield the stable cached pointer and
-         * drop the transient disk copy. */
+        /* Step 4b: if CACHED, yield the stable cached pointer.
+         * Check condition before yielding. */
         if (table->cache) {
             const struct ovsdb_row *cached =
                 ovsdb_row_cache_lookup(table->cache, uuid);
             if (cached) {
-                bool cont = cb(cached, aux);
-                ovsdb_row_destroy(disk_row);
-                if (!cont) {
-                    ovsdb_disk_store_cursor_close(cursor);
-                    return;
+                if (!cond
+                    || ovsdb_condition_match_every_clause(
+                           cached, cond)) {
+                    bool cont = cb(cached, aux);
+                    ovsdb_row_destroy(disk_row);
+                    if (!cont) {
+                        ovsdb_disk_store_cursor_close(cursor);
+                        return;
+                    }
+                } else {
+                    ovsdb_row_destroy(disk_row);
                 }
                 continue;
             }
         }
 
-        /* Step 4c: UNLOADED (or no cache).  Yield the transient disk
-         * row to 'cb' first, then insert it into the cache so
-         * subsequent lookups are cheap.  Ownership transfers to the
-         * cache on insert; do not destroy afterwards. */
-        bool cont = cb(disk_row, aux);
-
-        if (table->cache) {
-            size_t n_atoms = ovsdb_row_count_atoms(disk_row);
-            ovsdb_row_cache_insert(table->cache, disk_row, n_atoms);
-            /* disk_row is now owned by the cache.  LRU eviction may
-             * destroy entries yielded EARLIER in this iteration, but
-             * the callback already consumed those (transient contract).
-             * disk_row itself is safe from self-eviction: insert places
-             * it at the MRU end of the LRU list, and evict__ sweeps
-             * from the LRU end, so the just-inserted entry is the
-             * last candidate. */
-        } else {
+        /* Step 4c: UNLOADED row from disk.
+         * Predicate pushdown: check condition BEFORE
+         * callback/cache to avoid pollution. */
+        if (cond
+            && !ovsdb_condition_match_every_clause(disk_row, cond)) {
             ovsdb_row_destroy(disk_row);
+            continue;
         }
 
-        if (!cont) {
-            break;
+        {
+            bool cont = cb(disk_row, aux);
+
+            if (cache_matches && table->cache) {
+                size_t n_atoms = ovsdb_row_count_atoms(disk_row);
+                ovsdb_row_cache_insert(table->cache, disk_row,
+                                       n_atoms);
+                /* disk_row now owned by cache at MRU end --
+                 * eviction sweeps from LRU, so self-eviction
+                 * cannot happen. */
+            } else {
+                ovsdb_row_destroy(disk_row);
+            }
+
+            if (!cont) {
+                break;
+            }
         }
     }
 
     ovsdb_disk_store_cursor_close(cursor);
+}
+
+/* Backward-compatible wrapper: iterates all rows, caching
+ * UNLOADED ones.  Equivalent to _filtered(table, NULL, true). */
+void
+ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *table,
+                                   ovsdb_table_row_cb cb, void *aux)
+{
+    ovsdb_table_for_each_row_from_disk_filtered(
+        table, NULL, true, cb, aux);
 }
 
 struct ovsdb_error *
