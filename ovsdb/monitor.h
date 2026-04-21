@@ -94,6 +94,14 @@ bool ovsdb_monitor_needs_flush(struct ovsdb_monitor *,
 void ovsdb_monitor_get_initial(struct ovsdb_monitor *,
                                struct ovsdb_monitor_change_set **);
 
+/* Like ovsdb_monitor_get_initial(), but uses 'condition' to filter the
+ * initial dump via ovsdb_table_query().  The resulting change set is
+ * per-session (not cached on the monitor). */
+void ovsdb_monitor_get_initial_conditioned(
+    struct ovsdb_monitor *,
+    struct ovsdb_monitor_session_condition *,
+    struct ovsdb_monitor_change_set **);
+
 /* Disk-store lazy-load helpers. */
 bool ovsdb_monitor_needs_bulk_load(const struct ovsdb_monitor *);
 size_t ovsdb_monitor_submit_bulk_load(struct ovsdb_monitor *);

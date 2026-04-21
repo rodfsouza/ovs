@@ -1277,6 +1277,65 @@ pre_cmd_find(struct ctl_context *ctx)
     }
 }
 
+/* Try to convert simple CLI condition "column=value" to a JSON where
+ * clause ["column","==","value"].  Returns the JSON clause on success,
+ * or NULL if the condition is too complex (map key, set operators,
+ * non-equality). */
+static struct json *
+ctl_condition_to_where_clause(const struct ovsdb_idl_table_class *table,
+                              const char *arg)
+{
+    static const char *operators[] = {
+#define RELOP(ENUM, STRING) STRING,
+        RELOPS
+#undef RELOP
+    };
+
+    const struct ovsdb_idl_column *column;
+    char *key_string = NULL;
+    char *value_string = NULL;
+    int operator;
+
+    char *error = parse_column_key_value(arg, table, &column, &key_string,
+                                         &operator, operators,
+                                         ARRAY_SIZE(operators),
+                                         &value_string);
+    if (error) {
+        free(error);
+        free(key_string);
+        free(value_string);
+        return NULL;
+    }
+
+    /* Only handle simple equality on scalar columns. */
+    if (key_string || !value_string || operator != RELOP_EQ) {
+        free(key_string);
+        free(value_string);
+        return NULL;
+    }
+
+    /* Convert the value to OVSDB JSON. */
+    struct ovsdb_datum datum;
+    struct ovsdb_type type = column->type;
+    type.n_max = UINT_MAX;
+    error = ovsdb_datum_from_string(&datum, &type, value_string, NULL);
+    free(value_string);
+    if (error) {
+        free(error);
+        return NULL;
+    }
+
+    struct json *value_json = ovsdb_datum_to_json(&datum, &column->type);
+    ovsdb_datum_destroy(&datum, &column->type);
+
+    struct json *clause = json_array_create_3(
+        json_string_create(column->name),
+        json_string_create("=="),
+        value_json);
+
+    return clause;
+}
+
 static void
 cmd_find(struct ctl_context *ctx)
 {
@@ -1296,6 +1355,72 @@ cmd_find(struct ctl_context *ctx)
     if (ctx->error) {
         return;
     }
+
+    /* Try server-side select for simple equality conditions. */
+    if (ctx->argc > 2) {
+        struct json *where = json_array_create_empty();
+        bool all_simple = true;
+
+        for (int i = 2; i < ctx->argc; i++) {
+            struct json *clause = ctl_condition_to_where_clause(table,
+                                                                ctx->argv[i]);
+            if (!clause) {
+                all_simple = false;
+                break;
+            }
+            json_array_add(where, clause);
+        }
+
+        if (all_simple) {
+            /* Always request all columns from the server — we only
+             * use the result UUIDs to look up IDL rows for formatting.
+             * Passing NULL lets the server return everything including
+             * _uuid, which we need for correlation. */
+
+            struct json *result = ovsdb_idl_select(ctx->idl, table->name,
+                                                   where, NULL);
+            if (result && result->type == JSON_ARRAY) {
+                out = ctx->table = list_make_table(columns, n_columns);
+                for (size_t i = 0; i < result->array.n; i++) {
+                    /* For each JSON row, find the corresponding IDL row
+                     * and format it.  The IDL should have all rows from
+                     * the monitor sync. */
+                    struct json *row_json = result->array.elems[i];
+                    if (row_json->type != JSON_OBJECT) {
+                        continue;
+                    }
+                    struct json *uuid_json =
+                        shash_find_data(json_object(row_json), "_uuid");
+                    if (uuid_json
+                        && uuid_json->type == JSON_ARRAY
+                        && uuid_json->array.n == 2
+                        && uuid_json->array.elems[1]->type == JSON_STRING) {
+                        struct uuid uuid;
+                        if (uuid_from_string(&uuid,
+                                             uuid_json->array.elems[1]
+                                                 ->string)) {
+                            const struct ovsdb_idl_row *r =
+                                ovsdb_idl_get_row_for_uuid(ctx->idl, table,
+                                                           &uuid);
+                            if (r) {
+                                list_record(r, columns, n_columns, out);
+                            }
+                        }
+                    }
+                }
+                json_destroy(result);
+                free(columns);
+                return;
+            }
+
+            json_destroy(result);
+            /* Fall through to client-side filtering. */
+        } else {
+            json_destroy(where);
+        }
+    }
+
+    /* Client-side filtering fallback. */
     out = ctx->table = list_make_table(columns, n_columns);
     for (row = ovsdb_idl_first_row(ctx->idl, table); row;
          row = ovsdb_idl_next_row(row)) {

@@ -44,6 +44,7 @@
 #include "skiplist.h"
 #include "simap.h"
 #include "sset.h"
+#include "timeval.h"
 #include "svec.h"
 #include "util.h"
 #include "uuid.h"
@@ -99,6 +100,10 @@ struct ovsdb_idl {
     struct ovs_list rows_to_reparse; /* Stores rows that might need to be
                                       * re-parsed due to insertion of a
                                       * referenced row. */
+
+    /* Server-side select (Phase 4). */
+    struct json *select_request_id;     /* Non-null while waiting for reply. */
+    struct jsonrpc_msg *select_reply;   /* Stolen from event in run(). */
 };
 
 static struct ovsdb_cs_ops ovsdb_idl_cs_ops;
@@ -360,6 +365,9 @@ ovsdb_idl_destroy(struct ovsdb_idl *idl)
             hmap_destroy(&table->rows);
             free(table->modes);
         }
+        json_destroy(idl->select_request_id);
+        jsonrpc_msg_destroy(idl->select_reply);
+
         shash_destroy(&idl->table_by_name);
         free(idl->tables);
         free(idl);
@@ -471,7 +479,17 @@ ovsdb_idl_run(struct ovsdb_idl *idl)
             break;
 
         case OVSDB_CS_EVENT_TYPE_TXN_REPLY:
-            ovsdb_idl_txn_process_reply(idl, event->txn_reply);
+            if (idl->select_request_id
+                && event->txn_reply->id
+                && json_equal(idl->select_request_id, event->txn_reply->id)) {
+                /* Steal the reply from the event so event_destroy
+                 * does not free it.  ovsdb_idl_select() will consume
+                 * it after the poll loop returns. */
+                idl->select_reply = event->txn_reply;
+                event->txn_reply = NULL;
+            } else {
+                ovsdb_idl_txn_process_reply(idl, event->txn_reply);
+            }
             break;
         }
         ovsdb_cs_event_destroy(event);
@@ -1042,6 +1060,98 @@ ovsdb_idl_clause_destroy(struct ovsdb_idl_clause *clause)
     }
 }
 
+/* Server-side select. */
+
+/* Sends a "transact" request containing a single "select" operation
+ * to the server and blocks until the reply arrives.
+ *
+ * 'where' and 'columns' are consumed (ownership transferred).
+ * 'where' is a JSON array of conditions (AND semantics).
+ * 'columns' is a JSON array of column name strings, or NULL for all.
+ *
+ * Returns the JSON "rows" array from the select result on success
+ * (caller must json_destroy it), or NULL on error. */
+struct json *
+ovsdb_idl_select(struct ovsdb_idl *idl,
+                 const char *table_name,
+                 struct json *where,
+                 struct json *columns)
+{
+    /* Cannot run a select while a transaction is in progress. */
+    if (idl->txn) {
+        json_destroy(where);
+        json_destroy(columns);
+        return NULL;
+    }
+
+    if (!ovsdb_cs_may_send_transaction(idl->cs)) {
+        json_destroy(where);
+        json_destroy(columns);
+        return NULL;
+    }
+
+    /* Build: ["db_name", {"op":"select","table":"...","where":...}] */
+    struct json *operations = json_array_create_1(
+        json_string_create(idl->class_->database));
+
+    struct json *select_op = json_object_create();
+    json_object_put_string(select_op, "op", "select");
+    json_object_put_string(select_op, "table", table_name);
+    json_object_put(select_op, "where", where);
+    if (columns) {
+        json_object_put(select_op, "columns", columns);
+    }
+    json_array_add(operations, select_op);
+
+    /* Send the transact request. */
+    idl->select_request_id = ovsdb_cs_send_transaction(idl->cs, operations);
+    if (!idl->select_request_id) {
+        return NULL;
+    }
+
+    /* Block until the reply arrives, with a 10-second timeout to
+     * avoid indefinite hangs in CLI tools. */
+    idl->select_reply = NULL;
+    long long int deadline = time_msec() + 10000;
+    while (!idl->select_reply) {
+        ovsdb_idl_run(idl);
+        ovsdb_idl_wait(idl);
+        poll_timer_wait_until(deadline);
+        poll_block();
+
+        if (!ovsdb_cs_is_alive(idl->cs) || time_msec() >= deadline) {
+            json_destroy(idl->select_request_id);
+            idl->select_request_id = NULL;
+            return NULL;
+        }
+    }
+
+    /* Extract the "rows" from the reply. */
+    struct json *result = NULL;
+    struct jsonrpc_msg *reply = idl->select_reply;
+
+    if (reply->type == JSONRPC_REPLY
+        && reply->result
+        && reply->result->type == JSON_ARRAY
+        && reply->result->array.n >= 1) {
+        struct json *op_result = reply->result->array.elems[0];
+        if (op_result->type == JSON_OBJECT) {
+            struct json *rows = shash_find_data(json_object(op_result),
+                                                "rows");
+            if (rows) {
+                result = json_clone(rows);
+            }
+        }
+    }
+
+    jsonrpc_msg_destroy(reply);
+    json_destroy(idl->select_request_id);
+    idl->select_request_id = NULL;
+    idl->select_reply = NULL;
+
+    return result;
+}
+
 /* ovsdb_idl_condition. */
 
 void

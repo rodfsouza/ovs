@@ -411,6 +411,23 @@ void ovsdb_idl_loop_destroy(struct ovsdb_idl_loop *);
 struct ovsdb_idl_txn *ovsdb_idl_loop_run(struct ovsdb_idl_loop *);
 int ovsdb_idl_loop_commit_and_wait(struct ovsdb_idl_loop *);
 
+/* Server-Side Select
+ * ===================
+ *
+ * Sends a one-shot "select" query to the server and blocks for the reply
+ * (up to 10 seconds).  Returns matching rows only, without downloading
+ * the full table.  The 'where' condition uses AND semantics (all clauses
+ * must match), per the OVSDB protocol specification.
+ *
+ * 'where' and 'columns' are consumed (ownership transferred).
+ * Returns the JSON "rows" array on success (caller must json_destroy),
+ * or NULL on error/timeout.
+ */
+struct json *ovsdb_idl_select(struct ovsdb_idl *,
+                              const char *table_name,
+                              struct json *where,
+                              struct json *columns);
+
 /* Conditional Replication
  * =======================
  *

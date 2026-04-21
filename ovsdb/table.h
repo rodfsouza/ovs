@@ -24,6 +24,7 @@
 struct json;
 struct uuid;
 struct ovsdb_bloom_filter;
+struct ovsdb_condition;
 struct ovsdb_txn;
 
 /* Schema for a database table. */
@@ -142,6 +143,24 @@ void ovsdb_table_for_each_loaded_row(const struct ovsdb_table *,
  * Main-thread only (synchronous disk I/O). */
 void ovsdb_table_for_each_row_from_disk(const struct ovsdb_table *,
                                         ovsdb_table_row_cb cb, void *aux);
+
+/* Iterates rows in 'table' matching 'condition', calling 'cb' for each.
+ *
+ * If 'condition' is NULL or trivially true, yields all rows (equivalent
+ * to ovsdb_table_for_each_row_from_disk).
+ *
+ * Two execution paths:
+ *  1. UUID exact-match: if 'condition' has a "_uuid == <uuid>" clause,
+ *     looks up directly via ovsdb_table_get_row() (bloom -> cache -> disk).
+ *  2. Unified iteration: yields table->rows (condition-filtered), then
+ *     if disk_store exists, walks cursor (condition-filtered, dedup vs
+ *     table->rows, selective cache insertion for matches only).
+ *
+ * Row-lifetime contract: same as ovsdb_table_for_each_row_from_disk —
+ * disk-origin row pointers passed to 'cb' are TRANSIENT. */
+void ovsdb_table_query(struct ovsdb_table *table,
+                       const struct ovsdb_condition *condition,
+                       ovsdb_table_row_cb cb, void *aux);
 
 /* Below functions adds row modification for ovsdb table to the transaction. */
 struct ovsdb_error *ovsdb_table_execute_insert(struct ovsdb_txn *txn,

@@ -1623,6 +1623,64 @@ ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
     *p_mcs = dbmon->init_change_set;
 }
 
+void
+ovsdb_monitor_get_initial_conditioned(
+    struct ovsdb_monitor *dbmon,
+    struct ovsdb_monitor_session_condition *condition,
+    struct ovsdb_monitor_change_set **p_mcs)
+{
+    if (!condition || !condition->conditional) {
+        /* No non-trivial conditions — use the shared path. */
+        ovsdb_monitor_get_initial(dbmon, p_mcs);
+        return;
+    }
+
+    /* Per-session change set: NOT cached on dbmon->init_change_set.
+     * Different sessions may have different conditions. */
+    struct ovsdb_monitor_change_set *change_set =
+        ovsdb_monitor_add_change_set(dbmon, true, NULL);
+
+    struct ovsdb_monitor_change_set_for_table *mcst;
+    LIST_FOR_EACH (mcst, list_in_change_set,
+                   &change_set->change_set_for_tables) {
+        if (!(mcst->mt->select & OJMS_INITIAL)) {
+            continue;
+        }
+
+        struct ovsdb_condition *old_cond, *new_cond, *diff_cond;
+        bool has_cond = ovsdb_monitor_get_table_conditions(
+            mcst->mt, condition, &old_cond, &new_cond, &diff_cond);
+
+        struct monitor_initial_aux aux = {
+            .mt = mcst->mt,
+            .mcst = mcst,
+        };
+
+        if (has_cond && !ovsdb_condition_is_true(new_cond)
+            && new_cond->n_clauses == 1
+            && new_cond->clauses[0].column->index == OVSDB_COL_UUID
+            && new_cond->clauses[0].function == OVSDB_F_EQ) {
+            /* UUID exact-match: O(1) via bloom -> cache -> disk.
+             * Single-clause conditions have identical AND/OR semantics,
+             * so ovsdb_table_query() (AND) is correct here. */
+            ovsdb_table_query(
+                CONST_CAST(struct ovsdb_table *, mcst->mt->table),
+                new_cond, monitor_initial_row_cb, &aux);
+        } else {
+            /* Multi-clause or non-UUID condition.  Monitor conditions
+             * use OR semantics (match_any_clause) while ovsdb_table_query
+             * uses AND (match_every_clause), so we cannot filter here.
+             * Yield all rows; condition filtering happens at JSON
+             * composition time via ovsdb_monitor_row_update_type_condition. */
+            ovsdb_table_for_each_row_from_disk(mcst->mt->table,
+                                               monitor_initial_row_cb,
+                                               &aux);
+        }
+    }
+
+    *p_mcs = change_set;
+}
+
 /* Returns true if any monitored table has a disk_store attached,
  * meaning rows are lazily loaded and a bulk load is needed before
  * composing the initial snapshot. */

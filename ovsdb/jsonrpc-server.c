@@ -1641,7 +1641,8 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
             return NULL;  /* Reply deferred — sent by
                            * monitor_complete_deferred(). */
         }
-        ovsdb_monitor_get_initial(m->dbmon, &m->change_set);
+        ovsdb_monitor_get_initial_conditioned(
+            m->dbmon, m->condition, &m->change_set);
         initial = true;
     }
     json = ovsdb_jsonrpc_monitor_compose_update(m, initial);
@@ -1969,7 +1970,8 @@ ovsdb_jsonrpc_monitor_complete_deferred(struct ovsdb_jsonrpc_session *s)
          * monitor_cond_since resume), so this is always an "initial"
          * snapshot. */
         ovs_assert(!m->change_set);
-        ovsdb_monitor_get_initial(m->dbmon, &m->change_set);
+        ovsdb_monitor_get_initial_conditioned(
+            m->dbmon, m->condition, &m->change_set);
         struct json *json = ovsdb_jsonrpc_monitor_compose_update(m, true);
         json = json ? json : json_object_create();
 
