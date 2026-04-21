@@ -94,6 +94,10 @@ bool ovsdb_monitor_needs_flush(struct ovsdb_monitor *,
 void ovsdb_monitor_get_initial(struct ovsdb_monitor *,
                                struct ovsdb_monitor_change_set **);
 
+/* Returns true if 'condition' has any non-trivial per-table conditions. */
+bool ovsdb_monitor_session_condition_is_conditional(
+    const struct ovsdb_monitor_session_condition *);
+
 /* Like ovsdb_monitor_get_initial(), but uses 'condition' to filter the
  * initial dump via ovsdb_table_query().  The resulting change set is
  * per-session (not cached on the monitor). */

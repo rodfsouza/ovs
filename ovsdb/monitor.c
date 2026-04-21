@@ -1623,6 +1623,13 @@ ovsdb_monitor_get_initial(struct ovsdb_monitor *dbmon,
     *p_mcs = dbmon->init_change_set;
 }
 
+bool
+ovsdb_monitor_session_condition_is_conditional(
+    const struct ovsdb_monitor_session_condition *condition)
+{
+    return condition && condition->conditional;
+}
+
 void
 ovsdb_monitor_get_initial_conditioned(
     struct ovsdb_monitor *dbmon,

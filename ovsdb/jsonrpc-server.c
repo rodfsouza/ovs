@@ -1633,7 +1633,9 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
          * sync-reads from disk, so the initial snapshot is still
          * complete. */
         if (ovsdb_monitor_needs_bulk_load(m->dbmon)
-            && ovsdb_lazy_load_pool_available()) {
+            && ovsdb_lazy_load_pool_available()
+            && !ovsdb_monitor_session_condition_is_conditional(
+                   m->condition)) {
             ovsdb_monitor_submit_bulk_load(m->dbmon);
             m->deferred_request_id = json_clone(request_id);
             m->initial_loading = true;
