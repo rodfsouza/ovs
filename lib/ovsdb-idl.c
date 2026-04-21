@@ -1308,6 +1308,14 @@ ovsdb_idl_set_condition(struct ovsdb_idl *idl,
     return seqno;
 }
 
+unsigned int
+ovsdb_idl_set_condition_json(struct ovsdb_idl *idl,
+                             const struct ovsdb_idl_table_class *tc,
+                             const struct json *condition_json)
+{
+    return ovsdb_cs_set_condition(idl->cs, tc->name, condition_json);
+}
+
 /* Turns off OVSDB_IDL_ALERT and OVSDB_IDL_TRACK for 'column' in 'idl'.
  *
  * This function should be called between ovsdb_idl_create() and the first call

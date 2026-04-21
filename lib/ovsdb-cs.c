@@ -1532,8 +1532,22 @@ ovsdb_cs_send_monitor_request(struct ovsdb_cs *cs, struct ovsdb_cs_db *db,
                 }
                 ovs_assert(mr0->type == JSON_OBJECT);
 
-                json_object_put(mr0, "where",
-                                json_clone(table->ack_cond));
+                /* Prefer a pre-set condition (set by the client
+                 * before the first ovsdb_cs_run, e.g. from CLI
+                 * prerequisites) over the default ack_cond.
+                 * This lets the server filter the initial dump. */
+                const struct json *cond = table->new_cond
+                                          ? table->new_cond
+                                          : table->ack_cond;
+                json_object_put(mr0, "where", json_clone(cond));
+
+                if (table->new_cond) {
+                    /* Initial request: no condition should be in-flight
+                     * yet, so req_cond must be NULL. */
+                    ovs_assert(!table->req_cond);
+                    table->req_cond = table->new_cond;
+                    table->new_cond = NULL;
+                }
             }
         }
     }

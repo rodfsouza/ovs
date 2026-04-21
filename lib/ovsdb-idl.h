@@ -462,6 +462,13 @@ unsigned int ovsdb_idl_set_condition(struct ovsdb_idl *,
                                      const struct ovsdb_idl_table_class *,
                                      const struct ovsdb_idl_condition *);
 
+/* Like ovsdb_idl_set_condition(), but takes raw JSON condition array.
+ * Useful for conditions on _uuid which is not in the IDL column array.
+ * 'condition_json' is cloned (caller retains ownership). */
+unsigned int ovsdb_idl_set_condition_json(struct ovsdb_idl *,
+                                          const struct ovsdb_idl_table_class *,
+                                          const struct json *condition_json);
+
 unsigned int ovsdb_idl_get_condition_seqno(const struct ovsdb_idl *);
 
 /* Indexes over one or more columns in the IDL, to retrieve rows matching

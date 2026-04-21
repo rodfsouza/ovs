@@ -62,6 +62,9 @@ static const struct cmd_show_table *cmd_show_tables;
 static void (*ctl_exit_func)(int status) = NULL;
 OVS_NO_RETURN static void ctl_exit(int status);
 
+static void ctl_set_uuid_condition(struct ctl_context *,
+                                   const struct ovsdb_idl_table_class *, int);
+
 /* IDL class. */
 static const struct ovsdb_idl_class *idl_class;
 
@@ -891,6 +894,11 @@ pre_cmd_get(struct ctl_context *ctx)
     if (ctx->error) {
         return;
     }
+
+    if (ctx->argc >= 3) {
+        ctl_set_uuid_condition(ctx, table, 2);
+    }
+
     for (i = 3; i < ctx->argc; i++) {
         if (!strcasecmp(ctx->argv[i], "_uuid")
             || !strcasecmp(ctx->argv[i], "-uuid")) {
@@ -1098,6 +1106,35 @@ pre_list_columns(struct ctl_context *ctx,
     return NULL;
 }
 
+/* If 'argv[first..argc)' are all UUID strings, builds a JSON condition
+ * array [["_uuid","==",["uuid","..."]],..] and sets it on 'table' via
+ * ovsdb_idl_set_condition_json().  This narrows the initial monitor
+ * request so the server only sends matching rows. */
+static void
+ctl_set_uuid_condition(struct ctl_context *ctx,
+                       const struct ovsdb_idl_table_class *table,
+                       int first)
+{
+    for (int i = first; i < ctx->argc; i++) {
+        struct uuid uuid;
+        if (!uuid_from_string(&uuid, ctx->argv[i])) {
+            return;
+        }
+    }
+
+    struct json *clauses = json_array_create_empty();
+    for (int i = first; i < ctx->argc; i++) {
+        json_array_add(clauses, json_array_create_3(
+            json_string_create("_uuid"),
+            json_string_create("=="),
+            json_array_create_2(
+                json_string_create("uuid"),
+                json_string_create(ctx->argv[i]))));
+    }
+    ovsdb_idl_set_condition_json(ctx->idl, table, clauses);
+    json_destroy(clauses);
+}
+
 static void
 pre_cmd_list(struct ctl_context *ctx)
 {
@@ -1112,6 +1149,10 @@ pre_cmd_list(struct ctl_context *ctx)
     ctx->error = pre_list_columns(ctx, table, column_names);
     if (ctx->error) {
         return;
+    }
+
+    if (ctx->argc >= 3) {
+        ctl_set_uuid_condition(ctx, table, 2);
     }
 }
 
@@ -1307,18 +1348,18 @@ ctl_condition_to_where_clause(const struct ovsdb_idl_table_class *table,
         return NULL;
     }
 
-    /* Only handle simple equality on scalar columns. */
-    if (key_string || !value_string || operator != RELOP_EQ) {
+    /* Only handle simple equality on scalar (non-set, non-map) columns. */
+    if (key_string || !value_string || operator != RELOP_EQ
+        || column->type.n_max != 1) {
         free(key_string);
         free(value_string);
         return NULL;
     }
 
-    /* Convert the value to OVSDB JSON. */
+    /* Convert the value to OVSDB JSON.  Column is guaranteed scalar
+     * (n_max == 1) by the check above. */
     struct ovsdb_datum datum;
-    struct ovsdb_type type = column->type;
-    type.n_max = UINT_MAX;
-    error = ovsdb_datum_from_string(&datum, &type, value_string, NULL);
+    error = ovsdb_datum_from_string(&datum, &column->type, value_string, NULL);
     free(value_string);
     if (error) {
         free(error);
