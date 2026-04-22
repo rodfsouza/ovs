@@ -76,11 +76,10 @@ struct ovsdb_name_index {
 struct ovsdb_name_index *ovsdb_name_index_create(const char *column_name,
                                                   unsigned int column_index);
 void ovsdb_name_index_destroy(struct ovsdb_name_index *);
+void ovsdb_name_index_clear(struct ovsdb_name_index *);
 const struct uuid *ovsdb_name_index_find(
     const struct ovsdb_name_index *, const char *name);
 
-void ovsdb_disk_store_set_indexed_column(
-    struct ovsdb_disk_store *, const char *column_name);
 void ovsdb_disk_store_build_name_index(
     struct ovsdb_disk_store *, struct ovsdb_name_index *);
 void ovsdb_disk_store_name_index_add(

@@ -804,8 +804,9 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
 
         /* Build secondary name index for the first single-column
          * string index declared in the schema (typically "name").
-         * The indexed column must be set BEFORE open() so that
-         * rebuild_index() extracts values in a single pass. */
+         * This does a second pass reading each row from disk to
+         * extract the indexed column value.  Runs during startup
+         * before workers are active — no lock needed. */
         for (size_t i = 0; i < table->schema->n_indexes; i++) {
             const struct ovsdb_column_set *idx = &table->schema->indexes[i];
             if (idx->n_columns == 1
