@@ -1665,20 +1665,20 @@ ovsdb_monitor_get_initial_conditioned(
 
         if (has_cond && !ovsdb_condition_is_true(new_cond)
             && new_cond->n_clauses == 1
-            && new_cond->clauses[0].column->index == OVSDB_COL_UUID
             && new_cond->clauses[0].function == OVSDB_F_EQ) {
-            /* UUID exact-match: O(1) via bloom -> cache -> disk.
-             * Single-clause conditions have identical AND/OR semantics,
-             * so ovsdb_table_query() (AND) is correct here. */
+            /* Single equality clause — ovsdb_table_query() handles
+             * UUID fast-path and name index lookup internally.
+             * Single-clause conditions have identical AND/OR
+             * semantics, so this is correct for monitor conditions. */
             ovsdb_table_query(
                 CONST_CAST(struct ovsdb_table *, mcst->mt->table),
                 new_cond, monitor_initial_row_cb, &aux);
         } else {
-            /* Multi-clause or non-UUID condition.  Monitor conditions
-             * use OR semantics (match_any_clause) while ovsdb_table_query
-             * uses AND (match_every_clause), so we cannot filter here.
-             * Yield all rows; condition filtering happens at JSON
-             * composition time via ovsdb_monitor_row_update_type_condition. */
+            /* Multi-clause or non-equality condition.  Monitor
+             * conditions use OR semantics (match_any_clause) while
+             * ovsdb_table_query uses AND (match_every_clause), so
+             * we cannot filter here.  Full scan with composition-time
+             * filtering via ovsdb_monitor_row_update_type_condition. */
             ovsdb_table_for_each_row_from_disk(mcst->mt->table,
                                                monitor_initial_row_cb,
                                                &aux);

@@ -25,6 +25,7 @@
 
 #include "bloom-filter.h"
 #include "column.h"
+#include "hash.h"
 #include "openvswitch/dynamic-string.h"
 #include "ovsdb-data.h"
 #include "ovsdb-error.h"
@@ -85,7 +86,9 @@ VLOG_DEFINE_THIS_MODULE(disk_store);
 #define DISK_STORE_N_COLUMNS_OFFSET 20  /* Byte offset of n_columns
                                          * within the row header. */
 
-/* In-memory index entry mapping UUID -> file location. */
+/* In-memory index entry mapping UUID -> file location.
+ * Also serves as the anchor for the secondary name index:
+ * both the UUID hmap and name hmap reference the same entry. */
 struct disk_store_index_entry {
     struct hmap_node hmap_node;   /* In ovsdb_disk_store.index. */
     struct uuid uuid;             /* Row UUID. */
@@ -93,6 +96,11 @@ struct disk_store_index_entry {
     uint32_t length;              /* Total record length on disk. */
     char *table_name;             /* Owning table name. */
     bool deleted;                 /* Marked for lazy deletion. */
+
+    /* Secondary name index linkage. */
+    char *name_value;             /* Indexed column value, or NULL. */
+    struct hmap_node name_node;   /* In name_index.entries (by name hash). */
+    bool in_name_index;           /* True if name_node is inserted. */
 };
 
 /* The disk store handle. */
@@ -108,6 +116,8 @@ struct ovsdb_disk_store {
     struct ovsdb_schema *schema;  /* Embedded schema (owned). */
     uint32_t schema_json_len;     /* Length of embedded schema JSON.
                                    * Zero in legacy files. */
+    char *indexed_column_name;    /* Column to extract for name index,
+                                   * or NULL if none.  Set before open. */
 };
 
 /* Cursor for iterating rows of a single table. */
@@ -491,6 +501,7 @@ static void
 disk_store_index_entry_destroy(struct disk_store_index_entry *e)
 {
     free(e->table_name);
+    free(e->name_value);
     free(e);
 }
 
@@ -592,6 +603,110 @@ disk_store_read_header(int fd,
 /* Index rebuild: scan existing file to reconstruct in-memory index.    */
 /* ------------------------------------------------------------------ */
 
+/* Returns the byte size of a serialized atom of the given type,
+ * reading from 'data'.  For fixed-size types this is constant;
+ * for strings it reads the 4-byte length prefix. */
+static size_t
+disk_store_atom_size(const uint8_t *data, uint8_t type_tag)
+{
+    switch (type_tag) {
+    case OVSDB_TYPE_INTEGER: return 8;
+    case OVSDB_TYPE_REAL:    return 8;
+    case OVSDB_TYPE_BOOLEAN: return 1;
+    case OVSDB_TYPE_UUID:    return 16;
+    case OVSDB_TYPE_STRING: {
+        uint32_t len;
+        memcpy(&len, data, sizeof len);
+        return sizeof len + len;
+    }
+    default: return 0;
+    }
+}
+
+/* Skip past a serialized datum (uint32_t n + n keys + n values).
+ * Returns the number of bytes consumed. */
+static size_t
+disk_store_skip_datum(const uint8_t *data, uint8_t key_type,
+                      uint8_t val_type)
+{
+    uint32_t n;
+    memcpy(&n, data, sizeof n);
+    size_t offset = sizeof n;
+
+    for (uint32_t i = 0; i < n; i++) {
+        offset += disk_store_atom_size(data + offset, key_type);
+    }
+    if (val_type != OVSDB_TYPE_VOID) {
+        for (uint32_t i = 0; i < n; i++) {
+            offset += disk_store_atom_size(data + offset, val_type);
+        }
+    }
+    return offset;
+}
+
+/* Scan a serialized row record for a specific column by name.
+ * Returns the string value if found (caller must free), NULL otherwise.
+ * Only works for scalar string columns. */
+static char *
+disk_store_extract_column_string(const uint8_t *record,
+                                 uint32_t total_len,
+                                 uint16_t n_columns,
+                                 uint16_t table_name_len,
+                                 const char *target_column)
+{
+    size_t target_len = strlen(target_column);
+    size_t pos = DISK_STORE_ROW_HEADER_SIZE
+                 + sizeof(uint16_t) + table_name_len;
+
+    for (uint16_t c = 0; c < n_columns && pos < total_len; c++) {
+        if (pos + sizeof(uint16_t) > total_len) {
+            break;
+        }
+        uint16_t col_name_len;
+        memcpy(&col_name_len, record + pos, sizeof col_name_len);
+        pos += sizeof col_name_len;
+
+        if (pos + col_name_len + 2 > total_len) {
+            break;
+        }
+        size_t col_name_pos = pos;
+        pos += col_name_len;
+
+        uint8_t key_type = record[pos++];
+        uint8_t val_type = record[pos++];
+
+        if (col_name_len == target_len
+            && !memcmp((const char *)(record + col_name_pos),
+                       target_column, target_len)
+            && key_type == OVSDB_TYPE_STRING) {
+            /* Found target column.  Extract the first string value. */
+            if (pos + sizeof(uint32_t) > total_len) {
+                break;
+            }
+            uint32_t datum_n;
+            memcpy(&datum_n, record + pos, sizeof datum_n);
+            pos += sizeof datum_n;
+            if (datum_n >= 1 && pos + sizeof(uint32_t) <= total_len) {
+                uint32_t str_len;
+                memcpy(&str_len, record + pos, sizeof str_len);
+                pos += sizeof str_len;
+                if (pos + str_len <= total_len) {
+                    return xmemdup0((const char *)(record + pos),
+                                   str_len);
+                }
+            }
+            return NULL;
+        }
+
+        /* Skip this column's datum. */
+        if (pos + sizeof(uint32_t) > total_len) {
+            break;
+        }
+        pos += disk_store_skip_datum(record + pos, key_type, val_type);
+    }
+    return NULL;
+}
+
 static struct ovsdb_error *
 disk_store_rebuild_index(struct ovsdb_disk_store *store)
 {
@@ -630,31 +745,45 @@ disk_store_rebuild_index(struct ovsdb_disk_store *store)
             break;
         }
 
-        /* Read the table name that follows the row header.
-         * We store a 2-byte name length + name bytes right
-         * after the fixed row header. */
+        /* Read the full record so we can extract both the table
+         * name and the indexed column value in a single pass. */
         {
+            uint8_t *record = xmalloc(total_len);
+            n = pread(store->fd, record, total_len, pos);
+            if (n != (ssize_t) total_len) {
+                free(record);
+                VLOG_WARN("short read at offset %lld",
+                          (long long) pos);
+                break;
+            }
+
             uint16_t name_len;
             char name_buf[DISK_STORE_MAX_TABLE_NAME];
 
-            n = pread(store->fd, &name_len, sizeof name_len,
-                      pos + DISK_STORE_ROW_HEADER_SIZE);
-            if (n != (ssize_t) sizeof name_len
-                || name_len >= DISK_STORE_MAX_TABLE_NAME) {
+            memcpy(&name_len,
+                   record + DISK_STORE_ROW_HEADER_SIZE,
+                   sizeof name_len);
+            if (name_len >= DISK_STORE_MAX_TABLE_NAME) {
+                free(record);
                 VLOG_WARN("bad table name at offset %lld",
                           (long long) pos);
                 break;
             }
-
-            n = pread(store->fd, name_buf, name_len,
-                      pos + DISK_STORE_ROW_HEADER_SIZE
-                      + sizeof name_len);
-            if (n != (ssize_t) name_len) {
-                VLOG_WARN("truncated table name at offset %lld",
-                          (long long) pos);
-                break;
-            }
+            memcpy(name_buf,
+                   record + DISK_STORE_ROW_HEADER_SIZE
+                   + sizeof name_len,
+                   name_len);
             name_buf[name_len] = '\0';
+
+            /* Extract indexed column value from the record. */
+            char *name_value = NULL;
+            if (store->indexed_column_name
+                && !(flags & DISK_STORE_FLAG_DELETED)) {
+                name_value = disk_store_extract_column_string(
+                    record, total_len, n_columns,
+                    name_len, store->indexed_column_name);
+            }
+            free(record);
 
             /* If there's an older entry for this UUID, replace. */
             entry = disk_store_find_entry(store, &uuid);
@@ -669,6 +798,8 @@ disk_store_rebuild_index(struct ovsdb_disk_store *store)
             entry->length = total_len;
             entry->table_name = xstrdup(name_buf);
             entry->deleted = (flags & DISK_STORE_FLAG_DELETED) != 0;
+            entry->name_value = name_value;
+            entry->in_name_index = false;
             hmap_insert(&store->index, &entry->hmap_node,
                         disk_store_uuid_hash(&uuid));
         }
@@ -1575,6 +1706,113 @@ ovsdb_disk_store_rebuild_bloom(struct ovsdb_disk_store *store,
     struct ovsdb_bloom_filter *old = *bloom_p;
     *bloom_p = new_bloom;
     ovsdb_bloom_filter_destroy(old);
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API: secondary name index.                                   */
+/* ------------------------------------------------------------------ */
+
+void
+ovsdb_disk_store_set_indexed_column(struct ovsdb_disk_store *store,
+                                    const char *column_name)
+{
+    free(store->indexed_column_name);
+    store->indexed_column_name = column_name ? xstrdup(column_name) : NULL;
+}
+
+void
+ovsdb_disk_store_build_name_index(struct ovsdb_disk_store *store,
+                                  struct ovsdb_name_index *ni)
+{
+    struct disk_store_index_entry *e;
+
+    HMAP_FOR_EACH (e, hmap_node, &store->index) {
+        if (e->deleted || !e->name_value) {
+            continue;
+        }
+        hmap_insert(&ni->entries, &e->name_node,
+                    hash_string(e->name_value, 0));
+        e->in_name_index = true;
+    }
+}
+
+const struct uuid *
+ovsdb_name_index_find(const struct ovsdb_name_index *ni,
+                      const char *name)
+{
+    if (!ni) {
+        return NULL;
+    }
+    uint32_t h = hash_string(name, 0);
+    const struct disk_store_index_entry *e;
+
+    HMAP_FOR_EACH_WITH_HASH (e, name_node, h, &ni->entries) {
+        if (!strcmp(e->name_value, name)) {
+            return &e->uuid;
+        }
+    }
+    return NULL;
+}
+
+void
+ovsdb_disk_store_name_index_add(struct ovsdb_disk_store *store,
+                                struct ovsdb_name_index *ni,
+                                const struct uuid *uuid,
+                                const char *name)
+{
+    struct disk_store_index_entry *e = disk_store_find_entry(store, uuid);
+    if (!e) {
+        return;
+    }
+
+    if (e->in_name_index) {
+        hmap_remove(&ni->entries, &e->name_node);
+        e->in_name_index = false;
+    }
+    free(e->name_value);
+    e->name_value = xstrdup(name);
+    hmap_insert(&ni->entries, &e->name_node,
+                hash_string(name, 0));
+    e->in_name_index = true;
+}
+
+void
+ovsdb_disk_store_name_index_remove(struct ovsdb_disk_store *store,
+                                   struct ovsdb_name_index *ni,
+                                   const struct uuid *uuid)
+{
+    struct disk_store_index_entry *e = disk_store_find_entry(store, uuid);
+    if (!e) {
+        return;
+    }
+
+    if (e->in_name_index) {
+        hmap_remove(&ni->entries, &e->name_node);
+        e->in_name_index = false;
+    }
+    free(e->name_value);
+    e->name_value = NULL;
+}
+
+struct ovsdb_name_index *
+ovsdb_name_index_create(const char *column_name,
+                        unsigned int column_index)
+{
+    struct ovsdb_name_index *ni = xzalloc(sizeof *ni);
+    hmap_init(&ni->entries);
+    ni->column_name = xstrdup(column_name);
+    ni->column_index = column_index;
+    return ni;
+}
+
+void
+ovsdb_name_index_destroy(struct ovsdb_name_index *ni)
+{
+    if (ni) {
+        hmap_destroy(&ni->entries);
+        free(ni->column_name);
+        free(ni);
+    }
 }
 
 /* Returns the schema associated with 'store', or NULL. */

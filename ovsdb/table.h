@@ -25,6 +25,7 @@ struct json;
 struct uuid;
 struct ovsdb_bloom_filter;
 struct ovsdb_condition;
+struct ovsdb_name_index;
 struct ovsdb_txn;
 
 /* Schema for a database table. */
@@ -77,6 +78,9 @@ struct ovsdb_table {
     struct ovsdb_bloom_filter *bloom;  /* UUID existence filter.
                                         * NOT counted against cache
                                         * atom budget. */
+    struct ovsdb_name_index *name_index; /* Secondary name→UUID index.
+                                          * NULL if no indexed column
+                                          * or no disk_store. */
 
     /* Back-pointer to owning database (for lazy-load). */
     struct ovsdb *db;

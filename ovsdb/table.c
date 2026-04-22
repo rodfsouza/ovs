@@ -644,7 +644,31 @@ ovsdb_table_query(struct ovsdb_table *table,
         return;
     }
 
-    /* Path 2: Unified iteration — table->rows, then optional disk. */
+    /* Path 2: Name index lookup.
+     * Single-clause string equality on the indexed column
+     * → O(1) via name_index → UUID → bloom → offset → pread. */
+    if (check_cond
+        && condition->n_clauses == 1
+        && condition->clauses[0].function == OVSDB_F_EQ
+        && table->name_index
+        && condition->clauses[0].column->type.key.type == OVSDB_TYPE_STRING
+        && condition->clauses[0].column->type.n_max == 1
+        && condition->clauses[0].column->index
+           == table->name_index->column_index) {
+        const char *target =
+            json_string(condition->clauses[0].arg.keys[0].s);
+        const struct uuid *uuid =
+            ovsdb_name_index_find(table->name_index, target);
+        if (uuid) {
+            const struct ovsdb_row *row = ovsdb_table_get_row(table, uuid);
+            if (row && ovsdb_condition_match_every_clause(row, condition)) {
+                cb(row, aux);
+            }
+        }
+        return;
+    }
+
+    /* Path 3: Unified iteration — table->rows, then optional disk. */
 
     /* Step A: yield matching rows from in-memory table->rows.
      * Use HMAP_FOR_EACH_SAFE because callbacks (e.g. delete_row_cb)

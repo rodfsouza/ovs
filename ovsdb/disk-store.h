@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "compiler.h"
+#include "openvswitch/hmap.h"
 #include "openvswitch/uuid.h"
 
 struct ovsdb_bloom_filter;
@@ -62,6 +63,32 @@ bool ovsdb_disk_store_contains(const struct ovsdb_disk_store *,
 struct ovsdb_error *ovsdb_disk_store_compact(
     struct ovsdb_disk_store *)
     OVS_WARN_UNUSED_RESULT;
+
+/* Secondary name index. */
+struct ovsdb_name_index {
+    struct hmap entries;           /* name_hash → disk_store_index_entry
+                                   * (via entry->name_node). */
+    char *column_name;            /* Indexed column name (for disk scan). */
+    unsigned int column_index;    /* Column index in table schema
+                                   * (for fast comparison in query path). */
+};
+
+struct ovsdb_name_index *ovsdb_name_index_create(const char *column_name,
+                                                  unsigned int column_index);
+void ovsdb_name_index_destroy(struct ovsdb_name_index *);
+const struct uuid *ovsdb_name_index_find(
+    const struct ovsdb_name_index *, const char *name);
+
+void ovsdb_disk_store_set_indexed_column(
+    struct ovsdb_disk_store *, const char *column_name);
+void ovsdb_disk_store_build_name_index(
+    struct ovsdb_disk_store *, struct ovsdb_name_index *);
+void ovsdb_disk_store_name_index_add(
+    struct ovsdb_disk_store *, struct ovsdb_name_index *,
+    const struct uuid *, const char *name);
+void ovsdb_disk_store_name_index_remove(
+    struct ovsdb_disk_store *, struct ovsdb_name_index *,
+    const struct uuid *);
 
 /* Bloom filter rebuild (call after compaction). */
 void ovsdb_disk_store_rebuild_bloom(struct ovsdb_disk_store *,

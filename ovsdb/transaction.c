@@ -571,6 +571,20 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
         }
     }
 
+    /* Update secondary name index BEFORE disk store write-back.
+     * write_row() destroys the old index entry, so we must
+     * remove the name_node from ni->entries first to avoid
+     * a dangling pointer in the name hmap. */
+    if (txn_row->table->name_index && txn_row->table->disk_store) {
+        struct ovsdb_name_index *ni = txn_row->table->name_index;
+
+        if (txn_row->old) {
+            ovsdb_disk_store_name_index_remove(
+                txn_row->table->disk_store, ni,
+                ovsdb_row_get_uuid(txn_row->old));
+        }
+    }
+
     /* Phase 2: Write-back to disk store.
      * Errors are logged but not propagated; the in-memory
      * commit has already succeeded at this point. */
@@ -595,6 +609,26 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
             char *s = ovsdb_error_to_string_free(ds_err);
             VLOG_WARN_RL(&rl, "disk store write-back: %s", s);
             free(s);
+        }
+    }
+
+    /* Add new name to index AFTER write-back (the new entry
+     * now exists in the UUID index). */
+    if (txn_row->table->name_index && txn_row->table->disk_store
+        && txn_row->new) {
+        struct ovsdb_name_index *ni = txn_row->table->name_index;
+        const struct ovsdb_column *col =
+            ovsdb_table_schema_get_column(
+                txn_row->table->schema, ni->column_name);
+        if (col && col->type.key.type == OVSDB_TYPE_STRING) {
+            const struct ovsdb_datum *d =
+                &txn_row->new->fields[col->index];
+            if (d->n == 1 && d->keys[0].s) {
+                ovsdb_disk_store_name_index_add(
+                    txn_row->table->disk_store, ni,
+                    ovsdb_row_get_uuid(txn_row->new),
+                    json_string(d->keys[0].s));
+            }
         }
     }
 
