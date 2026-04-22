@@ -1726,6 +1726,45 @@ ovsdb_disk_store_build_name_index(struct ovsdb_disk_store *store,
 {
     struct disk_store_index_entry *e;
 
+    /* If name values were extracted during rebuild_index (single pass),
+     * just insert them into the name hmap.  Otherwise, do a second
+     * pass to read and extract them now. */
+    bool need_extract = false;
+    HMAP_FOR_EACH (e, hmap_node, &store->index) {
+        if (!e->deleted && !e->name_value) {
+            need_extract = true;
+            break;
+        }
+    }
+
+    if (need_extract) {
+        /* Second pass: read each row from disk, extract column. */
+        HMAP_FOR_EACH (e, hmap_node, &store->index) {
+            if (e->deleted) {
+                continue;
+            }
+            uint8_t *record = xmalloc(e->length);
+            ssize_t n = pread(store->fd, record, e->length, e->offset);
+            if (n != (ssize_t) e->length) {
+                free(record);
+                continue;
+            }
+            uint16_t name_len;
+            memcpy(&name_len,
+                   record + DISK_STORE_ROW_HEADER_SIZE,
+                   sizeof name_len);
+            uint16_t n_columns;
+            memcpy(&n_columns,
+                   record + DISK_STORE_N_COLUMNS_OFFSET,
+                   sizeof n_columns);
+            e->name_value = disk_store_extract_column_string(
+                record, e->length, n_columns,
+                name_len, ni->column_name);
+            free(record);
+        }
+    }
+
+    /* Insert entries with name values into the name hmap. */
     HMAP_FOR_EACH (e, hmap_node, &store->index) {
         if (e->deleted || !e->name_value) {
             continue;

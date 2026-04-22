@@ -62,8 +62,8 @@ static const struct cmd_show_table *cmd_show_tables;
 static void (*ctl_exit_func)(int status) = NULL;
 OVS_NO_RETURN static void ctl_exit(int status);
 
-static void ctl_set_uuid_condition(struct ctl_context *,
-                                   const struct ovsdb_idl_table_class *, int);
+static void ctl_set_row_condition(struct ctl_context *,
+                                  const struct ovsdb_idl_table_class *, int);
 
 /* IDL class. */
 static const struct ovsdb_idl_class *idl_class;
@@ -896,7 +896,7 @@ pre_cmd_get(struct ctl_context *ctx)
     }
 
     if (ctx->argc >= 3) {
-        ctl_set_uuid_condition(ctx, table, 2);
+        ctl_set_row_condition(ctx, table, 2);
     }
 
     for (i = 3; i < ctx->argc; i++) {
@@ -1106,33 +1106,62 @@ pre_list_columns(struct ctl_context *ctx,
     return NULL;
 }
 
-/* If 'argv[first..argc)' are all UUID strings, builds a JSON condition
- * array [["_uuid","==",["uuid","..."]],..] and sets it on 'table' via
- * ovsdb_idl_set_condition_json().  This narrows the initial monitor
- * request so the server only sends matching rows. */
+/* Sets a monitor condition for the record IDs in argv[first..argc).
+ *
+ * If all args are UUIDs, builds ["_uuid","==",["uuid","..."]] clauses.
+ * If a single non-UUID arg is given and the table has a simple scalar
+ * name column (from ctl_row_id), builds ["name","==","arg"] instead.
+ * This narrows the initial monitor request so the server only sends
+ * matching rows. */
 static void
-ctl_set_uuid_condition(struct ctl_context *ctx,
-                       const struct ovsdb_idl_table_class *table,
-                       int first)
+ctl_set_row_condition(struct ctl_context *ctx,
+                      const struct ovsdb_idl_table_class *table,
+                      int first)
 {
+    /* Check if all args are UUIDs. */
+    bool all_uuids = true;
     for (int i = first; i < ctx->argc; i++) {
         struct uuid uuid;
         if (!uuid_from_string(&uuid, ctx->argv[i])) {
-            return;
+            all_uuids = false;
+            break;
         }
     }
 
-    struct json *clauses = json_array_create_empty();
-    for (int i = first; i < ctx->argc; i++) {
-        json_array_add(clauses, json_array_create_3(
-            json_string_create("_uuid"),
-            json_string_create("=="),
-            json_array_create_2(
-                json_string_create("uuid"),
-                json_string_create(ctx->argv[i]))));
+    if (all_uuids) {
+        struct json *clauses = json_array_create_empty();
+        for (int i = first; i < ctx->argc; i++) {
+            json_array_add(clauses, json_array_create_3(
+                json_string_create("_uuid"),
+                json_string_create("=="),
+                json_array_create_2(
+                    json_string_create("uuid"),
+                    json_string_create(ctx->argv[i]))));
+        }
+        ovsdb_idl_set_condition_json(ctx->idl, table, clauses);
+        json_destroy(clauses);
+        return;
     }
-    ovsdb_idl_set_condition_json(ctx->idl, table, clauses);
-    json_destroy(clauses);
+
+    /* Single non-UUID arg: try to push a name condition. */
+    if (ctx->argc == first + 1) {
+        const struct ctl_table_class *ctl =
+            &ctl_classes[table - idl_classes];
+        for (int i = 0; i < ARRAY_SIZE(ctl->row_ids); i++) {
+            const struct ctl_row_id *id = &ctl->row_ids[i];
+            if (id->name_column && !id->key && !id->uuid_column) {
+                struct json *clause = json_array_create_3(
+                    json_string_create(id->name_column->name),
+                    json_string_create("=="),
+                    json_string_create(ctx->argv[first]));
+                struct json *cond = json_array_create_1(clause);
+                ovsdb_idl_set_condition_json(ctx->idl, table, cond);
+                json_destroy(cond);
+                return;
+            }
+        }
+    }
+    /* No suitable condition — full table sync (no condition set). */
 }
 
 /* Like pre_list_columns() but uses ovsdb_idl_add_column_noref() to
@@ -1165,28 +1194,15 @@ pre_cmd_list(struct ctl_context *ctx)
     const char *column_names = shash_find_data(&ctx->options, "--columns");
     const char *table_name = ctx->argv[1];
     const struct ovsdb_idl_table_class *table;
-    bool has_uuid_filter = false;
 
     ctx->error = pre_get_table(ctx, table_name, &table);
     if (ctx->error) {
         return;
     }
 
-    if (ctx->argc >= 3) {
-        has_uuid_filter = true;
-        for (int i = 2; i < ctx->argc; i++) {
-            struct uuid uuid;
-            if (!uuid_from_string(&uuid, ctx->argv[i])) {
-                has_uuid_filter = false;
-                break;
-            }
-        }
-    }
-
-    /* When filtering by UUID with no explicit --columns, skip
-     * add_ref_table to avoid monitoring referenced tables that
-     * the CLI doesn't need (displayed as raw UUIDs). */
-    if (has_uuid_filter && !column_names) {
+    /* When specific record IDs are given (UUID or name), skip
+     * add_ref_table and push a condition to narrow the monitor. */
+    if (ctx->argc >= 3 && !column_names) {
         ctx->error = pre_list_columns_noref(ctx, table, NULL);
     } else {
         ctx->error = pre_list_columns(ctx, table, column_names);
@@ -1195,8 +1211,8 @@ pre_cmd_list(struct ctl_context *ctx)
         return;
     }
 
-    if (has_uuid_filter) {
-        ctl_set_uuid_condition(ctx, table, 2);
+    if (ctx->argc >= 3) {
+        ctl_set_row_condition(ctx, table, 2);
     }
 }
 

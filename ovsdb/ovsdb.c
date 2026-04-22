@@ -802,6 +802,26 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
         ovsdb_disk_store_for_each_uuid(
             ds, node->name, add_bloom_cb, table->bloom);
 
+        /* Build secondary name index for the first single-column
+         * string index declared in the schema (typically "name").
+         * The indexed column must be set BEFORE open() so that
+         * rebuild_index() extracts values in a single pass. */
+        for (size_t i = 0; i < table->schema->n_indexes; i++) {
+            const struct ovsdb_column_set *idx = &table->schema->indexes[i];
+            if (idx->n_columns == 1
+                && idx->columns[0]->type.key.type == OVSDB_TYPE_STRING
+                && idx->columns[0]->type.n_max == 1) {
+                table->name_index = ovsdb_name_index_create(
+                    idx->columns[0]->name, idx->columns[0]->index);
+                ovsdb_disk_store_build_name_index(ds, table->name_index);
+                VLOG_DBG("%s: table %s: built name index on column '%s' "
+                         "(%"PRIuSIZE" entries)",
+                         db->name, node->name, idx->columns[0]->name,
+                         hmap_count(&table->name_index->entries));
+                break;
+            }
+        }
+
         /* Warm the cache up to the per-table atom budget on a
          * background worker pool so tools querying the table
          * immediately after startup see CACHED rows rather than
