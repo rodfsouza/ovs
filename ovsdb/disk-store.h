@@ -21,6 +21,7 @@
 #include "compiler.h"
 #include "openvswitch/uuid.h"
 
+struct ovsdb_bloom_filter;
 struct ovsdb_row;
 struct ovsdb_table;
 struct ovsdb_schema;
@@ -61,6 +62,11 @@ bool ovsdb_disk_store_contains(const struct ovsdb_disk_store *,
 struct ovsdb_error *ovsdb_disk_store_compact(
     struct ovsdb_disk_store *)
     OVS_WARN_UNUSED_RESULT;
+
+/* Bloom filter rebuild (call after compaction). */
+void ovsdb_disk_store_rebuild_bloom(struct ovsdb_disk_store *,
+                                    struct ovsdb_bloom_filter **bloom_p,
+                                    const char *table_name);
 
 /* Format detection and schema extraction. */
 bool ovsdb_disk_store_is_binary(const char *filename);

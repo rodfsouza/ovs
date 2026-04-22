@@ -99,12 +99,16 @@ row_load_done(void *result, void *aux)
     struct row_load_request *req = aux;
 
     if (row) {
-        if (row_in_table_rows(req->table, &req->uuid)) {
-            /* Newer version exists in table->rows — discard load. */
+        if (row_in_table_rows(req->table, &req->uuid)
+            || (req->table->disk_store
+                && !ovsdb_disk_store_contains(req->table->disk_store,
+                                              &req->uuid))) {
+            /* Row was modified in table->rows or deleted from disk
+             * while loading.  Discard the stale copy. */
             ovsdb_row_destroy(row);
             ovsdb_row_cache_remove(req->table->cache, &req->uuid);
             VLOG_DBG("lazy-load: discarded stale load of "UUID_FMT
-                     " (newer version in table->rows)",
+                     " (modified or deleted during load)",
                      UUID_ARGS(&req->uuid));
         } else {
             size_t n_atoms = ovsdb_row_count_atoms(row);

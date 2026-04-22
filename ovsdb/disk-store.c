@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "bloom-filter.h"
 #include "column.h"
 #include "openvswitch/dynamic-string.h"
 #include "ovsdb-data.h"
@@ -931,9 +932,15 @@ ovsdb_disk_store_write_row(struct ovsdb_disk_store *store,
     disk_store_buf_init(&buf);
     disk_store_serialize_row(&buf, row, table_name, 0);
 
+    /* Acquire write lock BEFORE disk write so concurrent readers
+     * never see a stale index entry pointing to an old offset
+     * (prevents data corruption on UUID reuse). */
+    ovs_rwlock_wrlock(&store->index_rwlock);
+
     /* Append to file. */
     offset = lseek(store->fd, 0, SEEK_END);
     if (offset < 0) {
+        ovs_rwlock_unlock(&store->index_rwlock);
         disk_store_buf_destroy(&buf);
         return ovsdb_io_error(errno,
                               "lseek failed on disk store");
@@ -941,14 +948,13 @@ ovsdb_disk_store_write_row(struct ovsdb_disk_store *store,
 
     n = write(store->fd, buf.data, buf.size);
     if (n != (ssize_t) buf.size) {
+        ovs_rwlock_unlock(&store->index_rwlock);
         disk_store_buf_destroy(&buf);
         return ovsdb_io_error(errno,
                               "write failed on disk store");
     }
 
-    /* Update in-memory index under write lock so worker threads
-     * doing read_row don't see a freed index entry. */
-    ovs_rwlock_wrlock(&store->index_rwlock);
+    /* Update in-memory index (already under write lock). */
     old_entry = disk_store_find_entry(store, uuid);
     if (old_entry) {
         hmap_remove(&store->index, &old_entry->hmap_node);
@@ -1185,6 +1191,10 @@ ovsdb_disk_store_cursor_open(struct ovsdb_disk_store *store,
     size_t count = 0;
     size_t idx = 0;
 
+    /* Hold read lock during snapshot to prevent compaction from
+     * swapping the index underneath us. */
+    ovs_rwlock_rdlock(&store->index_rwlock);
+
     /* Count matching, non-deleted entries. */
     HMAP_FOR_EACH (e, hmap_node, &store->index) {
         if (!e->deleted && !strcmp(e->table_name, table_name)) {
@@ -1205,6 +1215,8 @@ ovsdb_disk_store_cursor_open(struct ovsdb_disk_store *store,
             cursor->entries[idx++] = e;
         }
     }
+
+    ovs_rwlock_unlock(&store->index_rwlock);
 
     return cursor;
 }
@@ -1275,6 +1287,29 @@ ovsdb_disk_store_contains(const struct ovsdb_disk_store *store,
 /* Public API: compaction.                                             */
 /* ------------------------------------------------------------------ */
 
+/* Helper for ordered compaction: stores a deep copy of entry
+ * fields needed for the I/O phase (after the lock is released). */
+struct compact_entry {
+    struct uuid uuid;
+    off_t offset;
+    uint32_t length;
+    char *table_name;
+};
+
+struct compact_group {
+    struct compact_entry *entries;
+    size_t n;
+    size_t allocated;
+};
+
+static int
+compact_compare_by_uuid(const void *a_, const void *b_)
+{
+    const struct compact_entry *a = a_;
+    const struct compact_entry *b = b_;
+    return memcmp(&a->uuid, &b->uuid, sizeof(struct uuid));
+}
+
 struct ovsdb_error *
 ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
 {
@@ -1333,55 +1368,99 @@ ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
         }
     }
 
-    /* Copy all non-deleted records. */
+    /* Collect non-deleted entries, grouped by table and sorted
+     * by UUID within each group.  This produces a compacted file
+     * where each table's rows are contiguous and UUID-sorted,
+     * improving sequential scan performance (OS readahead). */
     hmap_init(&new_index);
 
-    HMAP_FOR_EACH (e, hmap_node, &store->index) {
-        uint8_t *record;
-        ssize_t n;
-        off_t new_offset;
-        struct disk_store_index_entry *new_entry;
+    /* Phase 1: Deep-copy entry fields under read lock and group by
+     * table.  We copy rather than snapshot raw pointers so that
+     * Phase 3 I/O can proceed safely after releasing the lock. */
+    struct shash table_groups;
+    shash_init(&table_groups);
 
+    ovs_rwlock_rdlock(&store->index_rwlock);
+    HMAP_FOR_EACH (e, hmap_node, &store->index) {
         if (e->deleted) {
             continue;
         }
 
-        record = xmalloc(e->length);
-        n = pread(store->fd, record, e->length, e->offset);
-        if (n != (ssize_t) e->length) {
-            free(record);
-            VLOG_WARN("short read during compact for "UUID_FMT,
-                      UUID_ARGS(&e->uuid));
-            continue;
+        struct compact_group *group =
+            shash_find_data(&table_groups, e->table_name);
+        if (!group) {
+            group = xzalloc(sizeof *group);
+            shash_add(&table_groups, e->table_name, group);
         }
-
-        new_offset = lseek(tmp_fd, 0, SEEK_END);
-        if (new_offset < 0) {
-            free(record);
-            error = ovsdb_io_error(errno,
-                                   "lseek failed during compact");
-            goto compact_error;
+        if (group->n >= group->allocated) {
+            group->allocated = group->allocated ? group->allocated * 2 : 16;
+            group->entries = xrealloc(group->entries,
+                                      group->allocated
+                                      * sizeof *group->entries);
         }
+        struct compact_entry *ce = &group->entries[group->n++];
+        ce->uuid = e->uuid;
+        ce->offset = e->offset;
+        ce->length = e->length;
+        ce->table_name = xstrdup(e->table_name);
+    }
+    ovs_rwlock_unlock(&store->index_rwlock);
 
-        n = write(tmp_fd, record, e->length);
-        free(record);
-        if (n != (ssize_t) e->length) {
-            error = ovsdb_io_error(errno,
-                                   "write failed during compact");
-            goto compact_error;
-        }
-
-        new_entry = xzalloc(sizeof *new_entry);
-        new_entry->uuid = e->uuid;
-        new_entry->offset = new_offset;
-        new_entry->length = e->length;
-        new_entry->table_name = xstrdup(e->table_name);
-        new_entry->deleted = false;
-        hmap_insert(&new_index, &new_entry->hmap_node,
-                    disk_store_uuid_hash(&new_entry->uuid));
+    /* Phase 2: Sort each group by UUID. */
+    struct shash_node *sn;
+    SHASH_FOR_EACH (sn, &table_groups) {
+        struct compact_group *group = sn->data;
+        qsort(group->entries, group->n, sizeof *group->entries,
+              compact_compare_by_uuid);
     }
 
-    /* Atomic rename. */
+    /* Phase 3: Write groups sequentially to temp file.
+     * Uses deep-copied fields from Phase 1 — no lock needed. */
+    SHASH_FOR_EACH (sn, &table_groups) {
+        struct compact_group *group = sn->data;
+        for (size_t i = 0; i < group->n; i++) {
+            struct compact_entry *ce = &group->entries[i];
+
+            uint8_t *record = xmalloc(ce->length);
+            ssize_t n = pread(store->fd, record, ce->length, ce->offset);
+            if (n != (ssize_t) ce->length) {
+                free(record);
+                VLOG_WARN("short read during compact for "UUID_FMT,
+                          UUID_ARGS(&ce->uuid));
+                continue;
+            }
+
+            off_t new_offset = lseek(tmp_fd, 0, SEEK_END);
+            if (new_offset < 0) {
+                free(record);
+                error = ovsdb_io_error(errno,
+                                       "lseek failed during compact");
+                goto compact_error;
+            }
+
+            n = write(tmp_fd, record, ce->length);
+            free(record);
+            if (n != (ssize_t) ce->length) {
+                error = ovsdb_io_error(errno,
+                                       "write failed during compact");
+                goto compact_error;
+            }
+
+            struct disk_store_index_entry *new_entry;
+            new_entry = xzalloc(sizeof *new_entry);
+            new_entry->uuid = ce->uuid;
+            new_entry->offset = new_offset;
+            new_entry->length = ce->length;
+            new_entry->table_name = xstrdup(ce->table_name);
+            new_entry->deleted = false;
+            hmap_insert(&new_index, &new_entry->hmap_node,
+                        disk_store_uuid_hash(&new_entry->uuid));
+        }
+    }
+
+    /* Phase 4: Atomic rename (POSIX guarantees atomicity).
+     * Readers with the old fd can still read the old (unlinked) file
+     * until we close it. */
     if (rename(tmp_filename, store->filename) < 0) {
         error = ovsdb_io_error(errno,
                                "rename '%s' -> '%s' failed",
@@ -1389,16 +1468,38 @@ ovsdb_disk_store_compact(struct ovsdb_disk_store *store)
         goto compact_error;
     }
 
-    /* Swap file descriptor and index. */
-    close(store->fd);
-    store->fd = tmp_fd;
+    /* Phase 5: Swap fd and index under write lock.
+     * This ensures no concurrent reader sees a new index entry
+     * pointing to the old fd or vice versa. */
+    ovs_rwlock_wrlock(&store->index_rwlock);
+    {
+        int old_fd = store->fd;
+        struct hmap old_index = store->index;
 
-    HMAP_FOR_EACH_SAFE (e, hmap_node, &store->index) {
-        hmap_remove(&store->index, &e->hmap_node);
-        disk_store_index_entry_destroy(e);
+        store->fd = tmp_fd;
+        store->index = new_index;
+
+        ovs_rwlock_unlock(&store->index_rwlock);
+
+        /* Cleanup outside lock. */
+        close(old_fd);
+        HMAP_FOR_EACH_SAFE (e, hmap_node, &old_index) {
+            hmap_remove(&old_index, &e->hmap_node);
+            disk_store_index_entry_destroy(e);
+        }
+        hmap_destroy(&old_index);
     }
-    hmap_destroy(&store->index);
-    store->index = new_index;
+
+    /* Cleanup table groups. */
+    SHASH_FOR_EACH_SAFE (sn, &table_groups) {
+        struct compact_group *group = sn->data;
+        for (size_t i = 0; i < group->n; i++) {
+            free(group->entries[i].table_name);
+        }
+        free(group->entries);
+        free(group);
+    }
+    shash_destroy(&table_groups);
 
     VLOG_INFO("compacted disk store '%s': %"PRIuSIZE" entries",
               store->filename, hmap_count(&store->index));
@@ -1412,6 +1513,17 @@ compact_error:
         disk_store_index_entry_destroy(e);
     }
     hmap_destroy(&new_index);
+
+    /* Clean up table groups. */
+    SHASH_FOR_EACH_SAFE (sn, &table_groups) {
+        struct compact_group *group = sn->data;
+        for (size_t i = 0; i < group->n; i++) {
+            free(group->entries[i].table_name);
+        }
+        free(group->entries);
+        free(group);
+    }
+    shash_destroy(&table_groups);
 
     close(tmp_fd);
     unlink(tmp_filename);
@@ -1436,6 +1548,33 @@ ovsdb_disk_store_for_each_uuid(struct ovsdb_disk_store *store,
             cb(&e->uuid, aux);
         }
     }
+}
+
+static void
+add_bloom_rebuild_cb(const struct uuid *uuid, void *aux)
+{
+    ovsdb_bloom_filter_add(aux, uuid);
+}
+
+/* Rebuilds 'bloom_p' from the current non-deleted UUIDs in 'store'
+ * for 'table_name'.  Destroys the old bloom filter and replaces it
+ * with a fresh one.  Should be called after compaction to eliminate
+ * false positives from deleted UUIDs. */
+void
+ovsdb_disk_store_rebuild_bloom(struct ovsdb_disk_store *store,
+                               struct ovsdb_bloom_filter **bloom_p,
+                               const char *table_name)
+{
+    size_t count = ovsdb_disk_store_count(store, table_name);
+    struct ovsdb_bloom_filter *new_bloom =
+        ovsdb_bloom_filter_create(count > 0 ? count : 1);
+
+    ovsdb_disk_store_for_each_uuid(store, table_name,
+                                   add_bloom_rebuild_cb, new_bloom);
+
+    struct ovsdb_bloom_filter *old = *bloom_p;
+    *bloom_p = new_bloom;
+    ovsdb_bloom_filter_destroy(old);
 }
 
 /* Returns the schema associated with 'store', or NULL. */

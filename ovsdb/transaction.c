@@ -555,7 +555,23 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
 
     ovsdb_txn_row_log(txn_row);
 
-    /* Write-back to disk store and update cache (Phase 1).
+    /* Phase 1: Update cache FIRST so stale entries are removed
+     * before the disk store marks the row as deleted.  This
+     * prevents a window where cache serves a row that disk
+     * considers deleted. */
+    if (txn_row->table->cache) {
+        if (txn_row->old) {
+            ovsdb_row_cache_unpin(txn_row->table->cache,
+                                  ovsdb_row_get_uuid(txn_row->old));
+            if (!txn_row->new) {
+                ovsdb_row_cache_remove(
+                    txn_row->table->cache,
+                    ovsdb_row_get_uuid(txn_row->old));
+            }
+        }
+    }
+
+    /* Phase 2: Write-back to disk store.
      * Errors are logged but not propagated; the in-memory
      * commit has already succeeded at this point. */
     if (txn_row->table->disk_store) {
@@ -563,8 +579,6 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
         if (txn_row->new) {
             ds_err = ovsdb_disk_store_write_row(
                 txn_row->table->disk_store, txn_row->new);
-            /* Update bloom filter so future lookups for this
-             * UUID don't get a false negative. */
             if (!ds_err && txn_row->table->bloom) {
                 ovsdb_bloom_filter_add(
                     txn_row->table->bloom,
@@ -581,25 +595,6 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
             char *s = ovsdb_error_to_string_free(ds_err);
             VLOG_WARN_RL(&rl, "disk store write-back: %s", s);
             free(s);
-        }
-    }
-    /* Update cache bookkeeping (Phase 1).
-     *
-     * We do NOT insert txn_row->new into the cache here because
-     * the row is already owned by table->rows hmap.  Double
-     * ownership would cause use-after-free on eviction.
-     *
-     * For deletes, remove from cache so stale entries are not
-     * served.  Unpin any row that was pinned during modify. */
-    if (txn_row->table->cache) {
-        if (txn_row->old) {
-            ovsdb_row_cache_unpin(txn_row->table->cache,
-                                  ovsdb_row_get_uuid(txn_row->old));
-            if (!txn_row->new) {
-                ovsdb_row_cache_remove(
-                    txn_row->table->cache,
-                    ovsdb_row_get_uuid(txn_row->old));
-            }
         }
     }
 
