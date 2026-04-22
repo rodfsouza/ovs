@@ -1135,23 +1135,67 @@ ctl_set_uuid_condition(struct ctl_context *ctx,
     json_destroy(clauses);
 }
 
+/* Like pre_list_columns() but uses ovsdb_idl_add_column_noref() to
+ * avoid adding referenced tables to the monitoring set. */
+static char * OVS_WARN_UNUSED_RESULT
+pre_list_columns_noref(struct ctl_context *ctx,
+                       const struct ovsdb_idl_table_class *table,
+                       const char *column_names)
+{
+    const struct ovsdb_idl_column **columns;
+    size_t n_columns;
+    char *error;
+
+    error = parse_column_names(column_names, table, &columns, &n_columns);
+    if (error) {
+        return error;
+    }
+    for (size_t i = 0; i < n_columns; i++) {
+        if (columns[i]) {
+            ovsdb_idl_add_column_noref(ctx->idl, columns[i]);
+        }
+    }
+    free(columns);
+    return NULL;
+}
+
 static void
 pre_cmd_list(struct ctl_context *ctx)
 {
     const char *column_names = shash_find_data(&ctx->options, "--columns");
     const char *table_name = ctx->argv[1];
     const struct ovsdb_idl_table_class *table;
+    bool has_uuid_filter = false;
 
     ctx->error = pre_get_table(ctx, table_name, &table);
     if (ctx->error) {
         return;
     }
-    ctx->error = pre_list_columns(ctx, table, column_names);
+
+    if (ctx->argc >= 3) {
+        has_uuid_filter = true;
+        for (int i = 2; i < ctx->argc; i++) {
+            struct uuid uuid;
+            if (!uuid_from_string(&uuid, ctx->argv[i])) {
+                has_uuid_filter = false;
+                break;
+            }
+        }
+    }
+
+    /* When filtering by UUID with no explicit --columns, skip
+     * add_ref_table to avoid monitoring referenced tables that
+     * the CLI doesn't need (displayed as raw UUIDs). */
+    if (has_uuid_filter && !column_names) {
+        ctx->error = pre_list_columns_noref(ctx, table, NULL);
+    } else {
+        ctx->error = pre_list_columns(ctx, table, column_names);
+    }
     if (ctx->error) {
         return;
     }
 
-    if (ctx->argc >= 3) {
+    if (has_uuid_filter) {
         ctl_set_uuid_condition(ctx, table, 2);
     }
 }

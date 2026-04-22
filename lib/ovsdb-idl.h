@@ -458,6 +458,9 @@ void ovsdb_idl_condition_add_clause(struct ovsdb_idl_condition *,
 void ovsdb_idl_condition_add_clause_true(struct ovsdb_idl_condition *);
 bool ovsdb_idl_condition_is_true(const struct ovsdb_idl_condition *);
 
+void ovsdb_idl_add_column_noref(struct ovsdb_idl *,
+                                const struct ovsdb_idl_column *);
+
 unsigned int ovsdb_idl_set_condition(struct ovsdb_idl *,
                                      const struct ovsdb_idl_table_class *,
                                      const struct ovsdb_idl_condition *);

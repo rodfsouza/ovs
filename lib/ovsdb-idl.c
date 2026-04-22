@@ -947,6 +947,17 @@ ovsdb_idl_add_column(struct ovsdb_idl *idl,
     add_ref_table(idl, &column->type.value);
 }
 
+/* Like ovsdb_idl_add_column(), but does not add referenced tables
+ * to the monitoring set.  Useful for CLI one-shot lookups where
+ * reference columns are displayed as raw UUIDs and the referenced
+ * tables' data is not needed. */
+void
+ovsdb_idl_add_column_noref(struct ovsdb_idl *idl,
+                           const struct ovsdb_idl_column *column)
+{
+    ovsdb_idl_set_mode(idl, column, OVSDB_IDL_MONITOR | OVSDB_IDL_ALERT);
+}
+
 /* Ensures that the table with class 'tc' will be replicated on 'idl' even if
  * no columns are selected for replication. Just the necessary data for table
  * references will be replicated (the UUID of the rows, for instance), any
