@@ -22,6 +22,8 @@
 #include "openvswitch/hmap.h"
 #include "openvswitch/list.h"
 #include "openvswitch/vlog.h"
+#include "ovs-atomic.h"
+#include "ovs-thread.h"
 #include "row.h"
 #include "timeval.h"
 #include "uuid.h"
@@ -90,6 +92,10 @@ struct ovsdb_row_cache_scan_ring {
  * deferred entries are swept after the outermost iteration
  * completes. */
 struct ovsdb_row_cache {
+    struct ovs_rwlock rwlock;     /* Protects structural mutations.
+                                   * Readers (lookup, stats) take rdlock;
+                                   * writers (insert, remove, etc.) take
+                                   * wrlock. */
     struct hmap entries;          /* Contains ovsdb_row_cache_entry. */
 
     /* Clock-sweep buffer (replaces LRU list). */
@@ -105,12 +111,18 @@ struct ovsdb_row_cache {
     size_t max_atoms;             /* Soft atom budget. */
     size_t total_atoms;           /* Sum of n_atoms for all entries. */
     size_t n_entries;             /* Number of entries in the cache. */
-    size_t hits;                  /* Number of successful lookups. */
-    size_t misses;                /* Number of failed lookups. */
-    size_t evictions;             /* Number of evicted entries. */
+
+    /* Atomic counters for lock-free stats access. */
+    atomic_uint64_t hits;         /* Number of successful lookups. */
+    atomic_uint64_t misses;       /* Number of failed lookups. */
+    atomic_uint64_t evictions;    /* Number of evicted entries. */
 
     /* Re-entrancy guard for safe iteration. */
-    int iterating;                /* Nesting depth of for_each_* calls. */
+    int iterating;                /* Nesting depth of for_each_* calls.
+                                   * When > 0, rwlock is already held by
+                                   * the current thread (wrlock), so
+                                   * public insert/remove must not
+                                   * re-acquire. */
     struct ovs_list deferred_free; /* Entries to free after iteration. */
 };
 
@@ -343,7 +355,8 @@ ovsdb_row_cache_evict__(struct ovsdb_row_cache *cache)
         /* usage_count == 0, not pinned -> evict. */
         VLOG_DBG("evicting row "UUID_FMT" (%"PRIuSIZE" atoms)",
                  UUID_ARGS(&e->uuid), e->n_atoms);
-        cache->evictions++;
+        { uint64_t orig;
+          atomic_add_relaxed(&cache->evictions, 1, &orig); }
         ovsdb_row_cache_evict_entry__(cache, e);
     }
 
@@ -370,7 +383,8 @@ ovsdb_row_cache_scan_ring_evict__(struct ovsdb_row_cache *cache,
 
     cache->scan_ring.slots[ring_slot] = NULL;
     cache->scan_ring.count--;
-    cache->evictions++;
+    { uint64_t orig;
+      atomic_add_relaxed(&cache->evictions, 1, &orig); }
     ovsdb_row_cache_evict_entry__(cache, e);
 }
 
@@ -411,6 +425,7 @@ ovsdb_row_cache_create(size_t max_atoms)
     struct ovsdb_row_cache *cache;
 
     cache = xmalloc(sizeof *cache);
+    ovs_rwlock_init(&cache->rwlock);
     hmap_init(&cache->entries);
 
     cache->clock_buf = xcalloc(CLOCK_BUF_INIT_CAP,
@@ -425,9 +440,9 @@ ovsdb_row_cache_create(size_t max_atoms)
     cache->max_atoms = max_atoms;
     cache->total_atoms = 0;
     cache->n_entries = 0;
-    cache->hits = 0;
-    cache->misses = 0;
-    cache->evictions = 0;
+    atomic_init(&cache->hits, 0);
+    atomic_init(&cache->misses, 0);
+    atomic_init(&cache->evictions, 0);
     cache->iterating = 0;
     ovs_list_init(&cache->deferred_free);
 
@@ -459,6 +474,7 @@ ovsdb_row_cache_destroy(struct ovsdb_row_cache *cache)
 
     hmap_destroy(&cache->entries);
     free(cache->clock_buf);
+    ovs_rwlock_destroy(&cache->rwlock);
     free(cache);
 }
 
@@ -474,15 +490,19 @@ ovsdb_row_cache_lookup(struct ovsdb_row_cache *cache,
                        const struct uuid *uuid)
 {
     struct ovsdb_row_cache_entry *entry;
+    uint64_t orig;
 
+    ovs_rwlock_rdlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
         ovsdb_row_cache_touch__(entry);
-        cache->hits++;
+        atomic_add_relaxed(&cache->hits, 1, &orig);
+        ovs_rwlock_unlock(&cache->rwlock);
         return entry->row;
     }
 
-    cache->misses++;
+    atomic_add_relaxed(&cache->misses, 1, &orig);
+    ovs_rwlock_unlock(&cache->rwlock);
     return NULL;
 }
 
@@ -490,20 +510,10 @@ ovsdb_row_cache_lookup(struct ovsdb_row_cache *cache,
  * Insert / remove.
  * ------------------------------------------------------------------ */
 
-/* Inserts 'row' into 'cache' with an atom cost of 'n_atoms'.
- *
- * If a row with the same UUID is already present, the old entry is
- * removed first (its row is destroyed).  The cache takes ownership of
- * 'row'.
- *
- * After insertion, entries are evicted via clock-sweep until
- * total_atoms <= max_atoms.
- *
- * In bulk_read mode, the entry is placed in the scan ring instead
- * of the main clock buffer. */
-void
-ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
-                       struct ovsdb_row *row, size_t n_atoms)
+/* Internal insert, caller must hold wrlock. */
+static void
+ovsdb_row_cache_insert_locked__(struct ovsdb_row_cache *cache,
+                                struct ovsdb_row *row, size_t n_atoms)
 {
     struct ovsdb_row_cache_entry *old;
     struct ovsdb_row_cache_entry *entry;
@@ -549,11 +559,49 @@ ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
              "total=%"PRIuSIZE")",
              UUID_ARGS(uuid), n_atoms, cache->total_atoms);
 
-    /* Evict from main clock buffer if necessary.  Scan ring entries
-     * are managed separately (reused within the ring) and do not
-     * trigger eviction of main-cache entries. */
+    /* Evict from main clock buffer if necessary. */
     if (!cache->bulk_read) {
         ovsdb_row_cache_evict__(cache);
+    }
+}
+
+/* Inserts 'row' into 'cache' with an atom cost of 'n_atoms'.
+ *
+ * If a row with the same UUID is already present, the old entry is
+ * removed first (its row is destroyed).  The cache takes ownership of
+ * 'row'.
+ *
+ * After insertion, entries are evicted via clock-sweep until
+ * total_atoms <= max_atoms.
+ *
+ * In bulk_read mode, the entry is placed in the scan ring instead
+ * of the main clock buffer. */
+void
+ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
+                       struct ovsdb_row *row, size_t n_atoms)
+{
+    if (cache->iterating > 0) {
+        /* Called from a for_each callback — lock already held. */
+        ovsdb_row_cache_insert_locked__(cache, row, n_atoms);
+    } else {
+        ovs_rwlock_wrlock(&cache->rwlock);
+        ovsdb_row_cache_insert_locked__(cache, row, n_atoms);
+        ovs_rwlock_unlock(&cache->rwlock);
+    }
+}
+
+/* Internal remove, caller must hold wrlock. */
+static void
+ovsdb_row_cache_remove_locked__(struct ovsdb_row_cache *cache,
+                                const struct uuid *uuid)
+{
+    struct ovsdb_row_cache_entry *entry;
+
+    entry = ovsdb_row_cache_find__(cache, uuid);
+    if (entry) {
+        VLOG_DBG("removing row "UUID_FMT" (%"PRIuSIZE" atoms)",
+                 UUID_ARGS(uuid), entry->n_atoms);
+        ovsdb_row_cache_evict_entry__(cache, entry);
     }
 }
 
@@ -563,13 +611,12 @@ void
 ovsdb_row_cache_remove(struct ovsdb_row_cache *cache,
                        const struct uuid *uuid)
 {
-    struct ovsdb_row_cache_entry *entry;
-
-    entry = ovsdb_row_cache_find__(cache, uuid);
-    if (entry) {
-        VLOG_DBG("removing row "UUID_FMT" (%"PRIuSIZE" atoms)",
-                 UUID_ARGS(uuid), entry->n_atoms);
-        ovsdb_row_cache_evict_entry__(cache, entry);
+    if (cache->iterating > 0) {
+        ovsdb_row_cache_remove_locked__(cache, uuid);
+    } else {
+        ovs_rwlock_wrlock(&cache->rwlock);
+        ovsdb_row_cache_remove_locked__(cache, uuid);
+        ovs_rwlock_unlock(&cache->rwlock);
     }
 }
 
@@ -585,6 +632,7 @@ ovsdb_row_cache_pin(struct ovsdb_row_cache *cache,
 {
     struct ovsdb_row_cache_entry *entry;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
         if (!entry->pinned) {
@@ -595,6 +643,7 @@ ovsdb_row_cache_pin(struct ovsdb_row_cache *cache,
         VLOG_DBG("pin request for absent row "UUID_FMT,
                  UUID_ARGS(uuid));
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* Unpins the entry for 'uuid', allowing it to be evicted again.
@@ -608,6 +657,7 @@ ovsdb_row_cache_unpin(struct ovsdb_row_cache *cache,
 {
     struct ovsdb_row_cache_entry *entry;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
         if (entry->pinned) {
@@ -621,6 +671,7 @@ ovsdb_row_cache_unpin(struct ovsdb_row_cache *cache,
         VLOG_DBG("unpin request for absent row "UUID_FMT,
                  UUID_ARGS(uuid));
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* ------------------------------------------------------------------
@@ -633,7 +684,9 @@ ovsdb_row_cache_unpin(struct ovsdb_row_cache *cache,
 void
 ovsdb_row_cache_bulk_read_start(struct ovsdb_row_cache *cache)
 {
+    ovs_rwlock_wrlock(&cache->rwlock);
     cache->bulk_read = true;
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* Exits bulk-read mode and evicts all entries remaining in the
@@ -643,6 +696,7 @@ ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *cache)
 {
     uint32_t i;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     cache->bulk_read = false;
 
     for (i = 0; i < OVSDB_ROW_CACHE_SCAN_RING_SIZE; i++) {
@@ -650,6 +704,7 @@ ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *cache)
             ovsdb_row_cache_scan_ring_evict__(cache, i);
         }
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* ------------------------------------------------------------------
@@ -682,21 +737,27 @@ ovsdb_row_cache_count(const struct ovsdb_row_cache *cache)
 size_t
 ovsdb_row_cache_hits(const struct ovsdb_row_cache *cache)
 {
-    return cache->hits;
+    uint64_t val;
+    atomic_read_relaxed(&cache->hits, &val);
+    return (size_t) val;
 }
 
 /* Returns the number of cache misses (failed lookups). */
 size_t
 ovsdb_row_cache_misses(const struct ovsdb_row_cache *cache)
 {
-    return cache->misses;
+    uint64_t val;
+    atomic_read_relaxed(&cache->misses, &val);
+    return (size_t) val;
 }
 
 /* Returns the number of entries evicted from 'cache'. */
 size_t
 ovsdb_row_cache_evictions(const struct ovsdb_row_cache *cache)
 {
-    return cache->evictions;
+    uint64_t val;
+    atomic_read_relaxed(&cache->evictions, &val);
+    return (size_t) val;
 }
 
 /* Returns the number of scan ring slot reuses. */
@@ -716,6 +777,10 @@ ovsdb_row_cache_usage_histogram(const struct ovsdb_row_cache *cache,
     struct ovsdb_row_cache_entry *entry;
     int i;
 
+    /* Cast away const for rwlock — rdlock does not modify
+     * logical state. */
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+
     for (i = 0; i <= OVSDB_ROW_CACHE_MAX_USAGE; i++) {
         histogram[i] = 0;
     }
@@ -727,6 +792,8 @@ ovsdb_row_cache_usage_histogram(const struct ovsdb_row_cache *cache,
         }
         histogram[uc]++;
     }
+
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
 }
 
 /* ------------------------------------------------------------------
@@ -740,9 +807,13 @@ ovsdb_row_cache_get_state(struct ovsdb_row_cache *cache,
                           const struct uuid *uuid)
 {
     struct ovsdb_row_cache_entry *entry;
+    enum ovsdb_row_state result;
 
+    ovs_rwlock_rdlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
-    return entry ? entry->state : OVSDB_ROW_UNLOADED;
+    result = entry ? entry->state : OVSDB_ROW_UNLOADED;
+    ovs_rwlock_unlock(&cache->rwlock);
+    return result;
 }
 
 /* Sets the loading state of an existing cache entry for 'uuid'.
@@ -754,10 +825,12 @@ ovsdb_row_cache_set_state(struct ovsdb_row_cache *cache,
 {
     struct ovsdb_row_cache_entry *entry;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
         entry->state = state;
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* Records a load failure for 'uuid'.  Returns the new state. */
@@ -766,12 +839,16 @@ ovsdb_row_cache_record_load_failure(struct ovsdb_row_cache *cache,
                                     const struct uuid *uuid)
 {
     struct ovsdb_row_cache_entry *entry;
+    enum ovsdb_row_state result;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (!entry) {
+        ovs_rwlock_unlock(&cache->rwlock);
         return OVSDB_ROW_UNLOADED;
     }
     if (entry->state == OVSDB_ROW_ERROR) {
+        ovs_rwlock_unlock(&cache->rwlock);
         return OVSDB_ROW_ERROR;
     }
 
@@ -790,7 +867,9 @@ ovsdb_row_cache_record_load_failure(struct ovsdb_row_cache *cache,
         entry->state = OVSDB_ROW_UNLOADED;
         entry->retry_after = time_msec() + backoff_ms;
     }
-    return entry->state;
+    result = entry->state;
+    ovs_rwlock_unlock(&cache->rwlock);
+    return result;
 }
 
 /* Returns true if 'uuid' is in UNLOADED state and the backoff
@@ -800,12 +879,17 @@ ovsdb_row_cache_is_retry_ready(struct ovsdb_row_cache *cache,
                                const struct uuid *uuid)
 {
     struct ovsdb_row_cache_entry *entry;
+    bool result;
 
+    ovs_rwlock_rdlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (!entry || entry->state != OVSDB_ROW_UNLOADED) {
-        return false;
+        result = false;
+    } else {
+        result = time_msec() >= entry->retry_after;
     }
-    return time_msec() >= entry->retry_after;
+    ovs_rwlock_unlock(&cache->rwlock);
+    return result;
 }
 
 /* Returns true if the cache has any entries in UNLOADED or LOADING
@@ -814,14 +898,18 @@ bool
 ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *cache)
 {
     struct ovsdb_row_cache_entry *entry;
+    bool result = false;
 
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
     HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_UNLOADED
             || entry->state == OVSDB_ROW_LOADING) {
-            return true;
+            result = true;
+            break;
         }
     }
-    return false;
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    return result;
 }
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
@@ -835,6 +923,7 @@ ovsdb_row_cache_for_each_unloaded(
 {
     struct ovsdb_row_cache_entry *entry;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     cache->iterating++;
     HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_UNLOADED
@@ -847,6 +936,7 @@ ovsdb_row_cache_for_each_unloaded(
     if (--cache->iterating == 0) {
         ovsdb_row_cache_sweep_deferred__(cache);
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_CACHED.
@@ -865,6 +955,7 @@ ovsdb_row_cache_for_each_loaded(
 {
     struct ovsdb_row_cache_entry *entry;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     cache->iterating++;
     HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_CACHED && entry->row) {
@@ -876,6 +967,7 @@ ovsdb_row_cache_for_each_loaded(
     if (--cache->iterating == 0) {
         ovsdb_row_cache_sweep_deferred__(cache);
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* Registers a UUID in the cache as UNLOADED (no row data yet).
@@ -888,8 +980,10 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     struct ovsdb_row_cache_entry *entry;
     uint32_t slot;
 
+    ovs_rwlock_wrlock(&cache->rwlock);
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
+        ovs_rwlock_unlock(&cache->rwlock);
         return;
     }
 
@@ -912,4 +1006,5 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
     cache->n_entries++;
+    ovs_rwlock_unlock(&cache->rwlock);
 }

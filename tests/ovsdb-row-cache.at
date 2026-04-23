@@ -22,6 +22,12 @@ test_usage_histogram
 test_eviction_counter
 test_scan_ring_insert_replace
 test_clock_buffer_compaction
+test_concurrent_lookup
+test_concurrent_lookup_insert
+test_concurrent_insert_eviction
+test_concurrent_pin_unpin
+test_concurrent_bulk_read
+test_concurrent_stress
 test-row-cache: ok
 ])
 AT_CLEANUP

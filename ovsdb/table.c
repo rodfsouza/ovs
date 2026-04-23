@@ -683,16 +683,26 @@ ovsdb_table_query(struct ovsdb_table *table,
         }
     }
 
-    /* Step B: walk disk cursor if disk_store is present. */
+    /* Step B: walk disk cursor if disk_store is present.
+     *
+     * Bracket with bulk_read_start/end so that rows loaded from
+     * disk during a sequential scan go into the scan ring instead
+     * of evicting hot entries from the main clock buffer. */
     if (!table->disk_store) {
         return;
+    }
+
+    bool bulk_read_active = false;
+    if (table->cache) {
+        ovsdb_row_cache_bulk_read_start(table->cache);
+        bulk_read_active = true;
     }
 
     struct ovsdb_disk_store_cursor *cursor;
     cursor = ovsdb_disk_store_cursor_open(table->disk_store,
                                           table->schema->name);
     if (!cursor) {
-        return;
+        goto out;
     }
 
     struct ovsdb_row *disk_row;
@@ -717,7 +727,7 @@ ovsdb_table_query(struct ovsdb_table *table,
                     if (!cb(cached, aux)) {
                         ovsdb_row_destroy(disk_row);
                         ovsdb_disk_store_cursor_close(cursor);
-                        return;
+                        goto out;
                     }
                 }
                 ovsdb_row_destroy(disk_row);
@@ -744,11 +754,16 @@ ovsdb_table_query(struct ovsdb_table *table,
 
         if (!cont) {
             ovsdb_disk_store_cursor_close(cursor);
-            return;
+            goto out;
         }
     }
 
     ovsdb_disk_store_cursor_close(cursor);
+
+out:
+    if (bulk_read_active) {
+        ovsdb_row_cache_bulk_read_end(table->cache);
+    }
 }
 
 struct ovsdb_error *

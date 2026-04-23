@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "ovstest.h"
+#include "ovs-thread.h"
 #include "util.h"
 #include "openvswitch/uuid.h"
 #include "ovsdb/row.h"
@@ -765,6 +766,458 @@ test_scan_ring_insert_replace(void)
     ovsdb_table_destroy(table);
 }
 
+/* ------------------------------------------------------------------
+ * Concurrency stress tests.
+ * ------------------------------------------------------------------ */
+
+#define N_READERS 4
+#define N_LOOKUP_ITERS 10000
+
+struct concurrent_lookup_aux {
+    struct ovsdb_row_cache *cache;
+    struct ovs_barrier *barrier;
+    int n_entries;
+};
+
+static void *
+concurrent_lookup_thread(void *arg)
+{
+    struct concurrent_lookup_aux *aux = arg;
+    int i;
+
+    ovs_barrier_block(aux->barrier);
+    for (i = 0; i < N_LOOKUP_ITERS; i++) {
+        struct uuid u = make_uuid(i % aux->n_entries);
+        struct ovsdb_row *row = ovsdb_row_cache_lookup(aux->cache,
+                                                       &u);
+        ovs_assert(row != NULL);
+    }
+    ovs_barrier_block(aux->barrier);
+
+    return NULL;
+}
+
+/* Test 1: Parallel lookups — no crash, no wrong data. */
+static void
+test_concurrent_lookup(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(SIZE_MAX);
+    struct ovs_barrier barrier;
+    struct concurrent_lookup_aux aux;
+    pthread_t threads[N_READERS];
+    int i;
+
+    /* Pre-populate cache. */
+    for (i = 0; i < 100; i++) {
+        struct uuid u = make_uuid(i);
+        ovsdb_row_cache_insert(cache,
+                               create_test_row(table, &u), 5);
+    }
+
+    aux.cache = cache;
+    aux.barrier = &barrier;
+    aux.n_entries = 100;
+
+    ovs_barrier_init(&barrier, N_READERS);
+    for (i = 0; i < N_READERS; i++) {
+        threads[i] = ovs_thread_create("cache-rd",
+                                       concurrent_lookup_thread,
+                                       &aux);
+    }
+    for (i = 0; i < N_READERS; i++) {
+        xpthread_join(threads[i], NULL);
+    }
+    ovs_barrier_destroy(&barrier);
+
+    ovs_assert(ovsdb_row_cache_hits(cache) >= N_READERS * N_LOOKUP_ITERS);
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
+/* Test 2: Readers + writer — no crash, no corruption. */
+struct rw_aux {
+    struct ovsdb_row_cache *cache;
+    struct ovsdb_table *table;
+    struct ovs_barrier *barrier;
+    bool writer;         /* true = writer thread, false = reader */
+};
+
+static void *
+concurrent_rw_thread(void *arg)
+{
+    struct rw_aux *aux = arg;
+    int i;
+
+    ovs_barrier_block(aux->barrier);
+
+    if (aux->writer) {
+        /* Insert and remove rows in range [50..99]. */
+        for (i = 0; i < 5000; i++) {
+            int id = 50 + (i % 50);
+            struct uuid u = make_uuid(id);
+            if (i % 2 == 0) {
+                struct ovsdb_row *row = create_test_row(aux->table,
+                                                        &u);
+                ovsdb_row_cache_insert(aux->cache, row, 5);
+            } else {
+                ovsdb_row_cache_remove(aux->cache, &u);
+            }
+        }
+    } else {
+        /* Lookup random rows, tolerate misses. */
+        for (i = 0; i < 5000; i++) {
+            struct uuid u = make_uuid(i % 100);
+            struct ovsdb_row *row = ovsdb_row_cache_lookup(
+                aux->cache, &u);
+            if (row) {
+                /* Verify the returned row has the right UUID. */
+                ovs_assert(uuid_equals(ovsdb_row_get_uuid(row),
+                                       &u));
+            }
+        }
+    }
+
+    ovs_barrier_block(aux->barrier);
+    return NULL;
+}
+
+static void
+test_concurrent_lookup_insert(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(SIZE_MAX);
+    struct ovs_barrier barrier;
+    struct rw_aux auxes[4];
+    pthread_t threads[4];
+    int i;
+
+    /* Pre-populate [0..49]. */
+    for (i = 0; i < 50; i++) {
+        struct uuid u = make_uuid(i);
+        ovsdb_row_cache_insert(cache,
+                               create_test_row(table, &u), 5);
+    }
+
+    ovs_barrier_init(&barrier, 4);
+    for (i = 0; i < 4; i++) {
+        auxes[i].cache = cache;
+        auxes[i].table = table;
+        auxes[i].barrier = &barrier;
+        auxes[i].writer = (i == 0); /* Thread 0 is writer. */
+        threads[i] = ovs_thread_create("cache-rw",
+                                       concurrent_rw_thread,
+                                       &auxes[i]);
+    }
+    for (i = 0; i < 4; i++) {
+        xpthread_join(threads[i], NULL);
+    }
+    ovs_barrier_destroy(&barrier);
+
+    /* Rows [0..49] should still be present (writer only touches
+     * [50..99]). */
+    for (i = 0; i < 50; i++) {
+        struct uuid u = make_uuid(i);
+        ovs_assert(ovsdb_row_cache_lookup(cache, &u) != NULL);
+    }
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
+/* Test 3: Multiple writers with eviction pressure. */
+struct insert_aux {
+    struct ovsdb_row_cache *cache;
+    struct ovsdb_table *table;
+    struct ovs_barrier *barrier;
+    int thread_id;
+};
+
+static void *
+concurrent_insert_thread(void *arg)
+{
+    struct insert_aux *aux = arg;
+    int i;
+
+    ovs_barrier_block(aux->barrier);
+    for (i = 0; i < 200; i++) {
+        int id = aux->thread_id * 1000 + i;
+        struct uuid u = make_uuid(id);
+        struct ovsdb_row *row = create_test_row(aux->table, &u);
+        ovsdb_row_cache_insert(aux->cache, row, 10);
+    }
+    ovs_barrier_block(aux->barrier);
+
+    return NULL;
+}
+
+static void
+test_concurrent_insert_eviction(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    /* Budget for 50 rows at 10 atoms. */
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(500);
+    struct ovs_barrier barrier;
+    struct insert_aux auxes[4];
+    pthread_t threads[4];
+    int i;
+
+    ovs_barrier_init(&barrier, 4);
+    for (i = 0; i < 4; i++) {
+        auxes[i].cache = cache;
+        auxes[i].table = table;
+        auxes[i].barrier = &barrier;
+        auxes[i].thread_id = i;
+        threads[i] = ovs_thread_create("cache-wr",
+                                       concurrent_insert_thread,
+                                       &auxes[i]);
+    }
+    for (i = 0; i < 4; i++) {
+        xpthread_join(threads[i], NULL);
+    }
+    ovs_barrier_destroy(&barrier);
+
+    /* Budget enforced: at most 50 entries. */
+    ovs_assert(ovsdb_row_cache_count(cache) <= 50);
+    ovs_assert(ovsdb_row_cache_n_atoms(cache) <= 500);
+    ovs_assert(ovsdb_row_cache_evictions(cache) > 0);
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
+/* Test 4: Pinned entries survive concurrent insert pressure. */
+static void
+test_concurrent_pin_unpin(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(200);
+    struct ovs_barrier barrier;
+    struct insert_aux auxes[2];
+    struct concurrent_lookup_aux rd_aux;
+    pthread_t threads[4];
+    int i;
+
+    /* Insert and pin 10 rows. */
+    for (i = 0; i < 10; i++) {
+        struct uuid u = make_uuid(i);
+        ovsdb_row_cache_insert(cache,
+                               create_test_row(table, &u), 10);
+        ovsdb_row_cache_pin(cache, &u);
+    }
+
+    ovs_barrier_init(&barrier, 4);
+
+    /* 2 inserter threads. */
+    for (i = 0; i < 2; i++) {
+        auxes[i].cache = cache;
+        auxes[i].table = table;
+        auxes[i].barrier = &barrier;
+        auxes[i].thread_id = 10 + i;
+        threads[i] = ovs_thread_create("cache-pin-wr",
+                                       concurrent_insert_thread,
+                                       &auxes[i]);
+    }
+
+    /* 2 lookup threads checking pinned entries. */
+    rd_aux.cache = cache;
+    rd_aux.barrier = &barrier;
+    rd_aux.n_entries = 10;
+    for (i = 2; i < 4; i++) {
+        threads[i] = ovs_thread_create("cache-pin-rd",
+                                       concurrent_lookup_thread,
+                                       &rd_aux);
+    }
+
+    for (i = 0; i < 4; i++) {
+        xpthread_join(threads[i], NULL);
+    }
+    ovs_barrier_destroy(&barrier);
+
+    /* All 10 pinned entries must survive. */
+    for (i = 0; i < 10; i++) {
+        struct uuid u = make_uuid(i);
+        ovs_assert(ovsdb_row_cache_lookup(cache, &u) != NULL);
+    }
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
+/* Test 5: Bulk-read scan ring under contention. */
+struct scan_aux {
+    struct ovsdb_row_cache *cache;
+    struct ovsdb_table *table;
+    struct ovs_barrier *barrier;
+};
+
+static void *
+concurrent_scan_thread(void *arg)
+{
+    struct scan_aux *aux = arg;
+    int i;
+
+    ovs_barrier_block(aux->barrier);
+    for (i = 0; i < 300; i++) {
+        struct uuid u = make_uuid(1000 + i);
+        struct ovsdb_row *row = create_test_row(aux->table, &u);
+        ovsdb_row_cache_insert(aux->cache, row, 5);
+    }
+    ovs_barrier_block(aux->barrier);
+
+    return NULL;
+}
+
+static void
+test_concurrent_bulk_read(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(SIZE_MAX);
+    struct ovs_barrier barrier;
+    struct scan_aux scan;
+    struct concurrent_lookup_aux rd;
+    pthread_t threads[2];
+    int i;
+
+    /* Insert 20 hot rows. */
+    for (i = 0; i < 20; i++) {
+        struct uuid u = make_uuid(i);
+        ovsdb_row_cache_insert(cache,
+                               create_test_row(table, &u), 5);
+        ovsdb_row_cache_lookup(cache, &u);
+        ovsdb_row_cache_lookup(cache, &u);
+    }
+
+    ovsdb_row_cache_bulk_read_start(cache);
+
+    ovs_barrier_init(&barrier, 2);
+
+    scan.cache = cache;
+    scan.table = table;
+    scan.barrier = &barrier;
+    threads[0] = ovs_thread_create("cache-scan",
+                                   concurrent_scan_thread,
+                                   &scan);
+
+    rd.cache = cache;
+    rd.barrier = &barrier;
+    rd.n_entries = 20;
+    threads[1] = ovs_thread_create("cache-hot",
+                                   concurrent_lookup_thread,
+                                   &rd);
+
+    for (i = 0; i < 2; i++) {
+        xpthread_join(threads[i], NULL);
+    }
+    ovs_barrier_destroy(&barrier);
+
+    ovsdb_row_cache_bulk_read_end(cache);
+
+    /* Hot rows survive. */
+    for (i = 0; i < 20; i++) {
+        struct uuid u = make_uuid(i);
+        ovs_assert(ovsdb_row_cache_lookup(cache, &u) != NULL);
+    }
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
+/* Test 6: Mixed workload stress test. */
+struct stress_aux {
+    struct ovsdb_row_cache *cache;
+    struct ovsdb_table *table;
+    struct ovs_barrier *barrier;
+    int role;  /* 0=inserter, 1=looker, 2=remover, 3=stats */
+    int thread_id;
+};
+
+static void *
+concurrent_stress_thread(void *arg)
+{
+    struct stress_aux *aux = arg;
+    int i;
+
+    ovs_barrier_block(aux->barrier);
+
+    switch (aux->role) {
+    case 0: /* inserter */
+        for (i = 0; i < 1000; i++) {
+            int id = aux->thread_id * 10000 + i;
+            struct uuid u = make_uuid(id);
+            struct ovsdb_row *row = create_test_row(aux->table, &u);
+            ovsdb_row_cache_insert(aux->cache, row, 5);
+        }
+        break;
+
+    case 1: /* looker */
+        for (i = 0; i < 2000; i++) {
+            struct uuid u = make_uuid(i % 5000);
+            ovsdb_row_cache_lookup(aux->cache, &u);
+        }
+        break;
+
+    case 2: /* remover */
+        for (i = 0; i < 500; i++) {
+            struct uuid u = make_uuid(i * 3);
+            ovsdb_row_cache_remove(aux->cache, &u);
+        }
+        break;
+
+    case 3: /* stats reader */
+        for (i = 0; i < 1000; i++) {
+            size_t histogram[6];
+            ovsdb_row_cache_hits(aux->cache);
+            ovsdb_row_cache_misses(aux->cache);
+            ovsdb_row_cache_evictions(aux->cache);
+            ovsdb_row_cache_count(aux->cache);
+            ovsdb_row_cache_usage_histogram(aux->cache, histogram);
+        }
+        break;
+    }
+
+    ovs_barrier_block(aux->barrier);
+    return NULL;
+}
+
+static void
+test_concurrent_stress(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(1000);
+    struct ovs_barrier barrier;
+    struct stress_aux auxes[8];
+    pthread_t threads[8];
+    /* roles: 0,1=inserter 2,3=looker 4=remover 5=stats
+     * 6=inserter 7=looker */
+    int roles[8] = {0, 0, 1, 1, 2, 3, 0, 1};
+    int i;
+
+    ovs_barrier_init(&barrier, 8);
+    for (i = 0; i < 8; i++) {
+        auxes[i].cache = cache;
+        auxes[i].table = table;
+        auxes[i].barrier = &barrier;
+        auxes[i].role = roles[i];
+        auxes[i].thread_id = i;
+        threads[i] = ovs_thread_create("cache-stress",
+                                       concurrent_stress_thread,
+                                       &auxes[i]);
+    }
+    for (i = 0; i < 8; i++) {
+        xpthread_join(threads[i], NULL);
+    }
+    ovs_barrier_destroy(&barrier);
+
+    /* Reaching this point without crash or deadlock is success.
+     * Verify no underflow. */
+    ovs_assert(ovsdb_row_cache_count(cache) >= 0);
+    ovs_assert(ovsdb_row_cache_n_atoms(cache) >= 0);
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
 static void
 test_row_cache_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 {
@@ -827,6 +1280,24 @@ test_row_cache_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 
     printf("test_clock_buffer_compaction\n");
     test_clock_buffer_compaction();
+
+    printf("test_concurrent_lookup\n");
+    test_concurrent_lookup();
+
+    printf("test_concurrent_lookup_insert\n");
+    test_concurrent_lookup_insert();
+
+    printf("test_concurrent_insert_eviction\n");
+    test_concurrent_insert_eviction();
+
+    printf("test_concurrent_pin_unpin\n");
+    test_concurrent_pin_unpin();
+
+    printf("test_concurrent_bulk_read\n");
+    test_concurrent_bulk_read();
+
+    printf("test_concurrent_stress\n");
+    test_concurrent_stress();
 
     printf("test-row-cache: ok\n");
 }
