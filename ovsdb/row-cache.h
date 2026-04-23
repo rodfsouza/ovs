@@ -17,11 +17,16 @@
 #define OVSDB_ROW_CACHE_H 1
 
 #include <stddef.h>
+#include <stdbool.h>
 #include "compiler.h"
 #include "openvswitch/uuid.h"
 
 struct ovsdb_row;
 struct ovsdb_row_cache;
+
+/* Clock-sweep constants. */
+#define OVSDB_ROW_CACHE_MAX_USAGE 5
+#define OVSDB_ROW_CACHE_SCAN_RING_SIZE 256
 
 /* Row loading state for lazy-load (Phase 2). */
 enum ovsdb_row_state {
@@ -79,7 +84,7 @@ bool ovsdb_row_cache_is_retry_ready(struct ovsdb_row_cache *,
 bool ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *);
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
- * Does not modify entry state — caller is responsible for transitions.
+ * Does not modify entry state -- caller is responsible for transitions.
  * Stops early if 'cb' returns false. */
 void ovsdb_row_cache_for_each_unloaded(
     struct ovsdb_row_cache *,
@@ -96,11 +101,19 @@ void ovsdb_row_cache_for_each_loaded(
     bool (*cb)(const struct ovsdb_row *row, void *aux),
     void *aux);
 
+/* Bulk-read mode (scan ring). */
+void ovsdb_row_cache_bulk_read_start(struct ovsdb_row_cache *);
+void ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *);
+
 /* Stats. */
 size_t ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_count(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_hits(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_misses(const struct ovsdb_row_cache *);
+size_t ovsdb_row_cache_evictions(const struct ovsdb_row_cache *);
+size_t ovsdb_row_cache_scan_reuse(const struct ovsdb_row_cache *);
+void ovsdb_row_cache_usage_histogram(const struct ovsdb_row_cache *,
+                                     size_t histogram[/*6*/]);
 
 #endif /* ovsdb/row-cache.h */

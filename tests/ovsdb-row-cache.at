@@ -2,6 +2,26 @@ AT_BANNER([OVSDB -- row cache unit tests])
 
 AT_SETUP([row cache - C unit tests])
 AT_KEYWORDS([ovsdb row-cache])
-AT_CHECK([ovstest test-row-cache], [0], [test-row-cache: ok
+AT_CHECK([ovstest test-row-cache], [0], [test_basic_insert_lookup
+test_eviction_by_atoms
+test_pin_prevents_eviction
+test_unpin_allows_eviction
+test_remove
+test_stats
+test_zero_budget
+test_unlimited
+test_destroy_with_rows
+test_state_tracker
+test_pin_unpin_lifecycle
+test_row_count_atoms
+test_clock_sweep_usage_count
+test_clock_sweep_all_pinned
+test_scan_ring_isolation
+test_scan_ring_reuse
+test_usage_histogram
+test_eviction_counter
+test_scan_ring_insert_replace
+test_clock_buffer_compaction
+test-row-cache: ok
 ])
 AT_CLEANUP

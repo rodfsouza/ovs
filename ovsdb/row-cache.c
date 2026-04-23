@@ -29,10 +29,19 @@
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_row_cache);
 
-/* A single cached row, stored inside the cache's hmap and LRU list. */
+/* Initial capacity of the clock buffer (must be power of 2). */
+#define CLOCK_BUF_INIT_CAP 64
+
+/* A single cached row, stored inside the cache's hmap and clock buffer.
+ *
+ * Clock-sweep replacement: each entry has a 'usage_count' (0 to
+ * MAX_USAGE_COUNT).  On lookup the count is incremented; on eviction
+ * sweep the clock hand decrements non-zero counts and evicts entries
+ * whose count reaches zero. */
 struct ovsdb_row_cache_entry {
     struct hmap_node hmap_node;   /* In cache->entries, hashed by UUID. */
-    struct ovs_list lru_node;     /* In cache->lru list. */
+    struct ovs_list deferred_node; /* In cache->deferred_free when
+                                    * iterating > 0. */
     struct uuid uuid;             /* Row UUID (copy for fast compare). */
     struct ovsdb_row *row;        /* Owned by the cache; NULL if not yet
                                    * loaded (UNLOADED or LOADING state). */
@@ -42,32 +51,63 @@ struct ovsdb_row_cache_entry {
     uint8_t load_failures;        /* Consecutive load failure count. */
     long long int retry_after;    /* time_msec() before which no retry
                                    * should be attempted (backoff). */
+
+    /* Clock-sweep fields. */
+    uint8_t usage_count;          /* Access frequency, 0..MAX_USAGE. */
+    uint32_t clock_slot;          /* Index in cache->clock_buf. */
+    bool in_scan_ring;            /* True if entry lives in scan ring. */
 };
 
-/* An LRU cache of ovsdb_row objects, bounded by a maximum atom count.
+/* Scan ring: fixed-size circular buffer for bulk-read mode.
  *
- * Rows may be "pinned" to prevent eviction.  When the total atom count
- * exceeds 'max_atoms', the least-recently-used unpinned entry is
- * evicted.  If every remaining entry is pinned, eviction stops and the
- * cache is allowed to exceed the limit temporarily.
+ * When bulk_read is active, inserts go into the ring instead of the
+ * main clock buffer.  Ring entries have usage_count capped at 1 and
+ * are never promoted to the main cache, preventing sequential scans
+ * from evicting hot working-set entries. */
+struct ovsdb_row_cache_scan_ring {
+    struct ovsdb_row_cache_entry *slots[OVSDB_ROW_CACHE_SCAN_RING_SIZE];
+    uint32_t head;                /* Next slot to write into. */
+    size_t count;                 /* Number of occupied slots. */
+    size_t reuse_count;           /* Metric: times a slot was reused. */
+};
+
+/* A clock-sweep cache of ovsdb_row objects, bounded by a maximum
+ * atom count.
+ *
+ * Rows may be "pinned" to prevent eviction.  When the total atom
+ * count exceeds 'max_atoms', the clock hand sweeps the buffer:
+ * entries with usage_count > 0 get decremented; entries at zero
+ * are evicted.  If every remaining entry is pinned, eviction stops
+ * and the cache is allowed to exceed the limit temporarily.
  *
  * Re-entrancy safety:  The for_each_loaded() and for_each_unloaded()
  * functions iterate the hmap with HMAP_FOR_EACH_SAFE.  If a
- * callback triggers insert or remove (e.g., via transaction commit
- * or sync load fallback), evict_entry__() defers both hmap_remove
- * and free to a 'deferred_free' list while the 'iterating' depth
- * counter is positive.  Deferred entries are marked dead
- * (state=ERROR, row=NULL) but kept in the hmap chain so the
- * iterator's pre-fetched next pointer stays valid.  The deferred
- * entries are swept after the outermost iteration completes. */
+ * callback triggers insert or remove, evict_entry__() defers both
+ * hmap_remove and free to a 'deferred_free' list while the
+ * 'iterating' depth counter is positive.  Deferred entries are
+ * marked dead (state=ERROR, row=NULL) but kept in the hmap chain
+ * so the iterator's pre-fetched next pointer stays valid.  The
+ * deferred entries are swept after the outermost iteration
+ * completes. */
 struct ovsdb_row_cache {
     struct hmap entries;          /* Contains ovsdb_row_cache_entry. */
-    struct ovs_list lru;          /* LRU list, least-recent at front. */
+
+    /* Clock-sweep buffer (replaces LRU list). */
+    struct ovsdb_row_cache_entry **clock_buf; /* Flat slot array. */
+    size_t clock_cap;             /* Allocated capacity. */
+    size_t clock_len;             /* Number of occupied slots. */
+    uint32_t clock_hand;          /* Next slot to examine. */
+
+    /* Scan ring for bulk-read mode. */
+    struct ovsdb_row_cache_scan_ring scan_ring;
+    bool bulk_read;               /* True when in BULK_READ mode. */
+
     size_t max_atoms;             /* Soft atom budget. */
     size_t total_atoms;           /* Sum of n_atoms for all entries. */
     size_t n_entries;             /* Number of entries in the cache. */
     size_t hits;                  /* Number of successful lookups. */
     size_t misses;                /* Number of failed lookups. */
+    size_t evictions;             /* Number of evicted entries. */
 
     /* Re-entrancy guard for safe iteration. */
     int iterating;                /* Nesting depth of for_each_* calls. */
@@ -94,13 +134,17 @@ ovsdb_row_cache_find__(const struct ovsdb_row_cache *cache,
     return NULL;
 }
 
-/* Promotes 'entry' to the most-recently-used position (back of LRU). */
+/* Increments 'entry->usage_count', capped at MAX_USAGE_COUNT.
+ * For scan-ring entries, the cap is 1 to prevent promotion. */
 static void
-ovsdb_row_cache_touch__(struct ovsdb_row_cache *cache,
-                        struct ovsdb_row_cache_entry *entry)
+ovsdb_row_cache_touch__(struct ovsdb_row_cache_entry *entry)
 {
-    ovs_list_remove(&entry->lru_node);
-    ovs_list_push_back(&cache->lru, &entry->lru_node);
+    uint8_t cap = entry->in_scan_ring
+                  ? 1
+                  : OVSDB_ROW_CACHE_MAX_USAGE;
+    if (entry->usage_count < cap) {
+        entry->usage_count++;
+    }
 }
 
 /* Sweeps entries on the deferred_free list, completing their removal
@@ -113,10 +157,25 @@ ovsdb_row_cache_sweep_deferred__(struct ovsdb_row_cache *cache)
 
     while (!ovs_list_is_empty(&cache->deferred_free)) {
         entry = CONTAINER_OF(ovs_list_pop_front(&cache->deferred_free),
-                             struct ovsdb_row_cache_entry, lru_node);
+                             struct ovsdb_row_cache_entry,
+                             deferred_node);
         hmap_remove(&cache->entries, &entry->hmap_node);
         /* Row was already destroyed in evict_entry__. */
         free(entry);
+    }
+}
+
+/* Clears the scan ring slot for 'entry'.  Uses entry->clock_slot
+ * which stores the ring index when in_scan_ring is true. */
+static void
+ovsdb_row_cache_clear_scan_ring_slot__(struct ovsdb_row_cache *cache,
+                                       struct ovsdb_row_cache_entry *entry)
+{
+    uint32_t slot = entry->clock_slot;
+    if (slot < OVSDB_ROW_CACHE_SCAN_RING_SIZE
+        && cache->scan_ring.slots[slot] == entry) {
+        cache->scan_ring.slots[slot] = NULL;
+        cache->scan_ring.count--;
     }
 }
 
@@ -138,20 +197,27 @@ ovsdb_row_cache_evict_entry__(struct ovsdb_row_cache *cache,
     cache->total_atoms -= entry->n_atoms;
     cache->n_entries--;
 
+    /* Remove from clock buffer or scan ring. */
+    if (entry->in_scan_ring) {
+        ovsdb_row_cache_clear_scan_ring_slot__(cache, entry);
+    } else if (entry->clock_slot < cache->clock_cap) {
+        cache->clock_buf[entry->clock_slot] = NULL;
+        cache->clock_len--;
+    }
+
     if (cache->iterating > 0) {
         /* Defer both hmap_remove and free.  Destroy the row now
          * to release memory, but keep the entry in the hmap so
          * the iterator's bucket chain stays valid. */
-        ovs_list_remove(&entry->lru_node);
         if (entry->row) {
             ovsdb_row_destroy(entry->row);
             entry->row = NULL;
         }
         entry->n_atoms = 0;
         entry->state = OVSDB_ROW_ERROR; /* Mark dead for iterators. */
-        ovs_list_push_back(&cache->deferred_free, &entry->lru_node);
+        ovs_list_push_back(&cache->deferred_free,
+                           &entry->deferred_node);
     } else {
-        ovs_list_remove(&entry->lru_node);
         hmap_remove(&cache->entries, &entry->hmap_node);
         if (entry->row) {
             ovsdb_row_destroy(entry->row);
@@ -160,25 +226,176 @@ ovsdb_row_cache_evict_entry__(struct ovsdb_row_cache *cache,
     }
 }
 
-/* Evicts unpinned entries starting from the least-recently-used end
- * until total_atoms <= max_atoms or only pinned entries remain. */
+/* Finds a free slot in clock_buf, growing the buffer if necessary.
+ * Returns the slot index. */
+static uint32_t
+ovsdb_row_cache_alloc_slot__(struct ovsdb_row_cache *cache)
+{
+    uint32_t i;
+
+    /* Grow if needed.  Shrinking is handled by compact__(). */
+    if (cache->clock_len >= cache->clock_cap) {
+        size_t new_cap = cache->clock_cap * 2;
+        struct ovsdb_row_cache_entry **new_buf;
+        new_buf = xcalloc(new_cap, sizeof *new_buf);
+        memcpy(new_buf, cache->clock_buf,
+               cache->clock_cap * sizeof *new_buf);
+        free(cache->clock_buf);
+        cache->clock_buf = new_buf;
+        /* Return first slot in newly extended region. */
+        i = cache->clock_cap;
+        cache->clock_cap = new_cap;
+        return i;
+    }
+
+    /* Scan for a NULL slot starting at clock_hand. */
+    for (i = 0; i < cache->clock_cap; i++) {
+        uint32_t slot = (cache->clock_hand + i) % cache->clock_cap;
+        if (!cache->clock_buf[slot]) {
+            return slot;
+        }
+    }
+
+    /* Should not be reached (we grow above). */
+    OVS_NOT_REACHED();
+}
+
+/* Shrinks clock_buf when utilization drops below one quarter to
+ * reduce memory waste and sweep overhead.  Packs entries densely
+ * at the front of the new buffer and updates their clock_slot.
+ * Must not be called during iteration (deferred entries hold
+ * stale slot indices). */
+static void
+ovsdb_row_cache_compact__(struct ovsdb_row_cache *cache)
+{
+    size_t new_cap;
+    struct ovsdb_row_cache_entry **new_buf;
+    uint32_t dst = 0;
+    uint32_t i;
+
+    if (cache->iterating > 0
+        || cache->clock_cap <= CLOCK_BUF_INIT_CAP
+        || cache->clock_len >= cache->clock_cap / 4) {
+        return;
+    }
+
+    new_cap = cache->clock_cap / 2;
+    while (new_cap > CLOCK_BUF_INIT_CAP
+           && cache->clock_len < new_cap / 4) {
+        new_cap /= 2;
+    }
+
+    new_buf = xcalloc(new_cap, sizeof *new_buf);
+    for (i = 0; i < cache->clock_cap; i++) {
+        if (cache->clock_buf[i]) {
+            cache->clock_buf[i]->clock_slot = dst;
+            new_buf[dst++] = cache->clock_buf[i];
+        }
+    }
+
+    free(cache->clock_buf);
+    cache->clock_buf = new_buf;
+    cache->clock_cap = new_cap;
+    cache->clock_hand = dst % new_cap;
+}
+
+/* Clock-sweep eviction: sweeps the clock buffer, decrementing
+ * usage_count for non-zero entries and evicting zero-count entries
+ * until total_atoms <= max_atoms or all remaining entries are
+ * pinned.
+ *
+ * The sweep allows up to (MAX_USAGE + 2) full revolutions so that
+ * even entries at maximum usage_count can be decremented to zero
+ * and evicted. */
 static void
 ovsdb_row_cache_evict__(struct ovsdb_row_cache *cache)
 {
-    struct ovsdb_row_cache_entry *entry;
+    size_t max_steps;
+    size_t steps = 0;
 
-    LIST_FOR_EACH_SAFE (entry, lru_node, &cache->lru) {
-        if (cache->total_atoms <= cache->max_atoms) {
-            break;
+    /* Hard limit: enough revolutions to drain MAX_USAGE, plus margin. */
+    max_steps = (OVSDB_ROW_CACHE_MAX_USAGE + 2)
+                * (cache->clock_cap ? cache->clock_cap : 1);
+
+    while (cache->total_atoms > cache->max_atoms
+           && cache->clock_len > 0
+           && steps < max_steps) {
+        struct ovsdb_row_cache_entry *e;
+        uint32_t slot = cache->clock_hand;
+
+        cache->clock_hand = (slot + 1) % cache->clock_cap;
+        steps++;
+
+        e = cache->clock_buf[slot];
+        if (!e) {
+            continue; /* Empty slot. */
         }
-        if (entry->pinned) {
+
+        if (e->pinned) {
             continue;
         }
 
+        if (e->usage_count > 0) {
+            e->usage_count--;
+            continue;
+        }
+
+        /* usage_count == 0, not pinned -> evict. */
         VLOG_DBG("evicting row "UUID_FMT" (%"PRIuSIZE" atoms)",
-                 UUID_ARGS(&entry->uuid), entry->n_atoms);
-        ovsdb_row_cache_evict_entry__(cache, entry);
+                 UUID_ARGS(&e->uuid), e->n_atoms);
+        cache->evictions++;
+        ovsdb_row_cache_evict_entry__(cache, e);
     }
+
+    /* Shrink buffer if utilization dropped. */
+    ovsdb_row_cache_compact__(cache);
+}
+
+/* ------------------------------------------------------------------
+ * Scan ring helpers.
+ * ------------------------------------------------------------------ */
+
+/* Evicts a scan ring entry, removing it from the ring slot and
+ * the main hmap. */
+static void
+ovsdb_row_cache_scan_ring_evict__(struct ovsdb_row_cache *cache,
+                                  uint32_t ring_slot)
+{
+    struct ovsdb_row_cache_entry *e;
+
+    e = cache->scan_ring.slots[ring_slot];
+    if (!e) {
+        return;
+    }
+
+    cache->scan_ring.slots[ring_slot] = NULL;
+    cache->scan_ring.count--;
+    cache->evictions++;
+    ovsdb_row_cache_evict_entry__(cache, e);
+}
+
+/* Inserts 'entry' into the scan ring instead of the main clock
+ * buffer.  If the target ring slot is occupied, the old entry is
+ * evicted first. */
+static void
+ovsdb_row_cache_scan_ring_insert__(struct ovsdb_row_cache *cache,
+                                   struct ovsdb_row_cache_entry *entry)
+{
+    uint32_t slot;
+
+    slot = cache->scan_ring.head % OVSDB_ROW_CACHE_SCAN_RING_SIZE;
+
+    if (cache->scan_ring.slots[slot]) {
+        ovsdb_row_cache_scan_ring_evict__(cache, slot);
+        cache->scan_ring.reuse_count++;
+    }
+
+    entry->in_scan_ring = true;
+    entry->usage_count = 0;
+    entry->clock_slot = slot; /* Ring index (not clock_buf index). */
+    cache->scan_ring.slots[slot] = entry;
+    cache->scan_ring.count++;
+    cache->scan_ring.head++;
 }
 
 /* ------------------------------------------------------------------
@@ -195,12 +412,22 @@ ovsdb_row_cache_create(size_t max_atoms)
 
     cache = xmalloc(sizeof *cache);
     hmap_init(&cache->entries);
-    ovs_list_init(&cache->lru);
+
+    cache->clock_buf = xcalloc(CLOCK_BUF_INIT_CAP,
+                               sizeof *cache->clock_buf);
+    cache->clock_cap = CLOCK_BUF_INIT_CAP;
+    cache->clock_len = 0;
+    cache->clock_hand = 0;
+
+    memset(&cache->scan_ring, 0, sizeof cache->scan_ring);
+    cache->bulk_read = false;
+
     cache->max_atoms = max_atoms;
     cache->total_atoms = 0;
     cache->n_entries = 0;
     cache->hits = 0;
     cache->misses = 0;
+    cache->evictions = 0;
     cache->iterating = 0;
     ovs_list_init(&cache->deferred_free);
 
@@ -231,6 +458,7 @@ ovsdb_row_cache_destroy(struct ovsdb_row_cache *cache)
     }
 
     hmap_destroy(&cache->entries);
+    free(cache->clock_buf);
     free(cache);
 }
 
@@ -239,9 +467,8 @@ ovsdb_row_cache_destroy(struct ovsdb_row_cache *cache)
  * ------------------------------------------------------------------ */
 
 /* Looks up the cached row for 'uuid'.  Returns the row on a cache hit
- * (and promotes it to the most-recently-used position) or NULL on a
- * miss.  The returned row is still owned by the cache; the caller must
- * not free it. */
+ * (and increments its usage_count) or NULL on a miss.  The returned
+ * row is still owned by the cache; the caller must not free it. */
 struct ovsdb_row *
 ovsdb_row_cache_lookup(struct ovsdb_row_cache *cache,
                        const struct uuid *uuid)
@@ -250,7 +477,7 @@ ovsdb_row_cache_lookup(struct ovsdb_row_cache *cache,
 
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
-        ovsdb_row_cache_touch__(cache, entry);
+        ovsdb_row_cache_touch__(entry);
         cache->hits++;
         return entry->row;
     }
@@ -269,8 +496,11 @@ ovsdb_row_cache_lookup(struct ovsdb_row_cache *cache,
  * removed first (its row is destroyed).  The cache takes ownership of
  * 'row'.
  *
- * After insertion, unpinned entries are evicted from the
- * least-recently-used end until total_atoms <= max_atoms. */
+ * After insertion, entries are evicted via clock-sweep until
+ * total_atoms <= max_atoms.
+ *
+ * In bulk_read mode, the entry is placed in the scan ring instead
+ * of the main clock buffer. */
 void
 ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
                        struct ovsdb_row *row, size_t n_atoms)
@@ -297,9 +527,21 @@ ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
     entry->load_failures = 0;
     entry->retry_after = 0;
 
+    if (cache->bulk_read) {
+        /* Route to scan ring. */
+        ovsdb_row_cache_scan_ring_insert__(cache, entry);
+    } else {
+        /* Place in clock buffer. */
+        uint32_t slot = ovsdb_row_cache_alloc_slot__(cache);
+        entry->usage_count = 1;
+        entry->in_scan_ring = false;
+        entry->clock_slot = slot;
+        cache->clock_buf[slot] = entry;
+        cache->clock_len++;
+    }
+
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
-    ovs_list_push_back(&cache->lru, &entry->lru_node);
     cache->total_atoms += n_atoms;
     cache->n_entries++;
 
@@ -307,8 +549,12 @@ ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
              "total=%"PRIuSIZE")",
              UUID_ARGS(uuid), n_atoms, cache->total_atoms);
 
-    /* Evict if necessary. */
-    ovsdb_row_cache_evict__(cache);
+    /* Evict from main clock buffer if necessary.  Scan ring entries
+     * are managed separately (reused within the ring) and do not
+     * trigger eviction of main-cache entries. */
+    if (!cache->bulk_read) {
+        ovsdb_row_cache_evict__(cache);
+    }
 }
 
 /* Removes the cached entry for 'uuid', destroying its row.
@@ -367,11 +613,42 @@ ovsdb_row_cache_unpin(struct ovsdb_row_cache *cache,
         if (entry->pinned) {
             entry->pinned = false;
             VLOG_DBG("unpinned row "UUID_FMT, UUID_ARGS(uuid));
-            ovsdb_row_cache_evict__(cache);
+            if (!entry->in_scan_ring) {
+                ovsdb_row_cache_evict__(cache);
+            }
         }
     } else {
         VLOG_DBG("unpin request for absent row "UUID_FMT,
                  UUID_ARGS(uuid));
+    }
+}
+
+/* ------------------------------------------------------------------
+ * Bulk-read mode (scan ring).
+ * ------------------------------------------------------------------ */
+
+/* Enters bulk-read mode.  Subsequent inserts go into the scan ring
+ * instead of the main clock buffer, preventing scan workloads from
+ * evicting hot entries. */
+void
+ovsdb_row_cache_bulk_read_start(struct ovsdb_row_cache *cache)
+{
+    cache->bulk_read = true;
+}
+
+/* Exits bulk-read mode and evicts all entries remaining in the
+ * scan ring.  Subsequent inserts go into the main clock buffer. */
+void
+ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *cache)
+{
+    uint32_t i;
+
+    cache->bulk_read = false;
+
+    for (i = 0; i < OVSDB_ROW_CACHE_SCAN_RING_SIZE; i++) {
+        if (cache->scan_ring.slots[i]) {
+            ovsdb_row_cache_scan_ring_evict__(cache, i);
+        }
     }
 }
 
@@ -387,7 +664,7 @@ ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *cache)
 }
 
 /* Returns the soft atom budget of 'cache'.  Entries over this
- * budget are eligible for LRU eviction on insert/unpin. */
+ * budget are eligible for clock-sweep eviction on insert/unpin. */
 size_t
 ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *cache)
 {
@@ -413,6 +690,43 @@ size_t
 ovsdb_row_cache_misses(const struct ovsdb_row_cache *cache)
 {
     return cache->misses;
+}
+
+/* Returns the number of entries evicted from 'cache'. */
+size_t
+ovsdb_row_cache_evictions(const struct ovsdb_row_cache *cache)
+{
+    return cache->evictions;
+}
+
+/* Returns the number of scan ring slot reuses. */
+size_t
+ovsdb_row_cache_scan_reuse(const struct ovsdb_row_cache *cache)
+{
+    return cache->scan_ring.reuse_count;
+}
+
+/* Fills 'histogram' with the count of entries at each usage_count
+ * level (0 through MAX_USAGE_COUNT).  'histogram' must point to
+ * an array of at least MAX_USAGE_COUNT+1 elements. */
+void
+ovsdb_row_cache_usage_histogram(const struct ovsdb_row_cache *cache,
+                                size_t histogram[])
+{
+    struct ovsdb_row_cache_entry *entry;
+    int i;
+
+    for (i = 0; i <= OVSDB_ROW_CACHE_MAX_USAGE; i++) {
+        histogram[i] = 0;
+    }
+
+    HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
+        uint8_t uc = entry->usage_count;
+        if (uc > OVSDB_ROW_CACHE_MAX_USAGE) {
+            uc = OVSDB_ROW_CACHE_MAX_USAGE;
+        }
+        histogram[uc]++;
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -494,7 +808,8 @@ ovsdb_row_cache_is_retry_ready(struct ovsdb_row_cache *cache,
     return time_msec() >= entry->retry_after;
 }
 
-/* Returns true if the cache has any entries in UNLOADED or LOADING state. */
+/* Returns true if the cache has any entries in UNLOADED or LOADING
+ * state. */
 bool
 ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *cache)
 {
@@ -510,8 +825,8 @@ ovsdb_row_cache_has_unloaded(const struct ovsdb_row_cache *cache)
 }
 
 /* Calls 'cb' for each cache entry with state OVSDB_ROW_UNLOADED.
- * Does not modify entry state — caller is responsible for transitions.
- * Stops early if 'cb' returns false. */
+ * Does not modify entry state -- caller is responsible for
+ * transitions.  Stops early if 'cb' returns false. */
 void
 ovsdb_row_cache_for_each_unloaded(
     struct ovsdb_row_cache *cache,
@@ -540,7 +855,7 @@ ovsdb_row_cache_for_each_unloaded(
  * the cache is not destroyed).
  *
  * Re-entrancy safe: callbacks may call insert/remove/evict without
- * corrupting the iteration — evicted entries are deferred until
+ * corrupting the iteration -- evicted entries are deferred until
  * after the outermost iteration completes. */
 void
 ovsdb_row_cache_for_each_loaded(
@@ -571,6 +886,7 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
                              const struct uuid *uuid)
 {
     struct ovsdb_row_cache_entry *entry;
+    uint32_t slot;
 
     entry = ovsdb_row_cache_find__(cache, uuid);
     if (entry) {
@@ -585,9 +901,15 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     entry->state = OVSDB_ROW_UNLOADED;
     entry->load_failures = 0;
     entry->retry_after = 0;
+    entry->usage_count = 0;
+    entry->in_scan_ring = false;
+
+    slot = ovsdb_row_cache_alloc_slot__(cache);
+    entry->clock_slot = slot;
+    cache->clock_buf[slot] = entry;
+    cache->clock_len++;
 
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
-    ovs_list_push_back(&cache->lru, &entry->lru_node);
     cache->n_entries++;
 }
