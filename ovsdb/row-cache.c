@@ -123,9 +123,11 @@ struct ovsdb_row_cache {
     bool bulk_read;               /* True when in BULK_READ mode. */
 
     size_t max_atoms;             /* Current dynamic atom budget. */
-    size_t base_max_atoms;        /* Configured base budget (immutable). */
+    size_t base_max_atoms;        /* Configured base budget.  Set via
+                                   * set_max_atoms() under wrlock. */
     size_t high_water_atoms;      /* Upper bound for burst mode. */
-    bool burst_mode;              /* True during unconditioned scan. */
+    int burst_refcount;           /* >0 when burst mode active.
+                                   * Ref-counted for concurrent scans. */
     size_t total_atoms;           /* Sum of n_atoms for all entries. */
     size_t n_entries;             /* Number of entries in the cache. */
 
@@ -493,20 +495,29 @@ ovsdb_row_cache_sweeper_main__(void *arg)
         /* Decay under rdlock -- concurrent lookups not blocked. */
         ovsdb_row_cache_decay_usage__(cache);
 
-        /* Eviction + shrink under wrlock, only if needed. */
-        if (!cache->bulk_read
-            && (need_sweep
-                || cache->total_atoms > cache->max_atoms
-                || (!cache->burst_mode
-                    && cache->max_atoms > cache->base_max_atoms))) {
+        /* Check whether eviction or shrink is needed under rdlock
+         * (avoids wrlock when nothing to do). */
+        bool want_wrlock;
+        ovs_rwlock_rdlock(&cache->rwlock);
+        want_wrlock = !cache->bulk_read
+                      && (need_sweep
+                          || cache->total_atoms > cache->max_atoms
+                          || (cache->burst_refcount == 0
+                              && cache->max_atoms
+                                 > cache->base_max_atoms));
+        ovs_rwlock_unlock(&cache->rwlock);
+
+        if (want_wrlock) {
             ovs_rwlock_wrlock(&cache->rwlock);
 
             if (cache->total_atoms > cache->max_atoms) {
                 ovsdb_row_cache_evict__(cache);
             }
 
-            /* Gradually shrink burst budget toward base. */
-            if (!cache->burst_mode
+            /* Gradually shrink burst budget toward base.
+             * The floor guarantees convergence even for
+             * small budgets. */
+            if (cache->burst_refcount == 0
                 && cache->max_atoms > cache->base_max_atoms) {
                 size_t target = cache->max_atoms * 9 / 10;
                 if (target < cache->base_max_atoms) {
@@ -603,7 +614,7 @@ ovsdb_row_cache_create(size_t max_atoms)
     cache->max_atoms = max_atoms;
     cache->base_max_atoms = max_atoms;
     cache->high_water_atoms = MIN(max_atoms * 10, HIGH_WATER_CEILING);
-    cache->burst_mode = false;
+    cache->burst_refcount = 0;
     cache->total_atoms = 0;
     cache->n_entries = 0;
     atomic_init(&cache->hits, 0);
@@ -900,25 +911,30 @@ ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *cache)
 
 /* Enters burst mode: raises max_atoms to high_water_atoms so that
  * a full unconditioned scan can cache all rows without eviction.
+ * Reference-counted: multiple concurrent scans can enter burst
+ * simultaneously; the budget stays raised until all exit.
  * The sweeper gradually shrinks back to base_max_atoms after
- * exit_burst(). */
+ * the last exit_burst(). */
 void
 ovsdb_row_cache_enter_burst(struct ovsdb_row_cache *cache)
 {
     ovs_rwlock_wrlock(&cache->rwlock);
-    cache->burst_mode = true;
+    cache->burst_refcount++;
     cache->max_atoms = cache->high_water_atoms;
     ovs_rwlock_unlock(&cache->rwlock);
 }
 
-/* Exits burst mode.  Does not immediately shrink max_atoms;
- * the sweeper thread contracts it gradually (10 percent per
- * cycle) so entries age out naturally via decay. */
+/* Exits burst mode.  Decrements the burst reference count.
+ * When it reaches zero, the sweeper thread contracts max_atoms
+ * gradually (10 percent per cycle) so entries age out naturally
+ * via decay. */
 void
 ovsdb_row_cache_exit_burst(struct ovsdb_row_cache *cache)
 {
     ovs_rwlock_wrlock(&cache->rwlock);
-    cache->burst_mode = false;
+    if (cache->burst_refcount > 0) {
+        cache->burst_refcount--;
+    }
     ovs_rwlock_unlock(&cache->rwlock);
 }
 
@@ -932,7 +948,7 @@ ovsdb_row_cache_set_max_atoms(struct ovsdb_row_cache *cache,
     ovs_rwlock_wrlock(&cache->rwlock);
     cache->base_max_atoms = base;
     cache->high_water_atoms = MIN(high_water, HIGH_WATER_CEILING);
-    if (!cache->burst_mode) {
+    if (cache->burst_refcount == 0) {
         cache->max_atoms = base;
     }
     ovs_rwlock_unlock(&cache->rwlock);
@@ -941,7 +957,11 @@ ovsdb_row_cache_set_max_atoms(struct ovsdb_row_cache *cache,
 size_t
 ovsdb_row_cache_base_max_atoms(const struct ovsdb_row_cache *cache)
 {
-    return cache->base_max_atoms;
+    size_t val;
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    val = cache->base_max_atoms;
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    return val;
 }
 
 /* ------------------------------------------------------------------
@@ -949,16 +969,18 @@ ovsdb_row_cache_base_max_atoms(const struct ovsdb_row_cache *cache)
  * ------------------------------------------------------------------ */
 
 /* Starts the background sweeper thread.  Must be called after
- * startup warmup completes.  Safe to call multiple times. */
+ * startup warmup completes.  Thread-safe; protected by wrlock. */
 void
 ovsdb_row_cache_start_sweeper(struct ovsdb_row_cache *cache)
 {
+    ovs_rwlock_wrlock(&cache->rwlock);
     if (!cache->sweeper_started) {
         cache->sweeper = ovs_thread_create(
             "cache-sweep",
             ovsdb_row_cache_sweeper_main__, cache);
         cache->sweeper_started = true;
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* ------------------------------------------------------------------
@@ -982,7 +1004,11 @@ ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *cache)
 size_t
 ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *cache)
 {
-    return cache->max_atoms;
+    size_t val;
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    val = cache->max_atoms;
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    return val;
 }
 
 /* Returns the number of entries in 'cache'. */
