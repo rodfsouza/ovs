@@ -19,11 +19,13 @@
 
 #include <string.h>
 
+#include "latch.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/list.h"
 #include "openvswitch/vlog.h"
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
+#include "openvswitch/poll-loop.h"
 #include "row.h"
 #include "timeval.h"
 #include "uuid.h"
@@ -33,6 +35,10 @@ VLOG_DEFINE_THIS_MODULE(ovsdb_row_cache);
 
 /* Initial capacity of the clock buffer (must be power of 2). */
 #define CLOCK_BUF_INIT_CAP 64
+
+/* Sweeper thread intervals. */
+#define SWEEP_INTERVAL_MS  1000   /* Wake every 1s to check budget. */
+#define DECAY_INTERVAL_MS  30000  /* Decay usage_count every 30s. */
 
 /* A single cached row, stored inside the cache's hmap and clock buffer.
  *
@@ -124,6 +130,12 @@ struct ovsdb_row_cache {
                                    * public insert/remove must not
                                    * re-acquire. */
     struct ovs_list deferred_free; /* Entries to free after iteration. */
+
+    /* Background sweeper thread. */
+    pthread_t sweeper;            /* Runs eviction + decay. */
+    struct latch sweep_latch;     /* Signaled when budget exceeded. */
+    struct latch exit_latch;      /* Signaled on destroy. */
+    long long int next_decay;     /* time_msec() of next usage decay. */
 };
 
 /* ------------------------------------------------------------------
@@ -365,6 +377,95 @@ ovsdb_row_cache_evict__(struct ovsdb_row_cache *cache)
 }
 
 /* ------------------------------------------------------------------
+ * Sweeper helpers.
+ * ------------------------------------------------------------------ */
+
+/* Decrements usage_count for all entries by 1, flooring at 0.
+ * Caller must hold wrlock. */
+static void
+ovsdb_row_cache_decay_usage__(struct ovsdb_row_cache *cache)
+{
+    uint32_t i;
+
+    for (i = 0; i < cache->clock_cap; i++) {
+        struct ovsdb_row_cache_entry *e = cache->clock_buf[i];
+        if (e && e->usage_count > 0) {
+            e->usage_count--;
+        }
+    }
+}
+
+/* Evicts at most one entry via two clock-hand revolutions.
+ * Two revolutions are needed because the first pass may only
+ * decrement usage_count from 1 to 0, and the second pass
+ * evicts the now-zero entry.
+ * Used as inline fallback when the sweeper cannot keep up.
+ * Caller must hold wrlock. */
+static void
+ovsdb_row_cache_evict_one__(struct ovsdb_row_cache *cache)
+{
+    size_t steps = 0;
+    size_t max_steps = 2 * cache->clock_cap;
+
+    while (cache->total_atoms > cache->max_atoms
+           && steps < max_steps) {
+        uint32_t slot = cache->clock_hand;
+        struct ovsdb_row_cache_entry *e;
+
+        cache->clock_hand = (slot + 1) % cache->clock_cap;
+        steps++;
+
+        e = cache->clock_buf[slot];
+        if (!e || e->pinned) {
+            continue;
+        }
+        if (e->usage_count > 0) {
+            e->usage_count--;
+            continue;
+        }
+        { uint64_t orig;
+          atomic_add_relaxed(&cache->evictions, 1, &orig); }
+        ovsdb_row_cache_evict_entry__(cache, e);
+        return; /* Evicted one -- enough for inline. */
+    }
+}
+
+/* Background sweeper thread.  Runs eviction when budget is exceeded
+ * (signaled via latch) and periodic usage_count decay. */
+static void *
+ovsdb_row_cache_sweeper_main__(void *arg)
+{
+    struct ovsdb_row_cache *cache = arg;
+
+    while (!latch_is_set(&cache->exit_latch)) {
+        long long now = time_msec();
+        bool need_sweep = latch_poll(&cache->sweep_latch);
+
+        ovs_rwlock_wrlock(&cache->rwlock);
+
+        /* Eviction sweep if over budget. */
+        if (need_sweep || cache->total_atoms > cache->max_atoms) {
+            ovsdb_row_cache_evict__(cache);
+        }
+
+        /* Periodic usage decay. */
+        if (now >= cache->next_decay) {
+            ovsdb_row_cache_decay_usage__(cache);
+            cache->next_decay = now + DECAY_INTERVAL_MS;
+        }
+
+        ovs_rwlock_unlock(&cache->rwlock);
+
+        /* Wait for signal or timer. */
+        poll_timer_wait(SWEEP_INTERVAL_MS);
+        latch_wait(&cache->sweep_latch);
+        latch_wait(&cache->exit_latch);
+        poll_block();
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------
  * Scan ring helpers.
  * ------------------------------------------------------------------ */
 
@@ -446,6 +547,14 @@ ovsdb_row_cache_create(size_t max_atoms)
     cache->iterating = 0;
     ovs_list_init(&cache->deferred_free);
 
+    /* Start background sweeper. */
+    cache->next_decay = time_msec() + DECAY_INTERVAL_MS;
+    latch_init(&cache->sweep_latch);
+    latch_init(&cache->exit_latch);
+    cache->sweeper = ovs_thread_create("cache-sweep",
+                                       ovsdb_row_cache_sweeper_main__,
+                                       cache);
+
     VLOG_DBG("created row cache (max_atoms=%"PRIuSIZE")", max_atoms);
     return cache;
 }
@@ -460,6 +569,12 @@ ovsdb_row_cache_destroy(struct ovsdb_row_cache *cache)
     if (!cache) {
         return;
     }
+
+    /* Stop sweeper thread. */
+    latch_set(&cache->exit_latch);
+    xpthread_join(cache->sweeper, NULL);
+    latch_destroy(&cache->sweep_latch);
+    latch_destroy(&cache->exit_latch);
 
     /* Sweep any deferred entries first. */
     ovsdb_row_cache_sweep_deferred__(cache);
@@ -559,9 +674,12 @@ ovsdb_row_cache_insert_locked__(struct ovsdb_row_cache *cache,
              "total=%"PRIuSIZE")",
              UUID_ARGS(uuid), n_atoms, cache->total_atoms);
 
-    /* Evict from main clock buffer if necessary. */
-    if (!cache->bulk_read) {
-        ovsdb_row_cache_evict__(cache);
+    /* If over budget, signal the sweeper for background eviction
+     * and do a mini-evict (one entry) inline as fallback. */
+    if (!cache->bulk_read
+        && cache->total_atoms > cache->max_atoms) {
+        latch_set(&cache->sweep_latch);
+        ovsdb_row_cache_evict_one__(cache);
     }
 }
 
