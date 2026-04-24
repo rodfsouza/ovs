@@ -70,7 +70,9 @@ struct ovsdb_row_cache_entry {
                                    * Atomic because lookup() bumps it
                                    * under rdlock while evict/decay
                                    * access it under wrlock. */
-    uint32_t clock_slot;          /* Index in cache->clock_buf. */
+    uint32_t clock_slot;          /* Index in cache->clock_buf, or
+                                   * UINT32_MAX if not in clock_buf
+                                   * (e.g. UNLOADED entries). */
     bool in_scan_ring;            /* True if entry lives in scan ring. */
 };
 
@@ -1292,7 +1294,6 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
                              const struct uuid *uuid)
 {
     struct ovsdb_row_cache_entry *entry;
-    uint32_t slot;
 
     bool locked = ovsdb_row_cache_wrlock_if_needed__(cache);
     entry = ovsdb_row_cache_find__(cache, uuid);
@@ -1312,10 +1313,11 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     atomic_init(&entry->usage_count, 0);
     entry->in_scan_ring = false;
 
-    slot = ovsdb_row_cache_alloc_slot__(cache);
-    entry->clock_slot = slot;
-    cache->clock_buf[slot] = entry;
-    cache->clock_len++;
+    /* UNLOADED entries are hmap-only: they have no row data and
+     * n_atoms=0, so they do not participate in clock-sweep
+     * eviction.  A clock_buf slot is allocated later when the
+     * entry transitions to CACHED via insert(). */
+    entry->clock_slot = UINT32_MAX;
 
     hmap_insert(&cache->entries, &entry->hmap_node,
                 uuid_hash(uuid));
