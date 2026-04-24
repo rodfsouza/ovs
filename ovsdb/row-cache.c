@@ -33,8 +33,9 @@
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_row_cache);
 
-/* Initial capacity of the clock buffer (must be power of 2). */
+/* Initial capacity of the clock buffer. */
 #define CLOCK_BUF_INIT_CAP 64
+BUILD_ASSERT_DECL(IS_POW2(CLOCK_BUF_INIT_CAP));
 
 /* Sweeper thread intervals. */
 #define SWEEP_INTERVAL_MS  1000   /* Wake every 1s to check budget. */
@@ -61,7 +62,10 @@ struct ovsdb_row_cache_entry {
                                    * should be attempted (backoff). */
 
     /* Clock-sweep fields. */
-    uint8_t usage_count;          /* Access frequency, 0..MAX_USAGE. */
+    atomic_int usage_count;       /* Access frequency, 0..MAX_USAGE.
+                                   * Atomic because lookup() bumps it
+                                   * under rdlock while evict/decay
+                                   * access it under wrlock. */
     uint32_t clock_slot;          /* Index in cache->clock_buf. */
     bool in_scan_ring;            /* True if entry lives in scan ring. */
 };
@@ -123,8 +127,10 @@ struct ovsdb_row_cache {
     atomic_uint64_t misses;       /* Number of failed lookups. */
     atomic_uint64_t evictions;    /* Number of evicted entries. */
 
-    /* Re-entrancy guard for safe iteration. */
-    int iterating;                /* Nesting depth of for_each_* calls.
+    /* Re-entrancy guard for safe iteration.  Atomic so that
+     * insert/remove can check it without holding the lock to
+     * detect re-entrant calls from for_each callbacks. */
+    atomic_int iterating;         /* Nesting depth of for_each_* calls.
                                    * When > 0, rwlock is already held by
                                    * the current thread (wrlock), so
                                    * public insert/remove must not
@@ -159,15 +165,18 @@ ovsdb_row_cache_find__(const struct ovsdb_row_cache *cache,
 }
 
 /* Increments 'entry->usage_count', capped at MAX_USAGE_COUNT.
- * For scan-ring entries, the cap is 1 to prevent promotion. */
+ * For scan-ring entries, the cap is 1 to prevent promotion.
+ * Safe to call under rdlock (uses atomic operations). */
 static void
 ovsdb_row_cache_touch__(struct ovsdb_row_cache_entry *entry)
 {
-    uint8_t cap = entry->in_scan_ring
-                  ? 1
-                  : OVSDB_ROW_CACHE_MAX_USAGE;
-    if (entry->usage_count < cap) {
-        entry->usage_count++;
+    int cap = entry->in_scan_ring
+              ? 1
+              : OVSDB_ROW_CACHE_MAX_USAGE;
+    int uc;
+    atomic_read_relaxed(&entry->usage_count, &uc);
+    if (uc < cap) {
+        atomic_store_relaxed(&entry->usage_count, uc + 1);
     }
 }
 
@@ -229,24 +238,28 @@ ovsdb_row_cache_evict_entry__(struct ovsdb_row_cache *cache,
         cache->clock_len--;
     }
 
-    if (cache->iterating > 0) {
-        /* Defer both hmap_remove and free.  Destroy the row now
-         * to release memory, but keep the entry in the hmap so
-         * the iterator's bucket chain stays valid. */
-        if (entry->row) {
-            ovsdb_row_destroy(entry->row);
-            entry->row = NULL;
-        }
-        entry->n_atoms = 0;
-        entry->state = OVSDB_ROW_ERROR; /* Mark dead for iterators. */
-        ovs_list_push_back(&cache->deferred_free,
-                           &entry->deferred_node);
-    } else {
-        hmap_remove(&cache->entries, &entry->hmap_node);
-        if (entry->row) {
-            ovsdb_row_destroy(entry->row);
-        }
-        free(entry);
+    { int iter_depth;
+      atomic_read_relaxed(&cache->iterating, &iter_depth);
+
+      if (iter_depth > 0) {
+          /* Defer both hmap_remove and free.  Destroy the row now
+           * to release memory, but keep the entry in the hmap so
+           * the iterator's bucket chain stays valid. */
+          if (entry->row) {
+              ovsdb_row_destroy(entry->row);
+              entry->row = NULL;
+          }
+          entry->n_atoms = 0;
+          entry->state = OVSDB_ROW_ERROR; /* Mark dead for iterators. */
+          ovs_list_push_back(&cache->deferred_free,
+                             &entry->deferred_node);
+      } else {
+          hmap_remove(&cache->entries, &entry->hmap_node);
+          if (entry->row) {
+              ovsdb_row_destroy(entry->row);
+          }
+          free(entry);
+      }
     }
 }
 
@@ -297,8 +310,13 @@ ovsdb_row_cache_compact__(struct ovsdb_row_cache *cache)
     uint32_t dst = 0;
     uint32_t i;
 
-    if (cache->iterating > 0
-        || cache->clock_cap <= CLOCK_BUF_INIT_CAP
+    { int iter_depth;
+      atomic_read_relaxed(&cache->iterating, &iter_depth);
+      if (iter_depth > 0) {
+          return;
+      }
+    }
+    if (cache->clock_cap <= CLOCK_BUF_INIT_CAP
         || cache->clock_len >= cache->clock_cap / 4) {
         return;
     }
@@ -359,9 +377,12 @@ ovsdb_row_cache_evict__(struct ovsdb_row_cache *cache)
             continue;
         }
 
-        if (e->usage_count > 0) {
-            e->usage_count--;
-            continue;
+        { int uc;
+          atomic_read_relaxed(&e->usage_count, &uc);
+          if (uc > 0) {
+              atomic_store_relaxed(&e->usage_count, uc - 1);
+              continue;
+          }
         }
 
         /* usage_count == 0, not pinned -> evict. */
@@ -389,8 +410,12 @@ ovsdb_row_cache_decay_usage__(struct ovsdb_row_cache *cache)
 
     for (i = 0; i < cache->clock_cap; i++) {
         struct ovsdb_row_cache_entry *e = cache->clock_buf[i];
-        if (e && e->usage_count > 0) {
-            e->usage_count--;
+        if (e) {
+            int uc;
+            atomic_read_relaxed(&e->usage_count, &uc);
+            if (uc > 0) {
+                atomic_store_relaxed(&e->usage_count, uc - 1);
+            }
         }
     }
 }
@@ -399,6 +424,13 @@ ovsdb_row_cache_decay_usage__(struct ovsdb_row_cache *cache)
  * Two revolutions are needed because the first pass may only
  * decrement usage_count from 1 to 0, and the second pass
  * evicts the now-zero entry.
+ *
+ * This is best-effort: entries at usage_count >= 2 will only
+ * be decremented, not evicted.  The full eviction sweep is
+ * deferred to the sweeper thread.  During sustained insert
+ * bursts, the cache may temporarily exceed its atom budget
+ * until the sweeper runs (up to SWEEP_INTERVAL_MS later).
+ *
  * Used as inline fallback when the sweeper cannot keep up.
  * Caller must hold wrlock. */
 static void
@@ -419,9 +451,12 @@ ovsdb_row_cache_evict_one__(struct ovsdb_row_cache *cache)
         if (!e || e->pinned) {
             continue;
         }
-        if (e->usage_count > 0) {
-            e->usage_count--;
-            continue;
+        { int uc;
+          atomic_read_relaxed(&e->usage_count, &uc);
+          if (uc > 0) {
+              atomic_store_relaxed(&e->usage_count, uc - 1);
+              continue;
+          }
         }
         { uint64_t orig;
           atomic_add_relaxed(&cache->evictions, 1, &orig); }
@@ -438,13 +473,17 @@ ovsdb_row_cache_sweeper_main__(void *arg)
     struct ovsdb_row_cache *cache = arg;
 
     while (!latch_is_set(&cache->exit_latch)) {
-        long long now = time_msec();
+        long long int now = time_msec();
         bool need_sweep = latch_poll(&cache->sweep_latch);
 
         ovs_rwlock_wrlock(&cache->rwlock);
 
-        /* Eviction sweep if over budget. */
-        if (need_sweep || cache->total_atoms > cache->max_atoms) {
+        /* Eviction sweep if over budget.  Skip during bulk_read
+         * because total_atoms includes scan ring entries that
+         * are not in the main clock buffer. */
+        if (!cache->bulk_read
+            && (need_sweep
+                || cache->total_atoms > cache->max_atoms)) {
             ovsdb_row_cache_evict__(cache);
         }
 
@@ -506,7 +545,7 @@ ovsdb_row_cache_scan_ring_insert__(struct ovsdb_row_cache *cache,
     }
 
     entry->in_scan_ring = true;
-    entry->usage_count = 0;
+    atomic_init(&entry->usage_count, 0);
     entry->clock_slot = slot; /* Ring index (not clock_buf index). */
     cache->scan_ring.slots[slot] = entry;
     cache->scan_ring.count++;
@@ -544,7 +583,7 @@ ovsdb_row_cache_create(size_t max_atoms)
     atomic_init(&cache->hits, 0);
     atomic_init(&cache->misses, 0);
     atomic_init(&cache->evictions, 0);
-    cache->iterating = 0;
+    atomic_init(&cache->iterating, 0);
     ovs_list_init(&cache->deferred_free);
 
     /* Start background sweeper. */
@@ -658,7 +697,7 @@ ovsdb_row_cache_insert_locked__(struct ovsdb_row_cache *cache,
     } else {
         /* Place in clock buffer. */
         uint32_t slot = ovsdb_row_cache_alloc_slot__(cache);
-        entry->usage_count = 1;
+        atomic_init(&entry->usage_count, 1);
         entry->in_scan_ring = false;
         entry->clock_slot = slot;
         cache->clock_buf[slot] = entry;
@@ -698,8 +737,11 @@ void
 ovsdb_row_cache_insert(struct ovsdb_row_cache *cache,
                        struct ovsdb_row *row, size_t n_atoms)
 {
-    if (cache->iterating > 0) {
-        /* Called from a for_each callback — lock already held. */
+    int depth;
+    atomic_read_relaxed(&cache->iterating, &depth);
+    if (depth > 0) {
+        /* Called from a for_each callback on the current thread,
+         * which already holds wrlock. */
         ovsdb_row_cache_insert_locked__(cache, row, n_atoms);
     } else {
         ovs_rwlock_wrlock(&cache->rwlock);
@@ -729,7 +771,9 @@ void
 ovsdb_row_cache_remove(struct ovsdb_row_cache *cache,
                        const struct uuid *uuid)
 {
-    if (cache->iterating > 0) {
+    int depth;
+    atomic_read_relaxed(&cache->iterating, &depth);
+    if (depth > 0) {
         ovsdb_row_cache_remove_locked__(cache, uuid);
     } else {
         ovs_rwlock_wrlock(&cache->rwlock);
@@ -833,7 +877,11 @@ ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *cache)
 size_t
 ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *cache)
 {
-    return cache->total_atoms;
+    size_t val;
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    val = cache->total_atoms;
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    return val;
 }
 
 /* Returns the soft atom budget of 'cache'.  Entries over this
@@ -841,14 +889,18 @@ ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *cache)
 size_t
 ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *cache)
 {
-    return cache->max_atoms;
+    return cache->max_atoms; /* Immutable after create. */
 }
 
 /* Returns the number of entries in 'cache'. */
 size_t
 ovsdb_row_cache_count(const struct ovsdb_row_cache *cache)
 {
-    return cache->n_entries;
+    size_t val;
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    val = cache->n_entries;
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    return val;
 }
 
 /* Returns the number of cache hits (successful lookups). */
@@ -882,7 +934,11 @@ ovsdb_row_cache_evictions(const struct ovsdb_row_cache *cache)
 size_t
 ovsdb_row_cache_scan_reuse(const struct ovsdb_row_cache *cache)
 {
-    return cache->scan_ring.reuse_count;
+    size_t val;
+    ovs_rwlock_rdlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    val = cache->scan_ring.reuse_count;
+    ovs_rwlock_unlock(CONST_CAST(struct ovs_rwlock *, &cache->rwlock));
+    return val;
 }
 
 /* Fills 'histogram' with the count of entries at each usage_count
@@ -904,7 +960,8 @@ ovsdb_row_cache_usage_histogram(const struct ovsdb_row_cache *cache,
     }
 
     HMAP_FOR_EACH (entry, hmap_node, &cache->entries) {
-        uint8_t uc = entry->usage_count;
+        int uc;
+        atomic_read_relaxed(&entry->usage_count, &uc);
         if (uc > OVSDB_ROW_CACHE_MAX_USAGE) {
             uc = OVSDB_ROW_CACHE_MAX_USAGE;
         }
@@ -1042,7 +1099,9 @@ ovsdb_row_cache_for_each_unloaded(
     struct ovsdb_row_cache_entry *entry;
 
     ovs_rwlock_wrlock(&cache->rwlock);
-    cache->iterating++;
+    { int old_depth;
+      atomic_add_relaxed(&cache->iterating, 1, &old_depth);
+    }
     HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_UNLOADED
             && time_msec() >= entry->retry_after) {
@@ -1051,8 +1110,11 @@ ovsdb_row_cache_for_each_unloaded(
             }
         }
     }
-    if (--cache->iterating == 0) {
-        ovsdb_row_cache_sweep_deferred__(cache);
+    { int old_depth;
+      atomic_sub_relaxed(&cache->iterating, 1, &old_depth);
+      if (old_depth == 1) {
+          ovsdb_row_cache_sweep_deferred__(cache);
+      }
     }
     ovs_rwlock_unlock(&cache->rwlock);
 }
@@ -1074,7 +1136,9 @@ ovsdb_row_cache_for_each_loaded(
     struct ovsdb_row_cache_entry *entry;
 
     ovs_rwlock_wrlock(&cache->rwlock);
-    cache->iterating++;
+    { int old_depth;
+      atomic_add_relaxed(&cache->iterating, 1, &old_depth);
+    }
     HMAP_FOR_EACH_SAFE (entry, hmap_node, &cache->entries) {
         if (entry->state == OVSDB_ROW_CACHED && entry->row) {
             if (!cb(entry->row, aux)) {
@@ -1082,8 +1146,11 @@ ovsdb_row_cache_for_each_loaded(
             }
         }
     }
-    if (--cache->iterating == 0) {
-        ovsdb_row_cache_sweep_deferred__(cache);
+    { int old_depth;
+      atomic_sub_relaxed(&cache->iterating, 1, &old_depth);
+      if (old_depth == 1) {
+          ovsdb_row_cache_sweep_deferred__(cache);
+      }
     }
     ovs_rwlock_unlock(&cache->rwlock);
 }
@@ -1113,7 +1180,7 @@ ovsdb_row_cache_add_unloaded(struct ovsdb_row_cache *cache,
     entry->state = OVSDB_ROW_UNLOADED;
     entry->load_failures = 0;
     entry->retry_after = 0;
-    entry->usage_count = 0;
+    atomic_init(&entry->usage_count, 0);
     entry->in_scan_ring = false;
 
     slot = ovsdb_row_cache_alloc_slot__(cache);

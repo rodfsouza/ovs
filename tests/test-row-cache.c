@@ -865,16 +865,12 @@ concurrent_rw_thread(void *arg)
             }
         }
     } else {
-        /* Lookup random rows, tolerate misses. */
+        /* Lookup random rows, tolerate misses.
+         * Do not dereference returned row pointers: they may
+         * become stale after lookup() releases its rdlock. */
         for (i = 0; i < 5000; i++) {
             struct uuid u = make_uuid(i % 100);
-            struct ovsdb_row *row = ovsdb_row_cache_lookup(
-                aux->cache, &u);
-            if (row) {
-                /* Verify the returned row has the right UUID. */
-                ovs_assert(uuid_equals(ovsdb_row_get_uuid(row),
-                                       &u));
-            }
+            ovsdb_row_cache_lookup(aux->cache, &u);
         }
     }
 
@@ -1211,8 +1207,9 @@ test_concurrent_stress(void)
 
     /* Reaching this point without crash or deadlock is success.
      * Verify no underflow. */
-    ovs_assert(ovsdb_row_cache_count(cache) >= 0);
-    ovs_assert(ovsdb_row_cache_n_atoms(cache) >= 0);
+    /* Verify no underflow (size_t is unsigned, so check < SIZE_MAX/2). */
+    ovs_assert(ovsdb_row_cache_count(cache) < SIZE_MAX / 2);
+    ovs_assert(ovsdb_row_cache_n_atoms(cache) < SIZE_MAX / 2);
 
     ovsdb_row_cache_destroy(cache);
     ovsdb_table_destroy(table);
