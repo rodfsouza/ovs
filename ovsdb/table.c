@@ -685,17 +685,26 @@ ovsdb_table_query(struct ovsdb_table *table,
 
     /* Step B: walk disk cursor if disk_store is present.
      *
-     * Bracket with bulk_read_start/end so that rows loaded from
-     * disk during a sequential scan go into the scan ring instead
-     * of evicting hot entries from the main clock buffer. */
+     * Unconditioned scans (full table) use burst mode: rows go
+     * into the main clock buffer with a raised budget so they
+     * persist for subsequent queries.
+     *
+     * Conditioned scans use bulk_read (scan ring): rows are
+     * temporary and don't evict hot entries. */
     if (!table->disk_store) {
         return;
     }
 
     bool bulk_read_active = false;
+    bool burst_active = false;
     if (table->cache) {
-        ovsdb_row_cache_bulk_read_start(table->cache);
-        bulk_read_active = true;
+        if (!check_cond) {
+            ovsdb_row_cache_enter_burst(table->cache);
+            burst_active = true;
+        } else {
+            ovsdb_row_cache_bulk_read_start(table->cache);
+            bulk_read_active = true;
+        }
     }
 
     struct ovsdb_disk_store_cursor *cursor;
@@ -761,7 +770,9 @@ ovsdb_table_query(struct ovsdb_table *table,
     ovsdb_disk_store_cursor_close(cursor);
 
 out:
-    if (bulk_read_active) {
+    if (burst_active) {
+        ovsdb_row_cache_exit_burst(table->cache);
+    } else if (bulk_read_active) {
         ovsdb_row_cache_bulk_read_end(table->cache);
     }
 }

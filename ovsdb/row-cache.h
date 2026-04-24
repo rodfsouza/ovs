@@ -105,6 +105,16 @@ void ovsdb_row_cache_for_each_loaded(
 void ovsdb_row_cache_bulk_read_start(struct ovsdb_row_cache *);
 void ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *);
 
+/* Burst mode (dynamic sizing). */
+void ovsdb_row_cache_enter_burst(struct ovsdb_row_cache *);
+void ovsdb_row_cache_exit_burst(struct ovsdb_row_cache *);
+void ovsdb_row_cache_set_max_atoms(struct ovsdb_row_cache *,
+                                   size_t base, size_t high_water);
+size_t ovsdb_row_cache_base_max_atoms(const struct ovsdb_row_cache *);
+
+/* Sweeper lifecycle (call after startup warmup). */
+void ovsdb_row_cache_start_sweeper(struct ovsdb_row_cache *);
+
 /* Stats. */
 size_t ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *);
 size_t ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *);

@@ -37,9 +37,13 @@ VLOG_DEFINE_THIS_MODULE(ovsdb_row_cache);
 #define CLOCK_BUF_INIT_CAP 64
 BUILD_ASSERT_DECL(IS_POW2(CLOCK_BUF_INIT_CAP));
 
-/* Sweeper thread intervals. */
-#define SWEEP_INTERVAL_MS  1000   /* Wake every 1s to check budget. */
-#define DECAY_INTERVAL_MS  30000  /* Decay usage_count every 30s. */
+/* Sweeper thread interval.  Decay and shrink both run once per
+ * wake cycle.  Budget-exceeded events wake the sweeper instantly
+ * via latch, so this interval only governs background maintenance. */
+#define SWEEP_INTERVAL_MS  30000
+
+/* Hard ceiling on dynamic high-water budget (atoms). */
+#define HIGH_WATER_CEILING 100000000
 
 /* A single cached row, stored inside the cache's hmap and clock buffer.
  *
@@ -118,7 +122,10 @@ struct ovsdb_row_cache {
     struct ovsdb_row_cache_scan_ring scan_ring;
     bool bulk_read;               /* True when in BULK_READ mode. */
 
-    size_t max_atoms;             /* Soft atom budget. */
+    size_t max_atoms;             /* Current dynamic atom budget. */
+    size_t base_max_atoms;        /* Configured base budget (immutable). */
+    size_t high_water_atoms;      /* Upper bound for burst mode. */
+    bool burst_mode;              /* True during unconditioned scan. */
     size_t total_atoms;           /* Sum of n_atoms for all entries. */
     size_t n_entries;             /* Number of entries in the cache. */
 
@@ -141,7 +148,7 @@ struct ovsdb_row_cache {
     pthread_t sweeper;            /* Runs eviction + decay. */
     struct latch sweep_latch;     /* Signaled when budget exceeded. */
     struct latch exit_latch;      /* Signaled on destroy. */
-    long long int next_decay;     /* time_msec() of next usage decay. */
+    bool sweeper_started;         /* False until start_sweeper(). */
 };
 
 /* ------------------------------------------------------------------
@@ -402,12 +409,14 @@ ovsdb_row_cache_evict__(struct ovsdb_row_cache *cache)
  * ------------------------------------------------------------------ */
 
 /* Decrements usage_count for all entries by 1, flooring at 0.
- * Caller must hold wrlock. */
+ * Uses rdlock so concurrent lookups are not blocked.  Only
+ * writers (insert/remove) are briefly blocked. */
 static void
 ovsdb_row_cache_decay_usage__(struct ovsdb_row_cache *cache)
 {
     uint32_t i;
 
+    ovs_rwlock_rdlock(&cache->rwlock);
     for (i = 0; i < cache->clock_cap; i++) {
         struct ovsdb_row_cache_entry *e = cache->clock_buf[i];
         if (e) {
@@ -418,6 +427,7 @@ ovsdb_row_cache_decay_usage__(struct ovsdb_row_cache *cache)
             }
         }
     }
+    ovs_rwlock_unlock(&cache->rwlock);
 }
 
 /* Evicts at most one entry via two clock-hand revolutions.
@@ -465,35 +475,48 @@ ovsdb_row_cache_evict_one__(struct ovsdb_row_cache *cache)
     }
 }
 
-/* Background sweeper thread.  Runs eviction when budget is exceeded
- * (signaled via latch) and periodic usage_count decay. */
+/* Background sweeper thread.  Responsibilities:
+ * 1. Decay usage_count under rdlock (doesn't block readers).
+ * 2. Evict over-budget entries under wrlock (only when needed).
+ * 3. Gradually shrink burst budget toward base.
+ *
+ * The sweeper blocks on wrlock while iteration (for_each) is
+ * in progress; it can never observe iterating > 0. */
 static void *
 ovsdb_row_cache_sweeper_main__(void *arg)
 {
     struct ovsdb_row_cache *cache = arg;
 
     while (!latch_is_set(&cache->exit_latch)) {
-        long long int now = time_msec();
         bool need_sweep = latch_poll(&cache->sweep_latch);
 
-        ovs_rwlock_wrlock(&cache->rwlock);
+        /* Decay under rdlock -- concurrent lookups not blocked. */
+        ovsdb_row_cache_decay_usage__(cache);
 
-        /* Eviction sweep if over budget.  Skip during bulk_read
-         * because total_atoms includes scan ring entries that
-         * are not in the main clock buffer. */
+        /* Eviction + shrink under wrlock, only if needed. */
         if (!cache->bulk_read
             && (need_sweep
-                || cache->total_atoms > cache->max_atoms)) {
-            ovsdb_row_cache_evict__(cache);
-        }
+                || cache->total_atoms > cache->max_atoms
+                || (!cache->burst_mode
+                    && cache->max_atoms > cache->base_max_atoms))) {
+            ovs_rwlock_wrlock(&cache->rwlock);
 
-        /* Periodic usage decay. */
-        if (now >= cache->next_decay) {
-            ovsdb_row_cache_decay_usage__(cache);
-            cache->next_decay = now + DECAY_INTERVAL_MS;
-        }
+            if (cache->total_atoms > cache->max_atoms) {
+                ovsdb_row_cache_evict__(cache);
+            }
 
-        ovs_rwlock_unlock(&cache->rwlock);
+            /* Gradually shrink burst budget toward base. */
+            if (!cache->burst_mode
+                && cache->max_atoms > cache->base_max_atoms) {
+                size_t target = cache->max_atoms * 9 / 10;
+                if (target < cache->base_max_atoms) {
+                    target = cache->base_max_atoms;
+                }
+                cache->max_atoms = target;
+            }
+
+            ovs_rwlock_unlock(&cache->rwlock);
+        }
 
         /* Wait for signal or timer. */
         poll_timer_wait(SWEEP_INTERVAL_MS);
@@ -578,6 +601,9 @@ ovsdb_row_cache_create(size_t max_atoms)
     cache->bulk_read = false;
 
     cache->max_atoms = max_atoms;
+    cache->base_max_atoms = max_atoms;
+    cache->high_water_atoms = MIN(max_atoms * 10, HIGH_WATER_CEILING);
+    cache->burst_mode = false;
     cache->total_atoms = 0;
     cache->n_entries = 0;
     atomic_init(&cache->hits, 0);
@@ -586,13 +612,10 @@ ovsdb_row_cache_create(size_t max_atoms)
     atomic_init(&cache->iterating, 0);
     ovs_list_init(&cache->deferred_free);
 
-    /* Start background sweeper. */
-    cache->next_decay = time_msec() + DECAY_INTERVAL_MS;
+    /* Sweeper thread is started later via start_sweeper(). */
     latch_init(&cache->sweep_latch);
     latch_init(&cache->exit_latch);
-    cache->sweeper = ovs_thread_create("cache-sweep",
-                                       ovsdb_row_cache_sweeper_main__,
-                                       cache);
+    cache->sweeper_started = false;
 
     VLOG_DBG("created row cache (max_atoms=%"PRIuSIZE")", max_atoms);
     return cache;
@@ -609,9 +632,11 @@ ovsdb_row_cache_destroy(struct ovsdb_row_cache *cache)
         return;
     }
 
-    /* Stop sweeper thread. */
-    latch_set(&cache->exit_latch);
-    xpthread_join(cache->sweeper, NULL);
+    /* Stop sweeper thread if it was started. */
+    if (cache->sweeper_started) {
+        latch_set(&cache->exit_latch);
+        xpthread_join(cache->sweeper, NULL);
+    }
     latch_destroy(&cache->sweep_latch);
     latch_destroy(&cache->exit_latch);
 
@@ -870,6 +895,73 @@ ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *cache)
 }
 
 /* ------------------------------------------------------------------
+ * Burst mode (dynamic sizing).
+ * ------------------------------------------------------------------ */
+
+/* Enters burst mode: raises max_atoms to high_water_atoms so that
+ * a full unconditioned scan can cache all rows without eviction.
+ * The sweeper gradually shrinks back to base_max_atoms after
+ * exit_burst(). */
+void
+ovsdb_row_cache_enter_burst(struct ovsdb_row_cache *cache)
+{
+    ovs_rwlock_wrlock(&cache->rwlock);
+    cache->burst_mode = true;
+    cache->max_atoms = cache->high_water_atoms;
+    ovs_rwlock_unlock(&cache->rwlock);
+}
+
+/* Exits burst mode.  Does not immediately shrink max_atoms;
+ * the sweeper thread contracts it gradually (10 percent per
+ * cycle) so entries age out naturally via decay. */
+void
+ovsdb_row_cache_exit_burst(struct ovsdb_row_cache *cache)
+{
+    ovs_rwlock_wrlock(&cache->rwlock);
+    cache->burst_mode = false;
+    ovs_rwlock_unlock(&cache->rwlock);
+}
+
+/* Adjusts the base and high-water atom budgets at runtime.
+ * Takes effect immediately; the sweeper will enforce the new
+ * limits on its next cycle. */
+void
+ovsdb_row_cache_set_max_atoms(struct ovsdb_row_cache *cache,
+                              size_t base, size_t high_water)
+{
+    ovs_rwlock_wrlock(&cache->rwlock);
+    cache->base_max_atoms = base;
+    cache->high_water_atoms = MIN(high_water, HIGH_WATER_CEILING);
+    if (!cache->burst_mode) {
+        cache->max_atoms = base;
+    }
+    ovs_rwlock_unlock(&cache->rwlock);
+}
+
+size_t
+ovsdb_row_cache_base_max_atoms(const struct ovsdb_row_cache *cache)
+{
+    return cache->base_max_atoms;
+}
+
+/* ------------------------------------------------------------------
+ * Sweeper lifecycle.
+ * ------------------------------------------------------------------ */
+
+/* Starts the background sweeper thread.  Must be called after
+ * startup warmup completes.  Safe to call multiple times. */
+void
+ovsdb_row_cache_start_sweeper(struct ovsdb_row_cache *cache)
+{
+    if (!cache->sweeper_started) {
+        cache->sweeper = ovs_thread_create(
+            "cache-sweep",
+            ovsdb_row_cache_sweeper_main__, cache);
+        cache->sweeper_started = true;
+    }
+}
+
+/* ------------------------------------------------------------------
  * Stats.
  * ------------------------------------------------------------------ */
 
@@ -884,12 +976,13 @@ ovsdb_row_cache_n_atoms(const struct ovsdb_row_cache *cache)
     return val;
 }
 
-/* Returns the soft atom budget of 'cache'.  Entries over this
- * budget are eligible for clock-sweep eviction on insert/unpin. */
+/* Returns the current dynamic atom budget of 'cache'.  This may
+ * be higher than base during burst mode, or shrinking toward
+ * base after burst ends. */
 size_t
 ovsdb_row_cache_max_atoms(const struct ovsdb_row_cache *cache)
 {
-    return cache->max_atoms; /* Immutable after create. */
+    return cache->max_atoms;
 }
 
 /* Returns the number of entries in 'cache'. */

@@ -823,19 +823,23 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
             }
         }
 
-        /* Warm the cache up to the per-table atom budget on a
-         * background worker pool so tools querying the table
-         * immediately after startup see CACHED rows rather than
-         * UNLOADED ones.  The bounded variant stops submitting
-         * loads before the cache would begin load-and-evict
-         * thrashing; for DBs larger than the budget, remaining
-         * UNLOADED rows are read on demand by
-         * ovsdb_table_for_each_row_from_disk() / get_row().
-         * Skips entirely when no worker pool is available. */
+        /* Warm the cache with burst mode: raise budget so warmup
+         * rows fit without eviction, then start the sweeper to
+         * gradually shrink back to base budget.
+         *
+         * The bounded variant stops submitting loads before the
+         * cache would begin load-and-evict thrashing; for DBs
+         * larger than the budget, remaining UNLOADED rows are
+         * read on demand.  Skips when no worker pool available. */
+        ovsdb_row_cache_enter_burst(table->cache);
+
         size_t warmup = 0;
         if (ovsdb_lazy_load_pool_available()) {
             warmup = ovsdb_lazy_load_bulk_request_until_full(db, table);
         }
+
+        ovsdb_row_cache_start_sweeper(table->cache);
+        ovsdb_row_cache_exit_burst(table->cache);
 
         VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store"
                  " (warmup jobs: %"PRIuSIZE")",

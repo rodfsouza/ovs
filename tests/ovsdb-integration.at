@@ -53,6 +53,10 @@ test_concurrent_insert_eviction
 test_concurrent_pin_unpin
 test_concurrent_bulk_read
 test_concurrent_stress
+test_burst_mode_grows_budget
+test_burst_mode_caches_rows
+test_set_max_atoms_runtime
+test_deferred_sweeper
 test-row-cache: ok
 ])
 AT_CLEANUP

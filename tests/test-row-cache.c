@@ -1215,6 +1215,109 @@ test_concurrent_stress(void)
     ovsdb_table_destroy(table);
 }
 
+/* ------------------------------------------------------------------
+ * Phase 4: Dynamic sizing tests.
+ * ------------------------------------------------------------------ */
+
+/* Entering burst mode raises max_atoms to high_water. */
+static void
+test_burst_mode_grows_budget(void)
+{
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(1000);
+
+    ovs_assert(ovsdb_row_cache_max_atoms(cache) == 1000);
+    ovs_assert(ovsdb_row_cache_base_max_atoms(cache) == 1000);
+
+    ovsdb_row_cache_enter_burst(cache);
+    ovs_assert(ovsdb_row_cache_max_atoms(cache) == 10000);
+
+    ovsdb_row_cache_exit_burst(cache);
+    /* max_atoms stays at 10000 — sweeper shrinks it. */
+    ovs_assert(ovsdb_row_cache_max_atoms(cache) >= 1000);
+
+    ovsdb_row_cache_destroy(cache);
+}
+
+/* Burst mode lets rows exceed base budget. */
+static void
+test_burst_mode_caches_rows(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    /* Base budget: 50 atoms (5 rows at 10 atoms). */
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(50);
+    int i;
+
+    ovsdb_row_cache_enter_burst(cache);
+
+    /* Insert 20 rows (200 atoms) — exceeds base but fits in
+     * high_water (500). */
+    for (i = 0; i < 20; i++) {
+        struct uuid u = make_uuid(i);
+        ovsdb_row_cache_insert(cache,
+                               create_test_row(table, &u), 10);
+    }
+
+    /* All 20 should fit during burst. */
+    ovs_assert(ovsdb_row_cache_count(cache) == 20);
+
+    ovsdb_row_cache_exit_burst(cache);
+
+    /* Rows still present after exit (no immediate shrink). */
+    ovs_assert(ovsdb_row_cache_count(cache) >= 20);
+
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
+/* set_max_atoms changes budgets at runtime. */
+static void
+test_set_max_atoms_runtime(void)
+{
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(1000);
+
+    ovs_assert(ovsdb_row_cache_base_max_atoms(cache) == 1000);
+    ovs_assert(ovsdb_row_cache_max_atoms(cache) == 1000);
+
+    ovsdb_row_cache_set_max_atoms(cache, 2000, 20000);
+    ovs_assert(ovsdb_row_cache_base_max_atoms(cache) == 2000);
+    ovs_assert(ovsdb_row_cache_max_atoms(cache) == 2000);
+
+    /* Burst should use the new high_water. */
+    ovsdb_row_cache_enter_burst(cache);
+    ovs_assert(ovsdb_row_cache_max_atoms(cache) == 20000);
+    ovsdb_row_cache_exit_burst(cache);
+
+    ovsdb_row_cache_destroy(cache);
+}
+
+/* Deferred sweeper: cache works without sweeper started. */
+static void
+test_deferred_sweeper(void)
+{
+    struct ovsdb_table *table = create_test_table();
+    struct ovsdb_row_cache *cache = ovsdb_row_cache_create(1000);
+    struct uuid u = make_uuid(1);
+    struct ovsdb_row *row;
+
+    /* Insert and lookup work without sweeper. */
+    row = create_test_row(table, &u);
+    ovsdb_row_cache_insert(cache, row, 10);
+    ovs_assert(ovsdb_row_cache_lookup(cache, &u) != NULL);
+
+    /* Start sweeper. */
+    ovsdb_row_cache_start_sweeper(cache);
+
+    /* Still works. */
+    ovs_assert(ovsdb_row_cache_lookup(cache, &u) != NULL);
+
+    /* Double start is safe. */
+    ovsdb_row_cache_start_sweeper(cache);
+
+    /* Clean destroy with sweeper running. */
+    ovsdb_row_cache_destroy(cache);
+    ovsdb_table_destroy(table);
+}
+
 static void
 test_row_cache_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 {
@@ -1295,6 +1398,18 @@ test_row_cache_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 
     printf("test_concurrent_stress\n");
     test_concurrent_stress();
+
+    printf("test_burst_mode_grows_budget\n");
+    test_burst_mode_grows_budget();
+
+    printf("test_burst_mode_caches_rows\n");
+    test_burst_mode_caches_rows();
+
+    printf("test_set_max_atoms_runtime\n");
+    test_set_max_atoms_runtime();
+
+    printf("test_deferred_sweeper\n");
+    test_deferred_sweeper();
 
     printf("test-row-cache: ok\n");
 }
