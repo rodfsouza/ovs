@@ -1590,8 +1590,12 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
             if (fmt && fmt->type == JSON_STRING
                 && !strcmp(json_string(fmt), "binary")) {
                 m->binary_transport = true;
-                VLOG_INFO("monitor %s: binary transport negotiated",
-                          json_string(monitor_id));
+                {
+                    char *id_s = json_to_string(monitor_id, 0);
+                    VLOG_INFO("monitor %s: binary transport negotiated",
+                              id_s);
+                    free(id_s);
+                }
             }
         }
     }
@@ -2278,8 +2282,12 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
             binary_stream_cleanup_jobs(m);
             m->binary_initial_streaming = false;
 
-            VLOG_INFO("binary initial snapshot complete for monitor %s",
-                      json_string(m->monitor_id));
+            {
+                char *id_s = json_to_string(m->monitor_id, 0);
+                VLOG_INFO("binary initial snapshot complete for monitor %s",
+                          id_s);
+                free(id_s);
+            }
         }
     }
 }
