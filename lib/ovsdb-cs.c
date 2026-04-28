@@ -231,6 +231,14 @@ struct ovsdb_cs {
 
     /* Binary transport. */
     bool binary_transport;   /* If true, request binary format from server. */
+
+    /* Binary initial snapshot in flight.  Set when the server
+     * acknowledges binary format and the initial table_updates in
+     * the reply is empty (rows arrive via ROW_BATCH frames).
+     * Cleared when INITIAL_END is received.  While true, the CS
+     * stays in CS_S_MONITORING but ovsdb_cs_may_send_transaction()
+     * returns false and the IDL won't report data as ready. */
+    bool binary_initial_pending;
 };
 
 static void ovsdb_cs_transition_at(struct ovsdb_cs *, enum ovsdb_cs_state,
@@ -500,6 +508,30 @@ ovsdb_cs_process_response(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
         } else {
             cs->data.monitor_version = 3;
             ovsdb_cs_transition(cs, CS_S_MONITORING);
+
+            /* Check for binary ack in 4th element.  If present, the
+             * server will stream the initial snapshot as binary
+             * ROW_BATCH frames followed by INITIAL_END.  The 3rd
+             * element (table_updates) is empty — skip it and wait
+             * for binary data before reporting data as ready. */
+            if (msg->result->type == JSON_ARRAY
+                && msg->result->array.n == 4) {
+                const struct json *ack = msg->result->array.elems[3];
+                if (ack->type == JSON_OBJECT
+                    && shash_find(json_object(ack), "format")) {
+                    cs->binary_initial_pending = true;
+                    /* Parse found + last_id but skip empty
+                     * table_updates.  ROW_BATCH frames deliver
+                     * the actual rows. */
+                    if (msg->result->array.elems[1]->type == JSON_STRING) {
+                        uuid_from_string(&cs->data.last_id,
+                            json_string(msg->result->array.elems[1]));
+                    }
+                    VLOG_INFO("binary initial snapshot pending — "
+                              "waiting for ROW_BATCH + INITIAL_END");
+                    break;
+                }
+            }
             ovsdb_cs_db_parse_monitor_reply(&cs->data, msg->result, 3);
         }
         break;
@@ -689,6 +721,15 @@ ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
                                          msg->binary_payload_len);
                 ovsdb_binary_reader_get_uuid(&end_r, &cs->data.last_id);
             }
+            if (cs->binary_initial_pending) {
+                cs->binary_initial_pending = false;
+                /* All ROW_BATCH events are accumulated in
+                 * cs->data.events.  Now that binary_initial_pending
+                 * is false, the next ovsdb_cs_run() iteration will
+                 * flush them to the caller.  The IDL will then
+                 * process the complete initial snapshot and report
+                 * has_ever_connected to the application. */
+            }
             VLOG_INFO("received binary initial snapshot complete");
         } else if (msg->binary_msg_type == OVSDB_BIN_UPDATE_BATCH
                    && msg->binary_payload && msg->binary_payload_len) {
@@ -821,7 +862,15 @@ ovsdb_cs_run(struct ovsdb_cs *cs, struct ovs_list *events)
         ovsdb_cs_process_msg(cs, msg);
         jsonrpc_msg_destroy(msg);
     }
-    ovs_list_push_back_all(events, &cs->data.events);
+
+    /* While binary initial snapshot is in flight, hold back events.
+     * ROW_BATCH frames produce update events that accumulate in
+     * cs->data.events.  Once INITIAL_END arrives and clears the
+     * flag, all accumulated events are flushed to the caller in
+     * one batch — the IDL then processes the complete snapshot. */
+    if (!cs->binary_initial_pending) {
+        ovs_list_push_back_all(events, &cs->data.events);
+    }
 }
 
 /* Arranges for poll_block() to wake up when ovsdb_cs_run() has something to
