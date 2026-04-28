@@ -44,11 +44,24 @@ AT_CHECK([test-binary-codec magic], [0], [magic: PASSED
 ])
 AT_CLEANUP
 
+AT_SETUP([binary codec - 10K row stress test])
+AT_KEYWORDS([ovsdb binary codec stress])
+AT_CHECK([test-binary-codec rows_stress], [0], [ignore])
+AT_CLEANUP
+
+AT_SETUP([binary codec - large datums])
+AT_KEYWORDS([ovsdb binary codec])
+AT_CHECK([test-binary-codec large_datums], [0], [large_datums: PASSED
+])
+AT_CLEANUP
+
 AT_SETUP([binary codec - all tests])
 AT_KEYWORDS([ovsdb binary])
 AT_CHECK([test-binary-codec], [0], [atoms: PASSED
 datums: PASSED
 rows: PASSED
+rows_stress: PASSED (10000 rows)
+large_datums: PASSED
 frames: PASSED
 invalid: PASSED
 magic: PASSED

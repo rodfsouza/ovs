@@ -645,6 +645,222 @@ test_rows(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Stress test: 10K row round-trip.                                   */
+/* ------------------------------------------------------------------ */
+
+#define STRESS_N_ROWS 10000
+
+static void
+test_rows_stress(void)
+{
+    const char *schema_json_str =
+        "{"
+        "  \"columns\": {"
+        "    \"name\":   {\"type\": \"string\"},"
+        "    \"count\":  {\"type\": \"integer\"},"
+        "    \"active\": {\"type\": \"boolean\"}"
+        "  }"
+        "}";
+    struct json *schema_json;
+    struct ovsdb_table_schema *ts;
+    struct ovsdb_error *error;
+    struct ovsdb_binary_buf buf;
+    struct ovsdb_binary_reader reader;
+    struct ovsdb_column_set columns;
+    const struct ovsdb_column *col_name;
+    const struct ovsdb_column *col_count;
+    const struct ovsdb_column *col_active;
+    size_t n_all_columns;
+    size_t r;
+
+    schema_json = json_from_string(schema_json_str);
+    error = ovsdb_table_schema_from_json(schema_json, "StressTable", &ts);
+    ovs_assert(!error);
+
+    col_name = shash_find_data(&ts->columns, "name");
+    col_count = shash_find_data(&ts->columns, "count");
+    col_active = shash_find_data(&ts->columns, "active");
+    ovs_assert(col_name && col_count && col_active);
+
+    ovsdb_column_set_init(&columns);
+    ovsdb_column_set_add(&columns, col_name);
+    ovsdb_column_set_add(&columns, col_count);
+    ovsdb_column_set_add(&columns, col_active);
+
+    n_all_columns = shash_count(&ts->columns);
+
+    /* Serialize 10K rows into a single buffer. */
+    ovsdb_binary_buf_init(&buf);
+    for (r = 0; r < STRESS_N_ROWS; r++) {
+        struct ovsdb_datum *datums = xmalloc(n_all_columns * sizeof *datums);
+        struct uuid row_uuid = uuid_random();
+        char name_val[64];
+        size_t c;
+
+        for (c = 0; c < n_all_columns; c++) {
+            ovsdb_datum_init_empty(&datums[c]);
+        }
+
+        snprintf(name_val, sizeof name_val, "row-%"PRIuSIZE, r);
+        datums[col_name->index].n = 1;
+        datums[col_name->index].keys = xmalloc(sizeof(union ovsdb_atom));
+        datums[col_name->index].keys[0].s = json_string_create(name_val);
+
+        datums[col_count->index].n = 1;
+        datums[col_count->index].keys = xmalloc(sizeof(union ovsdb_atom));
+        datums[col_count->index].keys[0].integer = (int64_t) r;
+
+        datums[col_active->index].n = 1;
+        datums[col_active->index].keys = xmalloc(sizeof(union ovsdb_atom));
+        datums[col_active->index].keys[0].boolean = (r % 2 == 0);
+
+        ovsdb_binary_serialize_row(&buf, &row_uuid, datums, &columns, true);
+
+        for (c = 0; c < n_all_columns; c++) {
+            struct shash_node *sn;
+            SHASH_FOR_EACH (sn, &ts->columns) {
+                const struct ovsdb_column *col = sn->data;
+                if (col->index == c) {
+                    ovsdb_datum_destroy(&datums[c], &col->type);
+                    break;
+                }
+            }
+        }
+        free(datums);
+    }
+
+    /* Deserialize all 10K rows and verify. */
+    ovsdb_binary_reader_init(&reader, buf.data, buf.size);
+    for (r = 0; r < STRESS_N_ROWS; r++) {
+        struct ovsdb_datum *datums = xmalloc(n_all_columns * sizeof *datums);
+        struct uuid out_uuid;
+        char expected_name[64];
+        size_t c;
+
+        for (c = 0; c < n_all_columns; c++) {
+            ovsdb_datum_init_empty(&datums[c]);
+        }
+
+        ovs_assert(ovsdb_binary_deserialize_row(&reader, &out_uuid,
+                                                 datums, n_all_columns,
+                                                 ts, true));
+
+        snprintf(expected_name, sizeof expected_name, "row-%"PRIuSIZE, r);
+        ovs_assert(datums[col_name->index].n == 1);
+        ovs_assert(!strcmp(json_string(datums[col_name->index].keys[0].s),
+                           expected_name));
+        ovs_assert(datums[col_count->index].keys[0].integer == (int64_t) r);
+        ovs_assert(datums[col_active->index].keys[0].boolean == (r % 2 == 0));
+
+        for (c = 0; c < n_all_columns; c++) {
+            struct shash_node *sn;
+            SHASH_FOR_EACH (sn, &ts->columns) {
+                const struct ovsdb_column *col = sn->data;
+                if (col->index == c) {
+                    ovsdb_datum_destroy(&datums[c], &col->type);
+                    break;
+                }
+            }
+        }
+        free(datums);
+    }
+
+    /* Verify reader consumed everything. */
+    ovs_assert(!ovsdb_binary_reader_remaining(&reader, 1));
+
+    ovsdb_column_set_destroy(&columns);
+    ovsdb_binary_buf_destroy(&buf);
+    ovsdb_table_schema_destroy(ts);
+    json_destroy(schema_json);
+
+    printf("rows_stress: PASSED (%d rows)\n", STRESS_N_ROWS);
+}
+
+/* ------------------------------------------------------------------ */
+/* Large datum round-trip: set of 100 strings, map of 50 pairs.       */
+/* ------------------------------------------------------------------ */
+
+static void
+test_large_datums(void)
+{
+    /* Test 1: Set of 100 strings. */
+    {
+        struct ovsdb_binary_buf buf;
+        struct ovsdb_binary_reader reader;
+        struct ovsdb_datum src, dst;
+        struct ovsdb_type type;
+        size_t i;
+
+        ovsdb_base_type_init(&type.key, OVSDB_TYPE_STRING);
+        ovsdb_base_type_init(&type.value, OVSDB_TYPE_VOID);
+        type.n_min = 0;
+        type.n_max = UINT_MAX;
+
+        ovsdb_datum_init_empty(&src);
+        src.n = 100;
+        src.keys = xmalloc(100 * sizeof *src.keys);
+        for (i = 0; i < 100; i++) {
+            char val[32];
+            snprintf(val, sizeof val, "element-%"PRIuSIZE, i);
+            src.keys[i].s = json_string_create(val);
+        }
+
+        ovsdb_binary_buf_init(&buf);
+        ovsdb_binary_serialize_datum(&buf, &src, &type, true);
+
+        ovsdb_binary_reader_init(&reader, buf.data, buf.size);
+        ovsdb_datum_init_empty(&dst);
+        ovs_assert(ovsdb_binary_deserialize_datum(&reader, &dst,
+                                                    &type, true));
+        ovs_assert(dst.n == 100);
+
+        ovsdb_datum_destroy(&src, &type);
+        ovsdb_datum_destroy(&dst, &type);
+        ovsdb_binary_buf_destroy(&buf);
+    }
+
+    /* Test 2: Map of 50 string→integer pairs. */
+    {
+        struct ovsdb_binary_buf buf;
+        struct ovsdb_binary_reader reader;
+        struct ovsdb_datum src, dst;
+        struct ovsdb_type type;
+        size_t i;
+
+        ovsdb_base_type_init(&type.key, OVSDB_TYPE_STRING);
+        ovsdb_base_type_init(&type.value, OVSDB_TYPE_INTEGER);
+        type.n_min = 0;
+        type.n_max = UINT_MAX;
+
+        ovsdb_datum_init_empty(&src);
+        src.n = 50;
+        src.keys = xmalloc(50 * sizeof *src.keys);
+        src.values = xmalloc(50 * sizeof *src.values);
+        for (i = 0; i < 50; i++) {
+            char key[32];
+            snprintf(key, sizeof key, "key-%"PRIuSIZE, i);
+            src.keys[i].s = json_string_create(key);
+            src.values[i].integer = (int64_t) (i * 1000);
+        }
+
+        ovsdb_binary_buf_init(&buf);
+        ovsdb_binary_serialize_datum(&buf, &src, &type, true);
+
+        ovsdb_binary_reader_init(&reader, buf.data, buf.size);
+        ovsdb_datum_init_empty(&dst);
+        ovs_assert(ovsdb_binary_deserialize_datum(&reader, &dst,
+                                                    &type, true));
+        ovs_assert(dst.n == 50);
+
+        ovsdb_datum_destroy(&src, &type);
+        ovsdb_datum_destroy(&dst, &type);
+        ovsdb_binary_buf_destroy(&buf);
+    }
+
+    printf("large_datums: PASSED\n");
+}
+
+/* ------------------------------------------------------------------ */
 /* Main.                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -655,6 +871,8 @@ static struct {
     { "atoms", test_atoms },
     { "datums", test_datums },
     { "rows", test_rows },
+    { "rows_stress", test_rows_stress },
+    { "large_datums", test_large_datums },
     { "frames", test_frames },
     { "invalid", test_invalid_frames },
     { "magic", test_magic },

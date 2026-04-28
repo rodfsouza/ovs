@@ -2048,55 +2048,24 @@ binary_stream_flush_batch(struct binary_stream_worker_ctx *wctx)
     }
 }
 
-/* Per-UUID callback for cache-through worker.
- *
- * Table filtering: ovsdb_disk_store_for_each_uuid() is called with
- * job->table_name, so only UUIDs for THIS table are yielded.
- *
- * Column filtering: ovsdb_binary_serialize_row() uses job->columns
- * which contains only the columns this monitor tracks. */
-static void
-cache_through_row_cb(const struct uuid *uuid, void *aux)
-{
-    struct binary_stream_worker_ctx *wctx = aux;
-    const struct ovsdb_row *row;
-    bool cancelled;
-
-    atomic_read_relaxed(&wctx->job->cancelled, &cancelled);
-    if (cancelled) {
-        return;
-    }
-
-    /* Read through cache: hit = memory, miss = pread + cache insert. */
-    row = ovsdb_table_get_row(wctx->job->table, uuid);
-    if (!row) {
-        return;
-    }
-
-    ovsdb_binary_serialize_row(&wctx->batch, uuid,
-                                row->fields, &wctx->job->columns, true);
-    wctx->rows_in_batch++;
-
-    if (wctx->batch.size >= BINARY_BATCH_MAX_BYTES
-        || wctx->rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
-        binary_stream_flush_batch(wctx);
-    }
-}
-
 /* Worker for subset monitors (e.g., ovn-nbctl list Logical_Router).
- * Reads through cache: cache hit = fast, cache miss = pread + insert.
- * Warms the cache for subsequent per-row lookups.
+ * Uses disk cursor for O(table_rows) iteration (not for_each_uuid
+ * which is O(total_rows)).  Serializes each row to binary FIRST,
+ * then inserts into cache (brief wrlock) — minimizes lock hold
+ * time and avoids main-thread contention.
  *
  * Thread safety:
- *   - ovsdb_table_get_row() acquires cache rwlock internally
- *   - pread() is thread-safe (no shared file offset)
- *   - table->schema->columns is immutable after ovsdb_create()
+ *   - cursor_open() copies index entries under index_rwlock (snapshot)
+ *   - cursor_next() calls pread() (thread-safe, no shared offset)
+ *   - ovsdb_binary_serialize_row() reads row->fields + columns (local)
+ *   - ovsdb_row_cache_insert() acquires wrlock briefly per row
  *   - batches enqueued under job->mutex, signaled via seq */
 static void *
 cache_through_stream_worker_fn(void *arg)
 {
     struct binary_stream_job *job = arg;
     struct binary_stream_worker_ctx wctx;
+    struct ovsdb_disk_store_cursor *cursor;
 
     /* This worker is only for disk-store tables.  In-memory tables
      * are routed to disk_cursor_stream_worker_fn (hmap fallback). */
@@ -2106,13 +2075,57 @@ cache_through_stream_worker_fn(void *arg)
     wctx.rows_in_batch = 0;
     ovsdb_binary_buf_init(&wctx.batch);
 
+    /* Enter burst mode to accommodate the full table scan.
+     * The burst cap (2x base_max_atoms) prevents unlimited growth;
+     * the sweeper gradually shrinks back to base after the scan. */
     if (job->table->cache) {
         ovsdb_row_cache_enter_query_burst(job->table->cache);
     }
 
-    ovsdb_disk_store_for_each_uuid(
-        job->table->disk_store, job->table_name,
-        cache_through_row_cb, &wctx);
+    /* Use disk cursor for O(table_rows) iteration.
+     * cursor_open builds a filtered array of entries for this
+     * table only — no scanning of other tables' UUIDs. */
+    cursor = ovsdb_disk_store_cursor_open(job->table->disk_store,
+                                          job->table_name);
+    if (cursor) {
+        struct ovsdb_row *row;
+
+        while ((row = ovsdb_disk_store_cursor_next(cursor,
+                                                    job->table))) {
+            bool cancelled;
+            const struct uuid *uuid;
+
+            atomic_read_relaxed(&job->cancelled, &cancelled);
+            if (cancelled) {
+                ovsdb_row_destroy(row);
+                break;
+            }
+
+            uuid = ovsdb_row_get_uuid(row);
+
+            /* Serialize FIRST — no locks held, no contention
+             * with the main thread. */
+            ovsdb_binary_serialize_row(&wctx.batch, uuid,
+                                        row->fields, &job->columns,
+                                        true);
+            wctx.rows_in_batch++;
+
+            /* Insert into cache SECOND — brief wrlock.
+             * Cache takes ownership of 'row'. */
+            if (job->table->cache) {
+                size_t n_atoms = ovsdb_row_count_atoms(row);
+                ovsdb_row_cache_insert(job->table->cache, row, n_atoms);
+            } else {
+                ovsdb_row_destroy(row);
+            }
+
+            if (wctx.batch.size >= BINARY_BATCH_MAX_BYTES
+                || wctx.rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+                binary_stream_flush_batch(&wctx);
+            }
+        }
+        ovsdb_disk_store_cursor_close(cursor);
+    }
 
     if (job->table->cache) {
         ovsdb_row_cache_exit_burst(job->table->cache);
