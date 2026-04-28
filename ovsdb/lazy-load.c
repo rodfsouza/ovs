@@ -314,3 +314,9 @@ ovsdb_lazy_load_pool_available(void)
 {
     return lazy_pool != NULL;
 }
+
+struct ovsdb_worker_pool *
+ovsdb_lazy_load_get_pool(void)
+{
+    return lazy_pool;
+}

@@ -32,6 +32,7 @@
 #include "openvswitch/dynamic-string.h"
 #include "monitor.h"
 #include "openvswitch/json.h"
+#include "openvswitch/ofpbuf.h"
 #include "jsonrpc.h"
 #include "lazy-load.h"
 #include "ovsdb-error.h"
@@ -45,6 +46,7 @@
 #include "simap.h"
 #include "storage.h"
 #include "stream.h"
+#include "worker-pool.h"
 #include "table.h"
 #include "timeval.h"
 #include "transaction.h"
@@ -1381,6 +1383,14 @@ struct ovsdb_jsonrpc_monitor {
     /* Binary transport (Phase 5).  When true, incremental updates
      * are sent as binary frames instead of JSON-RPC notifications. */
     bool binary_transport;
+
+    /* Binary initial snapshot streaming (worker-based).
+     * While binary_initial_streaming is true, the worker is
+     * producing batches.  completed_batches are drained and sent
+     * by the session run loop.  'done' is set by the done_fn
+     * after the worker finishes and all batches are sent. */
+    bool binary_initial_streaming;
+    size_t binary_tables_pending;   /* Tables still being streamed. */
 };
 
 static void ovsdb_jsonrpc_monitor_send_binary_initial(
@@ -1932,115 +1942,149 @@ ovsdb_jsonrpc_monitor_remove_all(struct ovsdb_jsonrpc_session *s)
     }
 }
 
-/* Context for binary initial snapshot row callback. */
-struct binary_initial_ctx {
-    struct ovsdb_jsonrpc_session *session;
+/* ------------------------------------------------------------------ */
+/* Worker-based binary initial snapshot streaming.                     */
+/*                                                                     */
+/* One worker job per table.  The worker iterates UUIDs from the       */
+/* disk-store in-memory index (or in-memory hmap), reads each row      */
+/* through the cache, serializes to binary, and collects batches in    */
+/* a list.  The done_fn runs on the main thread and sends all          */
+/* batches via binary frames.  This fully unblocks monitor_create().   */
+/* ------------------------------------------------------------------ */
+
+/* Worker job context for one table. */
+struct binary_stream_job {
+    /* Inputs (set by main, read by worker). */
     struct ovsdb_table *table;
+    char *table_name;                   /* Owned copy. */
+    struct ovsdb_column_set columns;    /* Cloned. */
+
+    /* Output: list of completed batch ofpbufs (worker writes). */
+    struct ovs_list batches;            /* List of struct ofpbuf. */
+
+    /* Back-pointer for done_fn context. */
+    struct ovsdb_jsonrpc_session *session;
+    struct ovsdb_jsonrpc_monitor *monitor;
+};
+
+/* Worker-thread context for building batches. */
+struct binary_stream_worker_ctx {
+    struct binary_stream_job *job;
     struct ovsdb_binary_buf batch;
     uint16_t rows_in_batch;
-    const char *table_name;
-    struct ovsdb_column_set columns;
 };
 
 static void
-binary_initial_flush_batch(struct binary_initial_ctx *ctx)
+binary_stream_flush_batch(struct binary_stream_worker_ctx *wctx)
 {
-    if (ctx->rows_in_batch > 0) {
-        /* Prepend table name + row count header to the batch. */
+    if (wctx->rows_in_batch > 0) {
+        /* Build framed batch: table_name + n_rows + row data. */
         struct ovsdb_binary_buf frame;
-        ovsdb_binary_buf_init(&frame);
-        ovsdb_binary_buf_put_string(&frame, ctx->table_name, true);
-        ovsdb_binary_buf_put_uint16(&frame, ctx->rows_in_batch, true);
-        ovsdb_binary_buf_put(&frame, ctx->batch.data, ctx->batch.size);
+        struct ofpbuf *buf;
 
-        VLOG_DBG("sending binary initial batch for %s "
-                 "(%"PRIu16" rows, %"PRIuSIZE" bytes)",
-                 ctx->table_name, ctx->rows_in_batch, frame.size);
-        jsonrpc_session_send_binary(ctx->session->js,
-                                    OVSDB_BIN_ROW_BATCH,
-                                    frame.data, frame.size);
+        ovsdb_binary_buf_init(&frame);
+        ovsdb_binary_buf_put_string(&frame, wctx->job->table_name, true);
+        ovsdb_binary_buf_put_uint16(&frame, wctx->rows_in_batch, true);
+        ovsdb_binary_buf_put(&frame, wctx->batch.data, wctx->batch.size);
+
+        buf = ofpbuf_new(frame.size);
+        ofpbuf_put(buf, frame.data, frame.size);
+        ovs_list_push_back(&wctx->job->batches, &buf->list_node);
+
         ovsdb_binary_buf_destroy(&frame);
-        ovsdb_binary_buf_clear(&ctx->batch);
-        ctx->rows_in_batch = 0;
+        ovsdb_binary_buf_clear(&wctx->batch);
+        wctx->rows_in_batch = 0;
     }
 }
 
 static void
-binary_initial_row_cb(const struct uuid *uuid, void *aux)
+binary_stream_row_cb(const struct uuid *uuid, void *aux)
 {
-    struct binary_initial_ctx *ctx = aux;
+    struct binary_stream_worker_ctx *wctx = aux;
     const struct ovsdb_row *row;
 
-    row = ovsdb_table_get_row(ctx->table, uuid);
+    row = ovsdb_table_get_row(wctx->job->table, uuid);
     if (!row) {
         return;
     }
 
-    ovsdb_binary_serialize_row(&ctx->batch, uuid,
-                                row->fields, &ctx->columns, true);
-    ctx->rows_in_batch++;
+    ovsdb_binary_serialize_row(&wctx->batch, uuid,
+                                row->fields, &wctx->job->columns, true);
+    wctx->rows_in_batch++;
 
-    if (ctx->batch.size >= BINARY_BATCH_MAX_BYTES || ctx->rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
-        binary_initial_flush_batch(ctx);
+    if (wctx->batch.size >= BINARY_BATCH_MAX_BYTES
+        || wctx->rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+        binary_stream_flush_batch(wctx);
     }
 }
 
-/* Sends the initial snapshot for a binary-transport monitor as
- * a stream of OVSDB_BIN_ROW_BATCH binary frames.  Iterates each
- * monitored table's rows via the disk-store index (if disk-backed)
- * or in-memory hmap, serializing rows using the binary codec.
- * Reads go through the row cache (miss → pread → cache insert). */
-static void
-ovsdb_jsonrpc_monitor_send_binary_initial(
-    struct ovsdb_jsonrpc_session *s,
-    struct ovsdb_jsonrpc_monitor *m,
-    bool initial OVS_UNUSED)
+/* Worker function: runs on a worker thread. */
+static void *
+binary_stream_worker_fn(void *arg)
 {
-    struct shash_node *node;
+    struct binary_stream_job *job = arg;
+    struct binary_stream_worker_ctx wctx;
 
-    SHASH_FOR_EACH (node, &m->db->tables) {
-        struct ovsdb_table *table = node->data;
-        struct binary_initial_ctx ctx;
+    wctx.job = job;
+    wctx.rows_in_batch = 0;
+    ovsdb_binary_buf_init(&wctx.batch);
 
-        /* Build column set for all user columns. */
-        ovsdb_column_set_init(&ctx.columns);
-        ovsdb_column_set_add_all(&ctx.columns, table);
-        ctx.session = s;
-        ctx.table = table;
-        ctx.table_name = node->name;
-        ctx.rows_in_batch = 0;
-        ovsdb_binary_buf_init(&ctx.batch);
-
-        if (table->disk_store) {
-            /* Disk-backed: iterate UUIDs from index, read through cache. */
-            ovsdb_disk_store_for_each_uuid(
-                table->disk_store, node->name,
-                binary_initial_row_cb, &ctx);
-        } else {
-            /* In-memory: iterate table->rows hmap. */
-            const struct ovsdb_row *row;
-            HMAP_FOR_EACH (row, hmap_node, &table->rows) {
-                const struct uuid *uuid = ovsdb_row_get_uuid(row);
-                ovsdb_binary_serialize_row(&ctx.batch, uuid,
-                                            row->fields, &ctx.columns,
-                                            true);
-                ctx.rows_in_batch++;
-                if (ctx.batch.size >= BINARY_BATCH_MAX_BYTES
-                    || ctx.rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
-                    binary_initial_flush_batch(&ctx);
-                }
+    if (job->table->disk_store) {
+        ovsdb_disk_store_for_each_uuid(
+            job->table->disk_store, job->table_name,
+            binary_stream_row_cb, &wctx);
+    } else {
+        const struct ovsdb_row *row;
+        HMAP_FOR_EACH (row, hmap_node, &job->table->rows) {
+            const struct uuid *uuid = ovsdb_row_get_uuid(row);
+            ovsdb_binary_serialize_row(&wctx.batch, uuid,
+                                        row->fields, &job->columns,
+                                        true);
+            wctx.rows_in_batch++;
+            if (wctx.batch.size >= BINARY_BATCH_MAX_BYTES
+                || wctx.rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+                binary_stream_flush_batch(&wctx);
             }
         }
-
-        /* Flush remaining rows. */
-        binary_initial_flush_batch(&ctx);
-
-        ovsdb_binary_buf_destroy(&ctx.batch);
-        ovsdb_column_set_destroy(&ctx.columns);
     }
 
-    /* Send INITIAL_END with txn_id. */
-    {
+    binary_stream_flush_batch(&wctx);
+    ovsdb_binary_buf_destroy(&wctx.batch);
+
+    return job;  /* Returned to done_fn as 'result'. */
+}
+
+/* Done callback: runs on main thread when worker completes.
+ * Sends all accumulated batches and, when all tables are done,
+ * sends INITIAL_END. */
+static void
+binary_stream_done_fn(void *result, void *aux OVS_UNUSED)
+{
+    struct binary_stream_job *job = result;
+    struct ovsdb_jsonrpc_session *s = job->session;
+    struct ovsdb_jsonrpc_monitor *m = job->monitor;
+    struct ofpbuf *buf;
+
+    /* Send all batches. */
+    while (!ovs_list_is_empty(&job->batches)) {
+        buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
+        VLOG_DBG("sending binary initial batch for %s (%"PRIu32" bytes)",
+                 job->table_name, buf->size);
+        jsonrpc_session_send_binary(s->js, OVSDB_BIN_ROW_BATCH,
+                                    buf->data, buf->size);
+        ofpbuf_delete(buf);
+    }
+
+    /* Cleanup job. */
+    free(job->table_name);
+    ovsdb_column_set_destroy(&job->columns);
+    free(job);
+
+    /* Decrement pending count.  When all tables are done, send
+     * INITIAL_END and clear the streaming flag. */
+    ovs_assert(m->binary_tables_pending > 0);
+    m->binary_tables_pending--;
+    if (m->binary_tables_pending == 0) {
         struct ovsdb_binary_buf end_buf;
         ovsdb_binary_buf_init(&end_buf);
         ovsdb_binary_buf_put_uuid(
@@ -2048,10 +2092,56 @@ ovsdb_jsonrpc_monitor_send_binary_initial(
         jsonrpc_session_send_binary(s->js, OVSDB_BIN_INITIAL_END,
                                     end_buf.data, end_buf.size);
         ovsdb_binary_buf_destroy(&end_buf);
+
+        m->binary_initial_streaming = false;
+        VLOG_INFO("binary initial snapshot complete for monitor %s",
+                  json_string(m->monitor_id));
+    }
+}
+
+/* Submits worker jobs for the binary initial snapshot.
+ * One job per table; each runs on a worker thread and the
+ * done_fn sends the batches on the main thread. */
+static void
+ovsdb_jsonrpc_monitor_send_binary_initial(
+    struct ovsdb_jsonrpc_session *s,
+    struct ovsdb_jsonrpc_monitor *m,
+    bool initial OVS_UNUSED)
+{
+    struct ovsdb_worker_pool *pool = ovsdb_lazy_load_get_pool();
+    struct shash_node *node;
+    size_t n_tables = 0;
+
+    if (!pool) {
+        VLOG_WARN("no worker pool available for binary streaming");
+        return;
     }
 
-    VLOG_INFO("binary initial snapshot complete for monitor %s",
-              json_string(m->monitor_id));
+    SHASH_FOR_EACH (node, &m->db->tables) {
+        n_tables++;
+    }
+
+    m->binary_initial_streaming = true;
+    m->binary_tables_pending = n_tables;
+
+    SHASH_FOR_EACH (node, &m->db->tables) {
+        struct ovsdb_table *table = node->data;
+        struct binary_stream_job *job = xzalloc(sizeof *job);
+
+        job->table = table;
+        job->table_name = xstrdup(node->name);
+        ovsdb_column_set_init(&job->columns);
+        ovsdb_column_set_add_all(&job->columns, table);
+        ovs_list_init(&job->batches);
+        job->session = s;
+        job->monitor = m;
+
+        ovsdb_worker_pool_submit(pool, binary_stream_worker_fn,
+                                 job, binary_stream_done_fn, NULL);
+    }
+
+    VLOG_INFO("binary initial snapshot: submitted %"PRIuSIZE
+              " table jobs to worker pool", n_tables);
 }
 
 static struct json *
@@ -2125,7 +2215,7 @@ ovsdb_jsonrpc_monitor_needs_flush(struct ovsdb_jsonrpc_session *s)
     struct ovsdb_jsonrpc_monitor *m;
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
-        if (m->initial_loading) {
+        if (m->initial_loading || m->binary_initial_streaming) {
             continue;
         }
         if (ovsdb_monitor_needs_flush(m->dbmon, m->change_set)) {
@@ -2249,7 +2339,7 @@ ovsdb_jsonrpc_monitor_flush_all(struct ovsdb_jsonrpc_session *s)
     struct ovsdb_jsonrpc_monitor *m;
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
-        if (m->initial_loading) {
+        if (m->initial_loading || m->binary_initial_streaming) {
             continue;
         }
 

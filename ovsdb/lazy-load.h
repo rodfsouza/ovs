@@ -72,5 +72,6 @@ bool ovsdb_lazy_load_has_pending(void);
  * use this to choose between the async deferred path and a
  * synchronous fallback. */
 bool ovsdb_lazy_load_pool_available(void);
+struct ovsdb_worker_pool *ovsdb_lazy_load_get_pool(void);
 
 #endif /* ovsdb/lazy-load.h */
