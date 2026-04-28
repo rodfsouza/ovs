@@ -42,6 +42,7 @@
 #include "openvswitch/poll-loop.h"
 #include "reconnect.h"
 #include "row.h"
+#include "seq.h"
 #include "server.h"
 #include "simap.h"
 #include "storage.h"
@@ -607,6 +608,10 @@ struct ovsdb_jsonrpc_session {
 static void ovsdb_jsonrpc_session_close(struct ovsdb_jsonrpc_session *);
 static int ovsdb_jsonrpc_session_run(struct ovsdb_jsonrpc_session *);
 static void ovsdb_jsonrpc_session_wait(struct ovsdb_jsonrpc_session *);
+static void ovsdb_jsonrpc_session_run_binary_streaming(
+    struct ovsdb_jsonrpc_session *);
+static void ovsdb_jsonrpc_session_wait_binary_streaming(
+    struct ovsdb_jsonrpc_session *);
 static void ovsdb_jsonrpc_session_get_memory_usage(
     const struct ovsdb_jsonrpc_session *, struct simap *usage);
 static void ovsdb_jsonrpc_session_got_request(struct ovsdb_jsonrpc_session *,
@@ -685,6 +690,7 @@ ovsdb_jsonrpc_session_run(struct ovsdb_jsonrpc_session *s)
         struct jsonrpc_msg *msg;
 
         ovsdb_jsonrpc_monitor_flush_all(s);
+        ovsdb_jsonrpc_session_run_binary_streaming(s);
 
         msg = jsonrpc_session_recv(s->js);
         if (msg) {
@@ -730,6 +736,7 @@ ovsdb_jsonrpc_session_wait(struct ovsdb_jsonrpc_session *s)
         } else {
             jsonrpc_session_recv_wait(s->js);
         }
+        ovsdb_jsonrpc_session_wait_binary_streaming(s);
     }
 }
 
@@ -1386,15 +1393,13 @@ struct ovsdb_jsonrpc_monitor {
 
     /* Binary initial snapshot streaming (worker-based).
      * While binary_initial_streaming is true, worker jobs are
-     * in flight.  The done_fn sends batches and decrements
-     * binary_tables_pending.  When it reaches 0, INITIAL_END
-     * is sent and binary_initial_streaming is cleared.
-     *
-     * If the monitor is destroyed while jobs are in flight
-     * (session disconnect), monitor_destroy NULLs the monitor
-     * pointer in each job so done_fn silently discards results. */
+     * in flight producing batches incrementally.  The main
+     * thread drains batches in session_run via seq polling
+     * and sends them as binary frames.  When all jobs are done
+     * and batches drained, INITIAL_END is sent. */
     bool binary_initial_streaming;
-    size_t binary_tables_pending;   /* Tables still being streamed. */
+    struct ovs_list stream_jobs;    /* List of binary_stream_job. */
+    uint64_t stream_seqno;         /* Last seq value observed. */
 };
 
 static void ovsdb_jsonrpc_monitor_send_binary_initial(
@@ -1963,10 +1968,16 @@ struct binary_stream_job {
     char *table_name;                   /* Owned copy. */
     struct ovsdb_column_set columns;    /* Cloned. */
 
-    /* Output: list of completed batch ofpbufs (worker writes). */
+    /* Batch queue (worker writes under mutex, main reads under mutex). */
     struct ovs_list batches;            /* List of struct ofpbuf. */
+    struct ovs_mutex mutex;             /* Protects 'batches' and 'done'. */
+    struct seq *seq;                    /* Signals main thread on new batch. */
+    bool done;                          /* True when worker has finished. */
 
-    /* Back-pointer for done_fn context. */
+    /* Linkage in monitor's stream_jobs list. */
+    struct ovs_list job_node;
+
+    /* Back-pointers (main-thread only after submission). */
     struct ovsdb_jsonrpc_session *session;
     struct ovsdb_jsonrpc_monitor *monitor;
 };
@@ -1993,7 +2004,12 @@ binary_stream_flush_batch(struct binary_stream_worker_ctx *wctx)
 
         buf = ofpbuf_new(frame.size);
         ofpbuf_put(buf, frame.data, frame.size);
+
+        /* Enqueue under mutex and signal main thread. */
+        ovs_mutex_lock(&wctx->job->mutex);
         ovs_list_push_back(&wctx->job->batches, &buf->list_node);
+        ovs_mutex_unlock(&wctx->job->mutex);
+        seq_change(wctx->job->seq);
 
         ovsdb_binary_buf_destroy(&frame);
         ovsdb_binary_buf_clear(&wctx->batch);
@@ -2055,71 +2071,142 @@ binary_stream_worker_fn(void *arg)
     binary_stream_flush_batch(&wctx);
     ovsdb_binary_buf_destroy(&wctx.batch);
 
-    return job;  /* Returned to done_fn as 'result'. */
+    /* Signal completion under mutex. */
+    ovs_mutex_lock(&job->mutex);
+    job->done = true;
+    ovs_mutex_unlock(&job->mutex);
+    seq_change(job->seq);
+
+    return NULL;  /* No done_fn result needed. */
 }
 
-/* Done callback: runs on main thread when worker completes.
- * Sends all accumulated batches and, when all tables are done,
- * sends INITIAL_END. */
-static void
-binary_stream_done_fn(void *result, void *aux OVS_UNUSED)
+/* Drains completed batches from all streaming jobs for monitor 'm',
+ * sending each as a binary frame.  Called from session_run on the
+ * main thread.  Returns true if all jobs are done and batches drained. */
+static bool
+binary_stream_drain_batches(struct ovsdb_jsonrpc_session *s,
+                            struct ovsdb_jsonrpc_monitor *m)
 {
-    struct binary_stream_job *job = result;
-    struct ovsdb_jsonrpc_session *s = job->session;
-    struct ovsdb_jsonrpc_monitor *m = job->monitor;
-    struct ofpbuf *buf;
+    struct binary_stream_job *job;
+    bool all_done = true;
 
-    /* If the monitor was destroyed while we were working (session
-     * disconnect), discard all batches.  monitor_destroy sets
-     * m->session = NULL and defers free(m) to us. */
-    if (!m->session) {
+    LIST_FOR_EACH (job, job_node, &m->stream_jobs) {
+        struct ofpbuf *buf;
+
+        ovs_mutex_lock(&job->mutex);
+        while (!ovs_list_is_empty(&job->batches)) {
+            buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
+            ovs_mutex_unlock(&job->mutex);
+
+            VLOG_DBG("sending binary initial batch for %s "
+                     "(%"PRIu32" bytes)",
+                     job->table_name, buf->size);
+            jsonrpc_session_send_binary(s->js, OVSDB_BIN_ROW_BATCH,
+                                        buf->data, buf->size);
+            ofpbuf_delete(buf);
+
+            ovs_mutex_lock(&job->mutex);
+        }
+        if (!job->done) {
+            all_done = false;
+        }
+        ovs_mutex_unlock(&job->mutex);
+    }
+
+    return all_done;
+}
+
+/* Frees all stream jobs and their resources. */
+static void
+binary_stream_cleanup_jobs(struct ovsdb_jsonrpc_monitor *m)
+{
+    struct binary_stream_job *job;
+
+    LIST_FOR_EACH_SAFE (job, job_node, &m->stream_jobs) {
+        struct ofpbuf *buf;
+
+        /* Discard any remaining batches. */
+        ovs_mutex_lock(&job->mutex);
         while (!ovs_list_is_empty(&job->batches)) {
             buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
             ofpbuf_delete(buf);
         }
+        ovs_mutex_unlock(&job->mutex);
+
+        ovs_list_remove(&job->job_node);
+        ovs_mutex_destroy(&job->mutex);
+        seq_destroy(job->seq);
         free(job->table_name);
         ovsdb_column_set_destroy(&job->columns);
         free(job);
+    }
+}
 
-        m->binary_tables_pending--;
-        if (m->binary_tables_pending == 0) {
-            free(m);  /* Deferred from monitor_destroy. */
+/* Called from session_run to check streaming progress. */
+static void
+ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
+{
+    struct ovsdb_jsonrpc_monitor *m;
+
+    HMAP_FOR_EACH (m, node, &s->monitors) {
+        if (!m->binary_initial_streaming) {
+            continue;
         }
-        return;
+
+        bool all_done = binary_stream_drain_batches(s, m);
+
+        /* Update seqno after draining. */
+        struct binary_stream_job *first_job;
+        first_job = CONTAINER_OF(ovs_list_front(&m->stream_jobs),
+                                 struct binary_stream_job, job_node);
+        m->stream_seqno = seq_read(first_job->seq);
+
+        if (all_done) {
+            /* Send INITIAL_END. */
+            struct ovsdb_binary_buf end_buf;
+            ovsdb_binary_buf_init(&end_buf);
+            ovsdb_binary_buf_put_uuid(
+                &end_buf, ovsdb_monitor_get_last_txnid(m->dbmon));
+            jsonrpc_session_send_binary(s->js, OVSDB_BIN_INITIAL_END,
+                                        end_buf.data, end_buf.size);
+            ovsdb_binary_buf_destroy(&end_buf);
+
+            binary_stream_cleanup_jobs(m);
+            m->binary_initial_streaming = false;
+
+            VLOG_INFO("binary initial snapshot complete for monitor %s",
+                      json_string(m->monitor_id));
+        }
     }
+}
 
-    /* Send all batches. */
-    while (!ovs_list_is_empty(&job->batches)) {
-        buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
-        VLOG_DBG("sending binary initial batch for %s (%"PRIu32" bytes)",
-                 job->table_name, buf->size);
-        jsonrpc_session_send_binary(s->js, OVSDB_BIN_ROW_BATCH,
-                                    buf->data, buf->size);
-        ofpbuf_delete(buf);
+/* Called from session_wait to register seq for poll_block wakeup. */
+static void
+ovsdb_jsonrpc_session_wait_binary_streaming(struct ovsdb_jsonrpc_session *s)
+{
+    struct ovsdb_jsonrpc_monitor *m;
+
+    HMAP_FOR_EACH (m, node, &s->monitors) {
+        if (!m->binary_initial_streaming) {
+            continue;
+        }
+
+        struct binary_stream_job *job;
+        LIST_FOR_EACH (job, job_node, &m->stream_jobs) {
+            seq_wait(job->seq, m->stream_seqno);
+        }
     }
+}
 
-    /* Cleanup job. */
-    free(job->table_name);
-    ovsdb_column_set_destroy(&job->columns);
-    free(job);
-
-    /* Decrement pending count.  When all tables are done, send
-     * INITIAL_END and clear the streaming flag. */
-    ovs_assert(m->binary_tables_pending > 0);
-    m->binary_tables_pending--;
-    if (m->binary_tables_pending == 0) {
-        struct ovsdb_binary_buf end_buf;
-        ovsdb_binary_buf_init(&end_buf);
-        ovsdb_binary_buf_put_uuid(
-            &end_buf, ovsdb_monitor_get_last_txnid(m->dbmon));
-        jsonrpc_session_send_binary(s->js, OVSDB_BIN_INITIAL_END,
-                                    end_buf.data, end_buf.size);
-        ovsdb_binary_buf_destroy(&end_buf);
-
-        m->binary_initial_streaming = false;
-        VLOG_INFO("binary initial snapshot complete for monitor %s",
-                  json_string(m->monitor_id));
-    }
+/* Done callback: runs on main thread.  With incremental delivery,
+ * the main thread already drained batches via session_run.  This
+ * callback only fires after the worker returns NULL.  Nothing to
+ * do here — cleanup happens in binary_stream_cleanup_jobs(). */
+static void
+binary_stream_done_fn(void *result OVS_UNUSED, void *aux OVS_UNUSED)
+{
+    /* No-op.  Batches were already drained incrementally.
+     * Job cleanup happens when session_run detects all_done. */
 }
 
 /* Submits worker jobs for the binary initial snapshot.
@@ -2145,7 +2232,8 @@ ovsdb_jsonrpc_monitor_send_binary_initial(
     }
 
     m->binary_initial_streaming = true;
-    m->binary_tables_pending = n_tables;
+    ovs_list_init(&m->stream_jobs);
+    m->stream_seqno = 0;
 
     SHASH_FOR_EACH (node, &m->db->tables) {
         struct ovsdb_table *table = node->data;
@@ -2156,11 +2244,24 @@ ovsdb_jsonrpc_monitor_send_binary_initial(
         ovsdb_column_set_init(&job->columns);
         ovsdb_column_set_add_all(&job->columns, table);
         ovs_list_init(&job->batches);
+        ovs_mutex_init(&job->mutex);
+        job->seq = seq_create();
+        job->done = false;
         job->session = s;
         job->monitor = m;
 
+        ovs_list_push_back(&m->stream_jobs, &job->job_node);
+
         ovsdb_worker_pool_submit(pool, binary_stream_worker_fn,
                                  job, binary_stream_done_fn, NULL);
+    }
+
+    /* Initialize seqno after creating all seq objects. */
+    if (!ovs_list_is_empty(&m->stream_jobs)) {
+        struct binary_stream_job *first;
+        first = CONTAINER_OF(ovs_list_front(&m->stream_jobs),
+                             struct binary_stream_job, job_node);
+        m->stream_seqno = seq_read(first->seq);
     }
 
     VLOG_INFO("binary initial snapshot: submitted %"PRIuSIZE
@@ -2273,18 +2374,14 @@ ovsdb_jsonrpc_monitor_destroy(struct ovsdb_jsonrpc_monitor *m,
     ovsdb_monitor_session_condition_destroy(m->condition);
 
     if (m->binary_initial_streaming) {
-        /* Worker jobs are in flight.  We can't free the monitor
-         * struct because done_fn references job->monitor.
-         * NULL the session pointer so done_fn knows to discard
-         * results, then let done_fn free the monitor when
-         * binary_tables_pending reaches 0. */
-        m->session = NULL;
-        m->dbmon = NULL;
-        m->condition = NULL;
-        VLOG_INFO("binary streaming in flight, deferring monitor free");
-    } else {
-        free(m);
+        /* Worker jobs may still be in flight.  Drain and discard
+         * any remaining batches, then free all job resources.
+         * Workers only write to job->batches under mutex — they
+         * don't access the monitor struct — so this is safe. */
+        binary_stream_cleanup_jobs(m);
+        m->binary_initial_streaming = false;
     }
+    free(m);
 }
 
 static struct jsonrpc_msg *
