@@ -382,67 +382,29 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
         }
     }
 
-    /* Disk-store path (Phase 1+2).
-     * Check row state in cache to decide: return cached row,
-     * submit async load, or wait for in-progress load. */
-    if (table->disk_store && table->cache) {
-        enum ovsdb_row_state state;
-        state = ovsdb_row_cache_get_state(table->cache, uuid);
-
-        switch (state) {
-        case OVSDB_ROW_CACHED:
-            /* Already loaded — return it. */
-            return ovsdb_row_cache_lookup(table->cache, uuid);
-
-        case OVSDB_ROW_LOADING:
-            /* Load in progress — caller must park. */
+    /* Disk-store path: bloom filter → disk index → pread → cache.
+     * The cache starts cold (no UNLOADED entries); misses go
+     * directly to disk via the UUID→offset index. */
+    if (table->disk_store) {
+        /* Fast negative: bloom filter rejects non-existent UUIDs
+         * without any disk I/O. */
+        if (table->bloom
+            && !ovsdb_bloom_filter_may_contain(table->bloom, uuid)) {
             return NULL;
+        }
 
-        case OVSDB_ROW_ERROR:
-            /* Load permanently failed — don't retry. */
-            return NULL;
-
-        case OVSDB_ROW_UNLOADED:
-            /* Fast negative check: if the bloom filter says the
-             * UUID is definitely not on disk, skip disk I/O. */
-            if (table->bloom
-                && !ovsdb_bloom_filter_may_contain(table->bloom,
-                                                   uuid)) {
-                return NULL;
-            }
-            /* If in backoff period after a failed retry, don't
-             * re-submit yet — return NULL so the trigger parks
-             * and retries on the next poll cycle. */
-            if (!ovsdb_row_cache_is_retry_ready(table->cache,
-                                                uuid)) {
-                return NULL;
-            }
-            /* Submit async load if worker pool available.
-             * ovsdb_lazy_load_request() transitions state to
-             * LOADING internally on success. */
-            if (table->db
-                && ovsdb_lazy_load_request(
-                       table->db,
-                       CONST_CAST(struct ovsdb_table *, table),
-                       uuid)) {
-                return NULL;  /* Caller must park. */
-            }
-            /* No worker pool — fall back to sync load. */
-            row = ovsdb_disk_store_read_row(
-                table->disk_store,
-                CONST_CAST(struct ovsdb_table *, table),
-                uuid);
-            if (row) {
+        /* Synchronous disk read using the UUID→offset index. */
+        row = ovsdb_disk_store_read_row(
+            table->disk_store,
+            CONST_CAST(struct ovsdb_table *, table),
+            uuid);
+        if (row) {
+            if (table->cache) {
                 ovsdb_row_cache_insert(
                     table->cache, row,
                     ovsdb_row_count_atoms(row));
-                return row;
             }
-            /* Sync load failed — record failure (may transition
-             * to ERROR after OVSDB_MAX_LOAD_RETRIES). */
-            ovsdb_row_cache_record_load_failure(
-                table->cache, uuid);
-            break;
+            return row;
         }
     }
 
