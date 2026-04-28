@@ -1,0 +1,57 @@
+AT_BANNER([OVSDB binary codec and protocol tests])
+
+dnl ========== Unit Tests ==========
+
+AT_SETUP([binary codec - atom round-trip])
+AT_KEYWORDS([ovsdb binary codec])
+AT_CHECK([test-binary-codec atoms], [0], [atoms: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary codec - datum round-trip])
+AT_KEYWORDS([ovsdb binary codec])
+AT_CHECK([test-binary-codec datums], [0], [datums: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary codec - row round-trip])
+AT_KEYWORDS([ovsdb binary codec])
+AT_CHECK([test-binary-codec rows], [0], [rows: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary codec - edge cases])
+AT_KEYWORDS([ovsdb binary codec])
+AT_CHECK([test-binary-codec edges], [0], [edges: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary protocol - frame round-trip])
+AT_KEYWORDS([ovsdb binary protocol])
+AT_CHECK([test-binary-codec frames], [0], [frames: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary protocol - invalid frames])
+AT_KEYWORDS([ovsdb binary protocol])
+AT_CHECK([test-binary-codec invalid], [0], [invalid: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary protocol - magic byte detection])
+AT_KEYWORDS([ovsdb binary protocol])
+AT_CHECK([test-binary-codec magic], [0], [magic: PASSED
+])
+AT_CLEANUP
+
+AT_SETUP([binary codec - all tests])
+AT_KEYWORDS([ovsdb binary])
+AT_CHECK([test-binary-codec], [0], [atoms: PASSED
+datums: PASSED
+rows: PASSED
+frames: PASSED
+invalid: PASSED
+magic: PASSED
+edges: PASSED
+])
+AT_CLEANUP

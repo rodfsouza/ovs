@@ -97,6 +97,7 @@ TESTSUITE_AT = \
 	tests/ovsdb-server.at \
 	tests/ovsdb-client.at \
 	tests/ovsdb-monitor.at \
+	tests/ovsdb-binary.at \
 	tests/ovsdb-idl.at \
 	tests/ovsdb-lock.at \
 	tests/ovsdb-rbac.at \
@@ -427,6 +428,10 @@ $(srcdir)/package.m4: $(top_srcdir)/configure.ac
 	  echo 'm4_define([AT_PACKAGE_STRING],    [$(PACKAGE_STRING)])' && \
 	  echo 'm4_define([AT_PACKAGE_BUGREPORT], [$(PACKAGE_BUGREPORT)])'; \
 	} >'$(srcdir)/package.m4'
+
+noinst_PROGRAMS += tests/test-binary-codec
+tests_test_binary_codec_SOURCES = tests/test-binary-codec.c
+tests_test_binary_codec_LDADD = ovsdb/libovsdb.la lib/libopenvswitch.la
 
 noinst_PROGRAMS += tests/test-ovsdb
 tests_test_ovsdb_SOURCES = tests/test-ovsdb.c

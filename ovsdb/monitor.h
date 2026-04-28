@@ -106,6 +106,25 @@ void ovsdb_monitor_get_initial_conditioned(
     struct ovsdb_monitor_session_condition *,
     struct ovsdb_monitor_change_set **);
 
+/* Iterates over the monitored tables in 'dbmon'.  For each table,
+ * calls 'cb' with the table name, the ovsdb_table pointer, the
+ * monitored column set, and 'aux'.  The column set contains only
+ * the columns this monitor is tracking (not all table columns).
+ *
+ * Ownership: the callback takes ownership of 'monitored_columns'
+ * and must call ovsdb_column_set_destroy() when done with it. */
+struct ovsdb_column_set;
+typedef void (*ovsdb_monitor_table_cb)(
+    const char *table_name,
+    const struct ovsdb_table *table,
+    struct ovsdb_column_set *monitored_columns,
+    void *aux);
+void ovsdb_monitor_for_each_table(const struct ovsdb_monitor *,
+                                   ovsdb_monitor_table_cb cb, void *aux);
+
+/* Returns the number of tables being monitored. */
+size_t ovsdb_monitor_get_table_count(const struct ovsdb_monitor *);
+
 /* Disk-store lazy-load helpers. */
 bool ovsdb_monitor_needs_bulk_load(const struct ovsdb_monitor *);
 size_t ovsdb_monitor_submit_bulk_load(struct ovsdb_monitor *);

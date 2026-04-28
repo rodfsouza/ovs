@@ -42,6 +42,7 @@
 #include "openvswitch/poll-loop.h"
 #include "reconnect.h"
 #include "row.h"
+#include "row-cache.h"
 #include "seq.h"
 #include "server.h"
 #include "simap.h"
@@ -2017,12 +2018,20 @@ binary_stream_flush_batch(struct binary_stream_worker_ctx *wctx)
     }
 }
 
+/* Per-UUID callback for cache-through worker.
+ *
+ * Table filtering: ovsdb_disk_store_for_each_uuid() is called with
+ * job->table_name, so only UUIDs for THIS table are yielded.
+ *
+ * Column filtering: ovsdb_binary_serialize_row() uses job->columns
+ * which contains only the columns this monitor tracks. */
 static void
-binary_stream_row_cb(const struct uuid *uuid, void *aux)
+cache_through_row_cb(const struct uuid *uuid, void *aux)
 {
     struct binary_stream_worker_ctx *wctx = aux;
     const struct ovsdb_row *row;
 
+    /* Read through cache: hit = memory, miss = pread + cache insert. */
     row = ovsdb_table_get_row(wctx->job->table, uuid);
     if (!row) {
         return;
@@ -2038,9 +2047,67 @@ binary_stream_row_cb(const struct uuid *uuid, void *aux)
     }
 }
 
-/* Worker function: runs on a worker thread. */
+/* Worker for subset monitors (e.g., ovn-nbctl list Logical_Router).
+ * Reads through cache: cache hit = fast, cache miss = pread + insert.
+ * Warms the cache for subsequent per-row lookups.
+ *
+ * Thread safety:
+ *   - ovsdb_table_get_row() acquires cache rwlock internally
+ *   - pread() is thread-safe (no shared file offset)
+ *   - table->schema->columns is immutable after ovsdb_create()
+ *   - batches enqueued under job->mutex, signaled via seq */
 static void *
-binary_stream_worker_fn(void *arg)
+cache_through_stream_worker_fn(void *arg)
+{
+    struct binary_stream_job *job = arg;
+    struct binary_stream_worker_ctx wctx;
+
+    /* This worker is only for disk-store tables.  In-memory tables
+     * are routed to disk_cursor_stream_worker_fn (hmap fallback). */
+    ovs_assert(job->table->disk_store);
+
+    wctx.job = job;
+    wctx.rows_in_batch = 0;
+    ovsdb_binary_buf_init(&wctx.batch);
+
+    if (job->table->cache) {
+        ovsdb_row_cache_enter_query_burst(job->table->cache);
+    }
+
+    ovsdb_disk_store_for_each_uuid(
+        job->table->disk_store, job->table_name,
+        cache_through_row_cb, &wctx);
+
+    if (job->table->cache) {
+        ovsdb_row_cache_exit_burst(job->table->cache);
+    }
+
+    binary_stream_flush_batch(&wctx);
+    ovsdb_binary_buf_destroy(&wctx.batch);
+
+    ovs_mutex_lock(&job->mutex);
+    job->done = true;
+    ovs_mutex_unlock(&job->mutex);
+    seq_change(job->seq);
+
+    return NULL;
+}
+
+/* Worker for full-DB monitors (northd, ovn-controller).
+ * Uses sequential disk cursor, bypasses cache entirely.
+ * No cache pollution, no eviction thrashing.
+ *
+ * Thread safety:
+ *   - cursor_open() copies index entries under index_rwlock (snapshot)
+ *   - cursor_next() calls pread() (thread-safe, no shared offset)
+ *   - ovsdb_row_create() inside disk_store_read_row only accesses
+ *     table->schema->columns (immutable)
+ *   - row is serialized and destroyed immediately (no shared state)
+ *   - batches enqueued under job->mutex, signaled via seq
+ *
+ * Does NOT touch: table->rows, table->cache, db->triggers. */
+static void *
+disk_cursor_stream_worker_fn(void *arg)
 {
     struct binary_stream_job *job = arg;
     struct binary_stream_worker_ctx wctx;
@@ -2050,13 +2117,44 @@ binary_stream_worker_fn(void *arg)
     ovsdb_binary_buf_init(&wctx.batch);
 
     if (job->table->disk_store) {
-        ovsdb_disk_store_for_each_uuid(
-            job->table->disk_store, job->table_name,
-            binary_stream_row_cb, &wctx);
+        struct ovsdb_disk_store_cursor *cursor;
+
+        cursor = ovsdb_disk_store_cursor_open(job->table->disk_store,
+                                              job->table_name);
+        if (cursor) {
+            struct ovsdb_row *row;
+
+            while ((row = ovsdb_disk_store_cursor_next(cursor,
+                                                        job->table))) {
+                const struct uuid *uuid = ovsdb_row_get_uuid(row);
+
+                ovsdb_binary_serialize_row(&wctx.batch, uuid,
+                                            row->fields, &job->columns,
+                                            true);
+                wctx.rows_in_batch++;
+                ovsdb_row_destroy(row);
+
+                if (wctx.batch.size >= BINARY_BATCH_MAX_BYTES
+                    || wctx.rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+                    binary_stream_flush_batch(&wctx);
+                }
+            }
+            ovsdb_disk_store_cursor_close(cursor);
+        }
     } else {
+        /* In-memory table: iterate hmap directly.
+         *
+         * Thread safety: table->rows is only modified by
+         * transactions, which run on the main thread.  The main
+         * thread is blocked in poll_block() while workers execute,
+         * so the hmap structure is stable during iteration.  This
+         * path is only reached for tables without a disk_store
+         * (pure in-memory databases). */
         const struct ovsdb_row *row;
+
         HMAP_FOR_EACH (row, hmap_node, &job->table->rows) {
             const struct uuid *uuid = ovsdb_row_get_uuid(row);
+
             ovsdb_binary_serialize_row(&wctx.batch, uuid,
                                         row->fields, &job->columns,
                                         true);
@@ -2071,13 +2169,12 @@ binary_stream_worker_fn(void *arg)
     binary_stream_flush_batch(&wctx);
     ovsdb_binary_buf_destroy(&wctx.batch);
 
-    /* Signal completion under mutex. */
     ovs_mutex_lock(&job->mutex);
     job->done = true;
     ovs_mutex_unlock(&job->mutex);
     seq_change(job->seq);
 
-    return NULL;  /* No done_fn result needed. */
+    return NULL;
 }
 
 /* Drains completed batches from all streaming jobs for monitor 'm',
@@ -2209,9 +2306,68 @@ binary_stream_done_fn(void *result OVS_UNUSED, void *aux OVS_UNUSED)
      * Job cleanup happens when session_run detects all_done. */
 }
 
+/* Callback context for submitting binary stream jobs per table. */
+struct binary_initial_ctx {
+    struct ovsdb_jsonrpc_session *session;
+    struct ovsdb_jsonrpc_monitor *monitor;
+    struct ovsdb_worker_pool *pool;
+    size_t n_submitted;
+    bool full_db;   /* True if monitor tracks all DB tables. */
+};
+
+static void
+binary_initial_submit_table(const char *table_name,
+                             const struct ovsdb_table *table,
+                             struct ovsdb_column_set *columns,
+                             void *aux_)
+{
+    struct binary_initial_ctx *ctx = aux_;
+    struct binary_stream_job *job = xzalloc(sizeof *job);
+    ovsdb_worker_fn worker_fn;
+
+    job->table = CONST_CAST(struct ovsdb_table *, table);
+    job->table_name = xstrdup(table_name);
+    /* Take ownership of 'columns' (built by ovsdb_monitor_for_each_table). */
+    job->columns = *columns;
+    ovsdb_column_set_init(columns);
+    ovs_list_init(&job->batches);
+    ovs_mutex_init(&job->mutex);
+    job->seq = seq_create();
+    job->done = false;
+    job->session = ctx->session;
+    job->monitor = ctx->monitor;
+
+    ovs_list_push_back(&ctx->monitor->stream_jobs, &job->job_node);
+
+    /* Select worker based on monitor scope.
+     *
+     * full_db is true when the monitor tracks the same number of
+     * tables as the database contains (n_mon_tables == n_db_tables).
+     * This is a conservative heuristic: a monitor could track all
+     * tables with restrictive conditions and still be classified as
+     * "full-DB".  In that case we bypass cache, which avoids
+     * pollution at the cost of not warming the cache.  This is the
+     * right trade-off for the common case (northd, ovn-controller
+     * monitor everything unconditionally).
+     *
+     *   - Full-DB (northd, ovn-controller): bypass cache.
+     *   - Subset (ovn-nbctl list <table>): warm cache. */
+    if (!table->disk_store) {
+        worker_fn = disk_cursor_stream_worker_fn;  /* Has hmap fallback. */
+    } else if (ctx->full_db) {
+        worker_fn = disk_cursor_stream_worker_fn;
+    } else {
+        worker_fn = cache_through_stream_worker_fn;
+    }
+
+    ovsdb_worker_pool_submit(ctx->pool, worker_fn,
+                             job, binary_stream_done_fn, NULL);
+    ctx->n_submitted++;
+}
+
 /* Submits worker jobs for the binary initial snapshot.
- * One job per table; each runs on a worker thread and the
- * done_fn sends the batches on the main thread. */
+ * One job per MONITORED table (not all DB tables).  Each
+ * runs on a worker thread; batches are drained by session_run. */
 static void
 ovsdb_jsonrpc_monitor_send_binary_initial(
     struct ovsdb_jsonrpc_session *s,
@@ -2219,53 +2375,47 @@ ovsdb_jsonrpc_monitor_send_binary_initial(
     bool initial OVS_UNUSED)
 {
     struct ovsdb_worker_pool *pool = ovsdb_lazy_load_get_pool();
-    struct shash_node *node;
-    size_t n_tables = 0;
+    size_t n_mon_tables;
+    size_t n_db_tables;
 
     if (!pool) {
         VLOG_WARN("no worker pool available for binary streaming");
         return;
     }
 
-    SHASH_FOR_EACH (node, &m->db->tables) {
-        n_tables++;
-    }
+    n_mon_tables = ovsdb_monitor_get_table_count(m->dbmon);
+    n_db_tables = shash_count(&m->db->tables);
 
     m->binary_initial_streaming = true;
     ovs_list_init(&m->stream_jobs);
     m->stream_seqno = 0;
 
-    SHASH_FOR_EACH (node, &m->db->tables) {
-        struct ovsdb_table *table = node->data;
-        struct binary_stream_job *job = xzalloc(sizeof *job);
+    {
+        struct binary_initial_ctx ctx = {
+            .session = s,
+            .monitor = m,
+            .pool = pool,
+            .n_submitted = 0,
+            .full_db = (n_mon_tables == n_db_tables),
+        };
 
-        job->table = table;
-        job->table_name = xstrdup(node->name);
-        ovsdb_column_set_init(&job->columns);
-        ovsdb_column_set_add_all(&job->columns, table);
-        ovs_list_init(&job->batches);
-        ovs_mutex_init(&job->mutex);
-        job->seq = seq_create();
-        job->done = false;
-        job->session = s;
-        job->monitor = m;
+        ovsdb_monitor_for_each_table(m->dbmon,
+                                      binary_initial_submit_table, &ctx);
 
-        ovs_list_push_back(&m->stream_jobs, &job->job_node);
-
-        ovsdb_worker_pool_submit(pool, binary_stream_worker_fn,
-                                 job, binary_stream_done_fn, NULL);
+        VLOG_INFO("binary initial snapshot: submitted %"PRIuSIZE
+                  " table jobs (%s mode) to worker pool",
+                  ctx.n_submitted,
+                  ctx.full_db ? "disk-cursor" : "cache-through");
     }
 
     /* Initialize seqno after creating all seq objects. */
     if (!ovs_list_is_empty(&m->stream_jobs)) {
         struct binary_stream_job *first;
+
         first = CONTAINER_OF(ovs_list_front(&m->stream_jobs),
                              struct binary_stream_job, job_node);
         m->stream_seqno = seq_read(first->seq);
     }
-
-    VLOG_INFO("binary initial snapshot: submitted %"PRIuSIZE
-              " table jobs to worker pool", n_tables);
 }
 
 static struct json *

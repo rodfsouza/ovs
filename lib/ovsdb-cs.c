@@ -340,6 +340,7 @@ ovsdb_cs_create(const char *db_name, int max_version,
     cs->leader_only = true;
     cs->shuffle_remotes = true;
     cs->set_db_change_aware = true;
+    cs->binary_transport = true;
     hmap_init(&cs->server_rows);
 
     return cs;

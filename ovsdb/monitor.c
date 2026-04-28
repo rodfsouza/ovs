@@ -567,6 +567,35 @@ ovsdb_monitor_table_exists(struct ovsdb_monitor *m,
     return shash_find_data(&m->tables, table->schema->name);
 }
 
+void
+ovsdb_monitor_for_each_table(const struct ovsdb_monitor *dbmon,
+                              ovsdb_monitor_table_cb cb, void *aux)
+{
+    struct shash_node *node;
+
+    SHASH_FOR_EACH (node, &dbmon->tables) {
+        struct ovsdb_monitor_table *mt = node->data;
+        struct ovsdb_column_set columns;
+        size_t i;
+
+        ovsdb_column_set_init(&columns);
+        for (i = 0; i < mt->n_columns; i++) {
+            if (mt->columns[i].monitored) {
+                ovsdb_column_set_add(&columns, mt->columns[i].column);
+            }
+        }
+
+        /* Callback takes ownership of 'columns'. */
+        cb(node->name, mt->table, &columns, aux);
+    }
+}
+
+size_t
+ovsdb_monitor_get_table_count(const struct ovsdb_monitor *dbmon)
+{
+    return shash_count(&dbmon->tables);
+}
+
 static struct ovsdb_monitor_change_set *
 ovsdb_monitor_add_change_set(struct ovsdb_monitor *dbmon,
                              bool init_only, const struct uuid *prev_txn)

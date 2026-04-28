@@ -56,5 +56,9 @@ ovsdb_binary_frame_decode(const uint8_t *hdr,
     memcpy(&len_be, &hdr[4], 4);
     *payload_len = ntohl(len_be);
 
+    if (*payload_len > OVSDB_BINARY_MAX_PAYLOAD) {
+        return false;
+    }
+
     return true;
 }
