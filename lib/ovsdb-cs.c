@@ -20,6 +20,8 @@
 
 #include <errno.h>
 
+#include "binary-codec.h"
+#include "binary-protocol.h"
 #include "hash.h"
 #include "jsonrpc.h"
 #include "openvswitch/dynamic-string.h"
@@ -541,6 +543,122 @@ ovsdb_cs_process_response(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
     }
 }
 
+/* Process a binary ROW_BATCH frame: deserialize binary rows,
+ * convert to JSON <table-updates2> format, and feed to the
+ * existing update parser via a synthetic notification. */
+static void
+ovsdb_cs_process_binary_row_batch(struct ovsdb_cs *cs,
+                                  const uint8_t *payload,
+                                  size_t payload_len)
+{
+    struct ovsdb_binary_reader reader;
+    char *table_name = NULL;
+    uint16_t n_rows;
+    struct json *table_updates;
+    struct json *table_rows;
+    uint16_t i;
+    int version;
+    const char *method;
+    struct json *params;
+    struct jsonrpc_msg *synthetic;
+
+    ovsdb_binary_reader_init(&reader, payload, payload_len);
+
+    if (!ovsdb_binary_reader_get_string(&reader, &table_name, true)
+        || !ovsdb_binary_reader_get_uint16(&reader, &n_rows, true)) {
+        free(table_name);
+        VLOG_WARN_RL(&syntax_rl, "malformed binary ROW_BATCH header");
+        return;
+    }
+
+    table_updates = json_object_create();
+    table_rows = json_object_create();
+    json_object_put(table_updates, table_name, table_rows);
+    free(table_name);
+
+    for (i = 0; i < n_rows; i++) {
+        struct uuid row_uuid;
+        uint16_t n_cols, c;
+        struct json *row_json;
+        struct json *row_update;
+        char uuid_str[UUID_LEN + 1];
+
+        if (!ovsdb_binary_reader_get_uuid(&reader, &row_uuid)
+            || !ovsdb_binary_reader_get_uint16(&reader, &n_cols, true)) {
+            break;
+        }
+
+        row_json = json_object_create();
+        for (c = 0; c < n_cols; c++) {
+            char *col_name = NULL;
+            uint8_t key_type, val_type;
+            struct ovsdb_datum datum;
+            struct ovsdb_type col_type;
+
+            if (!ovsdb_binary_reader_get_string(&reader, &col_name, true)
+                || !ovsdb_binary_reader_get_uint8(&reader, &key_type)
+                || !ovsdb_binary_reader_get_uint8(&reader, &val_type)) {
+                free(col_name);
+                json_destroy(row_json);
+                goto done;
+            }
+
+            /* Validate type tags from wire. */
+            if (key_type >= OVSDB_N_TYPES
+                || key_type == OVSDB_TYPE_VOID) {
+                free(col_name);
+                json_destroy(row_json);
+                goto done;
+            }
+
+            memset(&col_type, 0, sizeof col_type);
+            col_type.key.type = key_type;
+            col_type.value.type = val_type;
+            col_type.n_min = 0;
+            col_type.n_max = UINT_MAX;
+
+            if (!ovsdb_binary_deserialize_datum(&reader, &datum,
+                                                &col_type, true)) {
+                free(col_name);
+                json_destroy(row_json);
+                goto done;
+            }
+
+            json_object_put(row_json, col_name,
+                            ovsdb_datum_to_json(&datum, &col_type));
+            ovsdb_datum_destroy(&datum, &col_type);
+            free(col_name);
+        }
+
+        row_update = json_object_create();
+        json_object_put(row_update, "initial", row_json);
+
+        snprintf(uuid_str, sizeof uuid_str,
+                 UUID_FMT, UUID_ARGS(&row_uuid));
+        json_object_put(table_rows, uuid_str, row_update);
+    }
+
+done:
+    version = cs->data.monitor_version;
+    method = (version == 1 ? "update"
+              : version == 2 ? "update2"
+              : "update3");
+
+    if (version == 3) {
+        struct json *last_id = json_string_create_nocopy(
+            xasprintf(UUID_FMT, UUID_ARGS(&cs->data.last_id)));
+        params = json_array_create_3(
+            json_clone(cs->data.monitor_id), last_id, table_updates);
+    } else {
+        params = json_array_create_2(
+            json_clone(cs->data.monitor_id), table_updates);
+    }
+
+    synthetic = jsonrpc_create_notify(method, params);
+    ovsdb_cs_db_parse_update_rpc(&cs->data, synthetic);
+    jsonrpc_msg_destroy(synthetic);
+}
+
 static void
 ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
 {
@@ -556,32 +674,40 @@ ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
     if (msg->is_binary) {
         VLOG_DBG("received binary frame (type=%d, %"PRIuSIZE" bytes)",
                  msg->binary_msg_type, msg->binary_payload_len);
-        if (msg->binary_payload && msg->binary_payload_len) {
-            struct json *json;
-            char *payload_str;
 
-            /* Null-terminate the payload for JSON parsing. */
-            payload_str = xmemdup0((const char *) msg->binary_payload,
-                                   msg->binary_payload_len);
-            json = json_from_string(payload_str);
+        if (msg->binary_msg_type == OVSDB_BIN_ROW_BATCH
+            && msg->binary_payload && msg->binary_payload_len) {
+            ovsdb_cs_process_binary_row_batch(cs, msg->binary_payload,
+                                              msg->binary_payload_len);
+        } else if (msg->binary_msg_type == OVSDB_BIN_INITIAL_END) {
+            /* Parse txn_id from payload and update last_id so
+             * monitor_cond_since can resume from the right point. */
+            if (msg->binary_payload_len >= 16) {
+                struct ovsdb_binary_reader end_r;
+                ovsdb_binary_reader_init(&end_r, msg->binary_payload,
+                                         msg->binary_payload_len);
+                ovsdb_binary_reader_get_uuid(&end_r, &cs->data.last_id);
+            }
+            VLOG_INFO("received binary initial snapshot complete");
+        } else if (msg->binary_msg_type == OVSDB_BIN_UPDATE_BATCH
+                   && msg->binary_payload && msg->binary_payload_len) {
+            /* Transitional: binary frame wrapping JSON for updates. */
+            char *payload_str = xmemdup0(
+                (const char *) msg->binary_payload,
+                msg->binary_payload_len);
+            struct json *json = json_from_string(payload_str);
             free(payload_str);
             if (json->type == JSON_ARRAY) {
-                /* The payload is the monitor update params array.
-                 * Feed it into the existing update path by creating
-                 * a synthetic JSON-RPC notification. */
-                int version = cs->data.monitor_version;
-                const char *method = (version == 1 ? "update"
-                                      : version == 2 ? "update2"
-                                      : "update3");
-                struct jsonrpc_msg *synthetic;
-
-                synthetic = jsonrpc_create_notify(method, json);
-                ovsdb_cs_db_parse_update_rpc(&cs->data, synthetic);
-                jsonrpc_msg_destroy(synthetic);
+                int ver = cs->data.monitor_version;
+                const char *meth = (ver == 1 ? "update"
+                                    : ver == 2 ? "update2"
+                                    : "update3");
+                struct jsonrpc_msg *syn = jsonrpc_create_notify(meth, json);
+                ovsdb_cs_db_parse_update_rpc(&cs->data, syn);
+                jsonrpc_msg_destroy(syn);
             } else {
                 VLOG_WARN_RL(&syntax_rl,
-                             "failed to parse binary frame payload "
-                             "as JSON array");
+                             "failed to parse binary update payload");
                 json_destroy(json);
             }
         }

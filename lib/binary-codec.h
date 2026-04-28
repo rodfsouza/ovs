@@ -26,6 +26,8 @@
 union ovsdb_atom;
 struct ovsdb_datum;
 struct ovsdb_type;
+struct ovsdb_column_set;
+struct ovsdb_table_schema;
 
 /* ------------------------------------------------------------------ */
 /* Serialization buffer.                                               */
@@ -118,5 +120,27 @@ bool ovsdb_binary_deserialize_datum(struct ovsdb_binary_reader *,
                                      struct ovsdb_datum *,
                                      const struct ovsdb_type *,
                                      bool nbo);
+
+/* ------------------------------------------------------------------ */
+/* Row-level codec for network transport.                              */
+/*                                                                     */
+/* Wire format per row:                                                */
+/*   uuid:        16 bytes                                             */
+/*   n_columns:   uint16                                               */
+/*   Per column:  uint16 name_len + name + uint8 key_type              */
+/*                + uint8 val_type + datum                              */
+/* ------------------------------------------------------------------ */
+
+void ovsdb_binary_serialize_row(struct ovsdb_binary_buf *,
+                                const struct uuid *,
+                                const struct ovsdb_datum *datums,
+                                const struct ovsdb_column_set *columns,
+                                bool nbo);
+bool ovsdb_binary_deserialize_row(struct ovsdb_binary_reader *,
+                                  struct uuid *,
+                                  struct ovsdb_datum *datums,
+                                  size_t n_datums,
+                                  const struct ovsdb_table_schema *,
+                                  bool nbo);
 
 #endif /* ovsdb/binary-codec.h */

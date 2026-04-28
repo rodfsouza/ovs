@@ -20,9 +20,12 @@
 #include <arpa/inet.h>
 #include <string.h>
 
+#include "ovsdb/column.h"
 #include "openvswitch/json.h"
+#include "openvswitch/shash.h"
 #include "ovsdb-data.h"
 #include "openvswitch/uuid.h"
+#include "ovsdb/table.h"
 #include "util.h"
 
 /* Sanity caps for untrusted network data.  These do not apply to
@@ -361,13 +364,17 @@ ovsdb_binary_deserialize_atom(struct ovsdb_binary_reader *r,
 
     case OVSDB_TYPE_STRING: {
         uint32_t len;
+        char *s;
         if (!ovsdb_binary_reader_get_uint32(r, &len, nbo)) {
+            return false;
+        }
+        if (nbo && len > BINARY_CODEC_MAX_STRING) {
             return false;
         }
         if (!ovsdb_binary_reader_remaining(r, len)) {
             return false;
         }
-        char *s = xmalloc(len + 1);
+        s = xmalloc(len + 1);
         memcpy(s, r->data + r->pos, len);
         s[len] = '\0';
         r->pos += len;
@@ -475,5 +482,137 @@ error_keys:
     free(datum->keys);
     datum->keys = NULL;
     datum->n = 0;
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Row-level serialization / deserialization.                           */
+/*                                                                     */
+/* Wire format:                                                        */
+/*   uuid:        16 bytes                                             */
+/*   n_columns:   uint16                                               */
+/*   Per column:                                                       */
+/*     col_name:  uint16 len + UTF-8 bytes                             */
+/*     key_type:  uint8                                                */
+/*     val_type:  uint8  (OVSDB_TYPE_VOID for sets/scalars)            */
+/*     datum:     variable (see datum codec above)                     */
+/* ------------------------------------------------------------------ */
+
+void
+ovsdb_binary_serialize_row(struct ovsdb_binary_buf *buf,
+                           const struct uuid *uuid,
+                           const struct ovsdb_datum *datums,
+                           const struct ovsdb_column_set *columns,
+                           bool nbo)
+{
+    size_t i;
+
+    ovsdb_binary_buf_put_uuid(buf, uuid);
+    ovsdb_binary_buf_put_uint16(buf, (uint16_t) columns->n_columns, nbo);
+
+    for (i = 0; i < columns->n_columns; i++) {
+        const struct ovsdb_column *col = columns->columns[i];
+
+        /* Column name. */
+        ovsdb_binary_buf_put_string(buf, col->name, nbo);
+
+        /* Type tags. */
+        ovsdb_binary_buf_put_uint8(buf, (uint8_t) col->type.key.type);
+        ovsdb_binary_buf_put_uint8(buf,
+            (uint8_t) col->type.value.type);
+
+        /* Datum. */
+        ovsdb_binary_serialize_datum(buf, &datums[col->index],
+                                     &col->type, nbo);
+    }
+}
+
+bool
+ovsdb_binary_deserialize_row(struct ovsdb_binary_reader *r,
+                             struct uuid *uuid,
+                             struct ovsdb_datum *datums,
+                             size_t n_datums,
+                             const struct ovsdb_table_schema *schema,
+                             bool nbo)
+{
+    uint16_t n_columns;
+    size_t i;
+
+    if (!ovsdb_binary_reader_get_uuid(r, uuid)) {
+        return false;
+    }
+    if (!ovsdb_binary_reader_get_uint16(r, &n_columns, nbo)) {
+        return false;
+    }
+
+    /* Initialize all datums to empty defaults. */
+    for (i = 0; i < n_datums; i++) {
+        datums[i].n = 0;
+        datums[i].keys = NULL;
+        datums[i].values = NULL;
+        datums[i].refcnt = NULL;
+    }
+
+    for (i = 0; i < n_columns; i++) {
+        char *col_name = NULL;
+        uint8_t key_type, val_type;
+        const struct ovsdb_column *col;
+
+        if (!ovsdb_binary_reader_get_string(r, &col_name, nbo)) {
+            goto error;
+        }
+        if (!ovsdb_binary_reader_get_uint8(r, &key_type)
+            || !ovsdb_binary_reader_get_uint8(r, &val_type)) {
+            free(col_name);
+            goto error;
+        }
+
+        /* Look up column in schema. */
+        col = shash_find_data(&schema->columns, col_name);
+        free(col_name);
+
+        if (!col || (uint8_t) col->type.key.type != key_type
+            || (uint8_t) col->type.value.type != val_type) {
+            /* Unknown column or type mismatch — skip the datum.
+             * We need to consume the bytes even if we discard. */
+            struct ovsdb_type skip_type;
+            struct ovsdb_datum skip_datum;
+
+            memset(&skip_type, 0, sizeof skip_type);
+            skip_type.key.type = key_type;
+            skip_type.value.type = val_type;
+            if (!ovsdb_binary_deserialize_datum(r, &skip_datum,
+                                                &skip_type, nbo)) {
+                goto error;
+            }
+            ovsdb_datum_destroy(&skip_datum, &skip_type);
+            continue;
+        }
+
+        if (!ovsdb_binary_deserialize_datum(r, &datums[col->index],
+                                            &col->type, nbo)) {
+            goto error;
+        }
+    }
+
+    return true;
+
+error:
+    /* Clean up any datums that were successfully deserialized.
+     * All datums were initialized to empty (n=0, keys=NULL),
+     * so destroying empty ones is safe. */
+    for (i = 0; i < n_datums; i++) {
+        if (datums[i].keys) {
+            const struct ovsdb_column *col;
+            struct shash_node *node;
+            SHASH_FOR_EACH (node, &schema->columns) {
+                col = node->data;
+                if (col->index == i) {
+                    ovsdb_datum_destroy(&datums[i], &col->type);
+                    break;
+                }
+            }
+        }
+    }
     return false;
 }

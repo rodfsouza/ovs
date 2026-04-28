@@ -21,8 +21,13 @@
 
 #include "binary-codec.h"
 #include "binary-protocol.h"
+
+/* Binary streaming batch limits. */
+#define BINARY_BATCH_MAX_BYTES  (64 * 1024)
+#define BINARY_BATCH_MAX_ROWS   256
 #include "bitmap.h"
 #include "column.h"
+#include "disk-store.h"
 #include "cooperative-multitasking.h"
 #include "openvswitch/dynamic-string.h"
 #include "monitor.h"
@@ -1378,6 +1383,9 @@ struct ovsdb_jsonrpc_monitor {
     bool binary_transport;
 };
 
+static void ovsdb_jsonrpc_monitor_send_binary_initial(
+    struct ovsdb_jsonrpc_session *, struct ovsdb_jsonrpc_monitor *, bool);
+
 static struct ovsdb_jsonrpc_monitor *
 ovsdb_jsonrpc_monitor_find(struct ovsdb_jsonrpc_session *s,
                            const struct json *monitor_id)
@@ -1656,7 +1664,8 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
          * ovsdb_table_for_each_row_from_disk(), which
          * sync-reads from disk, so the initial snapshot is still
          * complete. */
-        if (ovsdb_monitor_needs_bulk_load(m->dbmon)
+        if (!m->binary_transport
+            && ovsdb_monitor_needs_bulk_load(m->dbmon)
             && ovsdb_lazy_load_pool_available()
             && !ovsdb_monitor_session_condition_is_conditional(
                    m->condition)) {
@@ -1671,6 +1680,42 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
             m->dbmon, m->condition, &m->change_set);
         initial = true;
     }
+
+    /* Binary transport: send a minimal ack reply, then stream the
+     * initial snapshot as binary ROW_BATCH frames.  The client
+     * knows to expect binary data after receiving the ack. */
+    if (m->binary_transport && m->version == OVSDB_MONITOR_V3) {
+        struct json *ack = json_object_create();
+        json_object_put_string(ack, "format", "binary");
+        json_object_put_string(ack, "txn_id",
+            xasprintf(UUID_FMT,
+                      UUID_ARGS(ovsdb_monitor_get_last_txnid(
+                              m->dbmon))));
+
+        /* Send the ack reply first (via the return path). */
+        struct jsonrpc_msg *reply = jsonrpc_create_reply(
+            json_array_create_3(
+                json_boolean_create(!initial),
+                json_string_create_nocopy(
+                    xasprintf(UUID_FMT,
+                              UUID_ARGS(ovsdb_monitor_get_last_txnid(
+                                      m->dbmon)))),
+                ack),
+            request_id);
+        ovsdb_jsonrpc_session_send(s, reply);
+
+        /* Now stream the initial data as binary batches.
+         * This iterates the change set and serializes each row
+         * using the binary codec. */
+        ovsdb_jsonrpc_monitor_send_binary_initial(s, m, initial);
+
+        /* Consume the change set so it's not sent again as an update. */
+        json_destroy(ovsdb_jsonrpc_monitor_compose_update(m, initial));
+
+        /* Return NULL since we already sent the reply above. */
+        return NULL;
+    }
+
     json = ovsdb_jsonrpc_monitor_compose_update(m, initial);
     json = json ? json : json_object_create();
 
@@ -1681,21 +1726,7 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
                                   m->dbmon))));
 
         struct json *json_found = json_boolean_create(!initial);
-        if (m->binary_transport) {
-            /* Include binary transport confirmation in V3 reply.
-             * The initial data is still JSON, but subsequent
-             * updates will use binary frames. */
-            struct json *json_opts = json_object_create();
-            json_object_put_string(json_opts, "format", "binary");
-            struct json *arr = json_array_create_empty();
-            json_array_add(arr, json_found);
-            json_array_add(arr, json_last_id);
-            json_array_add(arr, json);
-            json_array_add(arr, json_opts);
-            json = arr;
-        } else {
-            json = json_array_create_3(json_found, json_last_id, json);
-        }
+        json = json_array_create_3(json_found, json_last_id, json);
     }
 
     return jsonrpc_create_reply(json, request_id);
@@ -1899,6 +1930,128 @@ ovsdb_jsonrpc_monitor_remove_all(struct ovsdb_jsonrpc_session *s)
     HMAP_FOR_EACH_SAFE (m, node, &s->monitors) {
         ovsdb_jsonrpc_monitor_destroy(m, false);
     }
+}
+
+/* Context for binary initial snapshot row callback. */
+struct binary_initial_ctx {
+    struct ovsdb_jsonrpc_session *session;
+    struct ovsdb_table *table;
+    struct ovsdb_binary_buf batch;
+    uint16_t rows_in_batch;
+    const char *table_name;
+    struct ovsdb_column_set columns;
+};
+
+static void
+binary_initial_flush_batch(struct binary_initial_ctx *ctx)
+{
+    if (ctx->rows_in_batch > 0) {
+        /* Prepend table name + row count header to the batch. */
+        struct ovsdb_binary_buf frame;
+        ovsdb_binary_buf_init(&frame);
+        ovsdb_binary_buf_put_string(&frame, ctx->table_name, true);
+        ovsdb_binary_buf_put_uint16(&frame, ctx->rows_in_batch, true);
+        ovsdb_binary_buf_put(&frame, ctx->batch.data, ctx->batch.size);
+
+        VLOG_DBG("sending binary initial batch for %s "
+                 "(%"PRIu16" rows, %"PRIuSIZE" bytes)",
+                 ctx->table_name, ctx->rows_in_batch, frame.size);
+        jsonrpc_session_send_binary(ctx->session->js,
+                                    OVSDB_BIN_ROW_BATCH,
+                                    frame.data, frame.size);
+        ovsdb_binary_buf_destroy(&frame);
+        ovsdb_binary_buf_clear(&ctx->batch);
+        ctx->rows_in_batch = 0;
+    }
+}
+
+static void
+binary_initial_row_cb(const struct uuid *uuid, void *aux)
+{
+    struct binary_initial_ctx *ctx = aux;
+    const struct ovsdb_row *row;
+
+    row = ovsdb_table_get_row(ctx->table, uuid);
+    if (!row) {
+        return;
+    }
+
+    ovsdb_binary_serialize_row(&ctx->batch, uuid,
+                                row->fields, &ctx->columns, true);
+    ctx->rows_in_batch++;
+
+    if (ctx->batch.size >= BINARY_BATCH_MAX_BYTES || ctx->rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+        binary_initial_flush_batch(ctx);
+    }
+}
+
+/* Sends the initial snapshot for a binary-transport monitor as
+ * a stream of OVSDB_BIN_ROW_BATCH binary frames.  Iterates each
+ * monitored table's rows via the disk-store index (if disk-backed)
+ * or in-memory hmap, serializing rows using the binary codec.
+ * Reads go through the row cache (miss → pread → cache insert). */
+static void
+ovsdb_jsonrpc_monitor_send_binary_initial(
+    struct ovsdb_jsonrpc_session *s,
+    struct ovsdb_jsonrpc_monitor *m,
+    bool initial OVS_UNUSED)
+{
+    struct shash_node *node;
+
+    SHASH_FOR_EACH (node, &m->db->tables) {
+        struct ovsdb_table *table = node->data;
+        struct binary_initial_ctx ctx;
+
+        /* Build column set for all user columns. */
+        ovsdb_column_set_init(&ctx.columns);
+        ovsdb_column_set_add_all(&ctx.columns, table);
+        ctx.session = s;
+        ctx.table = table;
+        ctx.table_name = node->name;
+        ctx.rows_in_batch = 0;
+        ovsdb_binary_buf_init(&ctx.batch);
+
+        if (table->disk_store) {
+            /* Disk-backed: iterate UUIDs from index, read through cache. */
+            ovsdb_disk_store_for_each_uuid(
+                table->disk_store, node->name,
+                binary_initial_row_cb, &ctx);
+        } else {
+            /* In-memory: iterate table->rows hmap. */
+            const struct ovsdb_row *row;
+            HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+                const struct uuid *uuid = ovsdb_row_get_uuid(row);
+                ovsdb_binary_serialize_row(&ctx.batch, uuid,
+                                            row->fields, &ctx.columns,
+                                            true);
+                ctx.rows_in_batch++;
+                if (ctx.batch.size >= BINARY_BATCH_MAX_BYTES
+                    || ctx.rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+                    binary_initial_flush_batch(&ctx);
+                }
+            }
+        }
+
+        /* Flush remaining rows. */
+        binary_initial_flush_batch(&ctx);
+
+        ovsdb_binary_buf_destroy(&ctx.batch);
+        ovsdb_column_set_destroy(&ctx.columns);
+    }
+
+    /* Send INITIAL_END with txn_id. */
+    {
+        struct ovsdb_binary_buf end_buf;
+        ovsdb_binary_buf_init(&end_buf);
+        ovsdb_binary_buf_put_uuid(
+            &end_buf, ovsdb_monitor_get_last_txnid(m->dbmon));
+        jsonrpc_session_send_binary(s->js, OVSDB_BIN_INITIAL_END,
+                                    end_buf.data, end_buf.size);
+        ovsdb_binary_buf_destroy(&end_buf);
+    }
+
+    VLOG_INFO("binary initial snapshot complete for monitor %s",
+              json_string(m->monitor_id));
 }
 
 static struct json *
