@@ -554,6 +554,8 @@ ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
      * the _Server database (which uses V1/V2 monitors that do not
      * negotiate binary transport). */
     if (msg->is_binary) {
+        VLOG_DBG("received binary frame (type=%d, %"PRIuSIZE" bytes)",
+                 msg->binary_msg_type, msg->binary_payload_len);
         if (msg->binary_payload && msg->binary_payload_len) {
             struct json *json;
             char *payload_str;

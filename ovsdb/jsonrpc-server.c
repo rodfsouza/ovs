@@ -1562,6 +1562,8 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
             if (fmt && fmt->type == JSON_STRING
                 && !strcmp(json_string(fmt), "binary")) {
                 m->binary_transport = true;
+                VLOG_INFO("monitor %s: binary transport negotiated",
+                          json_string(monitor_id));
             }
         }
     }
@@ -1956,6 +1958,8 @@ ovsdb_jsonrpc_monitor_send_binary_flush(
         json_to_ds(params, 0, &ds);
         json_destroy(params);
 
+        VLOG_DBG("sending binary update batch (%"PRIuSIZE" bytes)",
+                 ds.length);
         jsonrpc_session_send_binary(s->js, OVSDB_BIN_UPDATE_BATCH,
                                     ds_cstr(&ds), ds.length);
         ds_destroy(&ds);
