@@ -2210,8 +2210,15 @@ disk_cursor_stream_worker_fn(void *arg)
         const struct ovsdb_row *row;
 
         HMAP_FOR_EACH (row, hmap_node, &job->table->rows) {
-            const struct uuid *uuid = ovsdb_row_get_uuid(row);
+            bool cancelled;
+            const struct uuid *uuid;
 
+            atomic_read_relaxed(&job->cancelled, &cancelled);
+            if (cancelled) {
+                break;
+            }
+
+            uuid = ovsdb_row_get_uuid(row);
             ovsdb_binary_serialize_row(&wctx.batch, uuid,
                                         row->fields, &job->columns,
                                         true);

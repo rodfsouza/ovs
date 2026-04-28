@@ -433,6 +433,12 @@ ovsdb_cs_restart_fsm(struct ovsdb_cs *cs)
      */
     ovsdb_cs_db_sync_condition(&cs->data);
 
+    /* Clear binary initial state.  If the connection dropped during
+     * binary streaming, no INITIAL_END will ever arrive for the old
+     * monitor.  Without this reset, events would be suppressed
+     * forever after reconnect. */
+    cs->binary_initial_pending = false;
+
     ovsdb_cs_send_schema_request(cs, &cs->server);
     ovsdb_cs_transition(cs, CS_S_SERVER_SCHEMA_REQUESTED);
     cs->data.monitor_version = 0;
@@ -1654,6 +1660,7 @@ ovsdb_cs_may_send_transaction(const struct ovsdb_cs *cs)
 {
     return (cs->session != NULL
             && cs->state == CS_S_MONITORING
+            && !cs->binary_initial_pending
             && (!cs->data.lock_name || ovsdb_cs_has_lock(cs)));
 }
 
