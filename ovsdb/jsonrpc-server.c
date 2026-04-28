@@ -2286,6 +2286,16 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
             m->stream_seq = NULL;
             m->binary_initial_streaming = false;
 
+            /* Initialize the change set for incremental updates.
+             * Binary streaming skipped get_initial, so m->change_set
+             * is NULL.  ovsdb_monitor_needs_flush asserts non-NULL.
+             * Use get_change_set_head to point at the monitor's
+             * current tracking position without scanning rows. */
+            if (!m->change_set) {
+                ovsdb_monitor_get_change_set_head(m->dbmon,
+                                                   &m->change_set);
+            }
+
             {
                 char *id_s = json_to_string(m->monitor_id, 0);
                 VLOG_INFO("binary initial snapshot complete for monitor %s",

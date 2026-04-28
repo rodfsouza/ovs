@@ -568,6 +568,22 @@ ovsdb_monitor_table_exists(struct ovsdb_monitor *m,
 }
 
 void
+ovsdb_monitor_get_change_set_head(struct ovsdb_monitor *dbmon,
+                                   struct ovsdb_monitor_change_set **p_mcs)
+{
+    /* Point the caller at the monitor's current (newest) change set
+     * tracking point.  This says "I'm up to date as of now" without
+     * populating any initial rows.  Future commits will create new
+     * change sets that differ from this one, making needs_flush()
+     * return true so incremental updates are sent. */
+    if (!dbmon->new_change_set) {
+        ovsdb_monitor_track_new_change_set(dbmon);
+    }
+    dbmon->new_change_set->n_refs++;
+    *p_mcs = dbmon->new_change_set;
+}
+
+void
 ovsdb_monitor_for_each_table(const struct ovsdb_monitor *dbmon,
                               ovsdb_monitor_table_cb cb, void *aux)
 {

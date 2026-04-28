@@ -106,6 +106,13 @@ void ovsdb_monitor_get_initial_conditioned(
     struct ovsdb_monitor_session_condition *,
     struct ovsdb_monitor_change_set **);
 
+/* Sets '*p_mcs' to the monitor's current change set tracking point
+ * WITHOUT populating initial data (no row scanning).  Used by binary
+ * streaming: workers deliver the initial data, and we just need the
+ * change set pointer so incremental updates work after INITIAL_END. */
+void ovsdb_monitor_get_change_set_head(struct ovsdb_monitor *,
+                                        struct ovsdb_monitor_change_set **);
+
 /* Iterates over the monitored tables in 'dbmon'.  For each table,
  * calls 'cb' with the table name, the ovsdb_table pointer, the
  * monitored column set, and 'aux'.  The column set contains only
