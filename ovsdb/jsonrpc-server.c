@@ -1703,8 +1703,15 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
 
     /* Binary transport: send a minimal ack reply, then stream the
      * initial snapshot as binary ROW_BATCH frames.  The client
-     * knows to expect binary data after receiving the ack. */
-    if (m->binary_transport && m->version == OVSDB_MONITOR_V3) {
+     * knows to expect binary data after receiving the ack.
+     *
+     * Only enter this path if the worker pool is available.
+     * Otherwise fall through to the synchronous JSON path below.
+     * Without workers we cannot stream binary batches, and sending
+     * the ack without follow-up ROW_BATCH/INITIAL_END would leave
+     * the client waiting forever. */
+    if (m->binary_transport && m->version == OVSDB_MONITOR_V3
+        && ovsdb_lazy_load_pool_available()) {
         struct json *ack = json_object_create();
         json_object_put_string(ack, "format", "binary");
         json_object_put_string(ack, "txn_id",
