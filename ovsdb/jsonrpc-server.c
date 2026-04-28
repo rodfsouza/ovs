@@ -1399,7 +1399,8 @@ struct ovsdb_jsonrpc_monitor {
      * and batches drained, INITIAL_END is sent. */
     bool binary_initial_streaming;
     struct ovs_list stream_jobs;    /* List of binary_stream_job. */
-    uint64_t stream_seqno;         /* Last seq value observed. */
+    struct seq *stream_seq;         /* Shared seq for all jobs. */
+    uint64_t stream_seqno;          /* Last seq value observed. */
 };
 
 static void ovsdb_jsonrpc_monitor_send_binary_initial(
@@ -1699,65 +1700,59 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
             return NULL;  /* Reply deferred — sent by
                            * monitor_complete_deferred(). */
         }
+        /* Binary transport: skip the expensive get_initial change set
+         * population — workers will read directly from disk.
+         *
+         * Only enter this path if the worker pool is available.
+         * Otherwise fall through to the JSON path which needs
+         * the change set. */
+        if (m->binary_transport && m->version == OVSDB_MONITOR_V3
+            && ovsdb_lazy_load_pool_available()) {
+            /* Build a 4-element V3 reply:
+             *   [0] found (boolean)
+             *   [1] last_txn_id (string)
+             *   [2] table_updates (empty — rows come via binary)
+             *   [3] binary ack ({"format":"binary"})
+             *
+             * Element [2] MUST be an empty object, not the ack,
+             * because the client parses [2] as table-updates2. */
+            struct json *ack = json_object_create();
+            struct json *reply_array;
+            struct jsonrpc_msg *reply;
+
+            json_object_put_string(ack, "format", "binary");
+
+            reply_array = json_array_create_empty();
+            json_array_add(reply_array, json_boolean_create(false));
+            json_array_add(reply_array,
+                           json_string_create_nocopy(
+                               xasprintf(UUID_FMT,
+                                   UUID_ARGS(ovsdb_monitor_get_last_txnid(
+                                                   m->dbmon)))));
+            json_array_add(reply_array, json_object_create());
+            json_array_add(reply_array, ack);
+
+            reply = jsonrpc_create_reply(reply_array, request_id);
+
+            /* Mark streaming BEFORE send, because session_send
+             * calls flush_all which would otherwise see
+             * binary_transport=true + streaming=false and send
+             * initial data as a binary update batch. */
+            m->binary_initial_streaming = true;
+
+            ovsdb_jsonrpc_session_send(s, reply);
+
+            /* Submit worker jobs — they read directly from disk,
+             * bypassing the change set and the cache entirely. */
+            ovsdb_jsonrpc_monitor_send_binary_initial(s, m, true);
+
+            return NULL;
+        }
+
+        /* JSON path: populate the change set (reads all rows). */
         ovsdb_monitor_get_initial_conditioned(
             m->dbmon, m->condition, &m->change_set);
         initial = true;
-    }
-
-    /* Binary transport: send a minimal ack reply, then stream the
-     * initial snapshot as binary ROW_BATCH frames.  The client
-     * knows to expect binary data after receiving the ack.
-     *
-     * Only enter this path if the worker pool is available.
-     * Otherwise fall through to the synchronous JSON path below.
-     * Without workers we cannot stream binary batches, and sending
-     * the ack without follow-up ROW_BATCH/INITIAL_END would leave
-     * the client waiting forever. */
-    if (m->binary_transport && m->version == OVSDB_MONITOR_V3
-        && ovsdb_lazy_load_pool_available()) {
-        /* Build a 4-element V3 reply:
-         *   [0] found (boolean)
-         *   [1] last_txn_id (string)
-         *   [2] table_updates (empty object — rows come via binary)
-         *   [3] binary ack ({"format":"binary"})
-         *
-         * Element [2] MUST be an empty object, not the ack, because
-         * the client parses element [2] as table-updates2 and would
-         * try to interpret ack keys as table names. */
-        struct json *ack = json_object_create();
-        json_object_put_string(ack, "format", "binary");
-
-        struct json *reply_array = json_array_create_empty();
-        json_array_add(reply_array, json_boolean_create(!initial));
-        json_array_add(reply_array,
-                       json_string_create_nocopy(
-                           xasprintf(UUID_FMT,
-                                     UUID_ARGS(ovsdb_monitor_get_last_txnid(
-                                             m->dbmon)))));
-        json_array_add(reply_array, json_object_create()); /* Empty updates. */
-        json_array_add(reply_array, ack);
-
-        struct jsonrpc_msg *reply = jsonrpc_create_reply(reply_array,
-                                                          request_id);
-
-        /* Mark streaming BEFORE send, because session_send calls
-         * flush_all which would otherwise see binary_transport=true
-         * + binary_initial_streaming=false and send the initial
-         * data as a binary update batch before the reply. */
-        m->binary_initial_streaming = true;
-
-        ovsdb_jsonrpc_session_send(s, reply);
-
-        /* Now stream the initial data as binary batches.
-         * This iterates the change set and serializes each row
-         * using the binary codec. */
-        ovsdb_jsonrpc_monitor_send_binary_initial(s, m, initial);
-
-        /* Consume the change set so it's not sent again as an update. */
-        json_destroy(ovsdb_jsonrpc_monitor_compose_update(m, initial));
-
-        /* Return NULL since we already sent the reply above. */
-        return NULL;
     }
 
     json = ovsdb_jsonrpc_monitor_compose_update(m, initial);
@@ -1996,7 +1991,7 @@ struct binary_stream_job {
     /* Batch queue (worker writes under mutex, main reads under mutex). */
     struct ovs_list batches;            /* List of struct ofpbuf. */
     struct ovs_mutex mutex;             /* Protects 'batches' and 'done'. */
-    struct seq *seq;                    /* Signals main thread on new batch. */
+    struct seq *seq;                    /* Shared seq (owned by monitor). */
     bool done;                          /* True when worker has finished. */
 
     /* Cancellation flag.  Set by cleanup_jobs on disconnect,
@@ -2205,7 +2200,7 @@ binary_stream_job_destroy(struct binary_stream_job *job)
     }
 
     ovs_mutex_destroy(&job->mutex);
-    seq_destroy(job->seq);
+    /* seq is shared (owned by monitor), not destroyed here. */
     free(job->table_name);
     ovsdb_column_set_destroy(&job->columns);
     free(job);
@@ -2267,11 +2262,8 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
             return;
         }
 
-        /* Update seqno after draining. */
-        struct binary_stream_job *first_job;
-        first_job = CONTAINER_OF(ovs_list_front(&m->stream_jobs),
-                                 struct binary_stream_job, job_node);
-        m->stream_seqno = seq_read(first_job->seq);
+        /* Update seqno after draining (shared seq for all jobs). */
+        m->stream_seqno = seq_read(m->stream_seq);
 
         if (all_done) {
             struct binary_stream_job *job;
@@ -2290,6 +2282,8 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
                 ovs_list_remove(&job->job_node);
                 binary_stream_job_destroy(job);
             }
+            seq_destroy(m->stream_seq);
+            m->stream_seq = NULL;
             m->binary_initial_streaming = false;
 
             {
@@ -2313,10 +2307,7 @@ ovsdb_jsonrpc_session_wait_binary_streaming(struct ovsdb_jsonrpc_session *s)
             continue;
         }
 
-        struct binary_stream_job *job;
-        LIST_FOR_EACH (job, job_node, &m->stream_jobs) {
-            seq_wait(job->seq, m->stream_seqno);
-        }
+        seq_wait(m->stream_seq, m->stream_seqno);
     }
 }
 
@@ -2367,7 +2358,7 @@ binary_initial_submit_table(const char *table_name,
     ovsdb_column_set_init(columns);
     ovs_list_init(&job->batches);
     ovs_mutex_init(&job->mutex);
-    job->seq = seq_create();
+    job->seq = ctx->monitor->stream_seq;  /* Shared seq. */
     job->done = false;
     atomic_init(&job->cancelled, false);
     job->session = ctx->session;
@@ -2408,7 +2399,8 @@ ovsdb_jsonrpc_monitor_send_binary_initial(
 
     m->binary_initial_streaming = true;
     ovs_list_init(&m->stream_jobs);
-    m->stream_seqno = 0;
+    m->stream_seq = seq_create();
+    m->stream_seqno = seq_read(m->stream_seq);
 
     {
         struct binary_initial_ctx ctx = {
@@ -2423,15 +2415,6 @@ ovsdb_jsonrpc_monitor_send_binary_initial(
 
         VLOG_INFO("binary initial snapshot: submitted %"PRIuSIZE
                   " table jobs to worker pool", ctx.n_submitted);
-    }
-
-    /* Initialize seqno after creating all seq objects. */
-    if (!ovs_list_is_empty(&m->stream_jobs)) {
-        struct binary_stream_job *first;
-
-        first = CONTAINER_OF(ovs_list_front(&m->stream_jobs),
-                             struct binary_stream_job, job_node);
-        m->stream_seqno = seq_read(first->seq);
     }
 }
 
@@ -2546,6 +2529,9 @@ ovsdb_jsonrpc_monitor_destroy(struct ovsdb_jsonrpc_monitor *m,
          * Workers only write to job->batches under mutex — they
          * don't access the monitor struct — so this is safe. */
         binary_stream_cleanup_jobs(m);
+        /* Don't destroy stream_seq here — workers may still
+         * call seq_change on it.  It will be destroyed when the
+         * last done_fn fires, or leaked (tiny, a few bytes). */
         m->binary_initial_streaming = false;
     }
     free(m);
