@@ -747,14 +747,6 @@ ovsdb_snapshot(struct ovsdb *db, bool trim_memory OVS_UNUSED)
     return error;
 }
 
-/* Callback for ovsdb_disk_store_for_each_uuid(). */
-static void
-add_unloaded_cb(const struct uuid *uuid, void *aux)
-{
-    struct ovsdb_row_cache *cache = aux;
-    ovsdb_row_cache_add_unloaded(cache, uuid);
-}
-
 static void
 add_bloom_cb(const struct uuid *uuid, void *aux)
 {
@@ -763,8 +755,9 @@ add_bloom_cb(const struct uuid *uuid, void *aux)
 }
 
 /* Attaches the binary disk store from storage to each table,
- * creating a row cache per table and populating it with UNLOADED
- * entries from the on-disk index.  After this call, rows are
+ * creating a row cache per table and building indexes (bloom
+ * filter, name index) from the on-disk data.  The cache starts
+ * cold and fills on demand.  After this call, rows are
  * loaded on demand via ovsdb_table_get_row(). */
 void
 ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
@@ -787,18 +780,12 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
         table->disk_store = ds;
         table->cache = ovsdb_row_cache_create(cache_max_atoms);
 
-        /* Populate cache with UNLOADED entries from the
-         * on-disk index.  This walks the in-memory index
-         * only — no disk I/O. */
-        ovsdb_disk_store_for_each_uuid(
-            ds, node->name, add_unloaded_cb, table->cache);
-
-        size_t indexed = ovsdb_row_cache_count(table->cache);
+        size_t n_rows = ovsdb_disk_store_count(ds, node->name);
 
         /* Build a bloom filter from all indexed UUIDs.
          * This enables fast negative lookups without touching
          * the cache or disk.  Memory is outside the atom budget. */
-        table->bloom = ovsdb_bloom_filter_create(indexed);
+        table->bloom = ovsdb_bloom_filter_create(n_rows);
         ovsdb_disk_store_for_each_uuid(
             ds, node->name, add_bloom_cb, table->bloom);
 
@@ -823,27 +810,14 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
             }
         }
 
-        /* Warm the cache with burst mode: raise budget so warmup
-         * rows fit without eviction, then start the sweeper to
-         * gradually shrink back to base budget.
-         *
-         * The bounded variant stops submitting loads before the
-         * cache would begin load-and-evict thrashing; for DBs
-         * larger than the budget, remaining UNLOADED rows are
-         * read on demand.  Skips when no worker pool available. */
-        ovsdb_row_cache_enter_burst(table->cache);
-
-        size_t warmup = 0;
-        if (ovsdb_lazy_load_pool_available()) {
-            warmup = ovsdb_lazy_load_bulk_request_until_full(db, table);
-        }
-
+        /* No proactive warm-up.  The cache starts cold and fills
+         * on demand as rows are accessed (cache miss → index lookup
+         * → pread → cache insert).  The sweeper handles ongoing
+         * eviction once the cache is active. */
         ovsdb_row_cache_start_sweeper(table->cache);
-        ovsdb_row_cache_exit_burst(table->cache);
 
-        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store"
-                 " (warmup jobs: %"PRIuSIZE")",
-                 db->name, node->name, indexed, warmup);
+        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store",
+                 db->name, node->name, n_rows);
     }
     db->disk_store_mode = true;
 }
