@@ -1385,10 +1385,14 @@ struct ovsdb_jsonrpc_monitor {
     bool binary_transport;
 
     /* Binary initial snapshot streaming (worker-based).
-     * While binary_initial_streaming is true, the worker is
-     * producing batches.  completed_batches are drained and sent
-     * by the session run loop.  'done' is set by the done_fn
-     * after the worker finishes and all batches are sent. */
+     * While binary_initial_streaming is true, worker jobs are
+     * in flight.  The done_fn sends batches and decrements
+     * binary_tables_pending.  When it reaches 0, INITIAL_END
+     * is sent and binary_initial_streaming is cleared.
+     *
+     * If the monitor is destroyed while jobs are in flight
+     * (session disconnect), monitor_destroy NULLs the monitor
+     * pointer in each job so done_fn silently discards results. */
     bool binary_initial_streaming;
     size_t binary_tables_pending;   /* Tables still being streamed. */
 };
@@ -2065,6 +2069,25 @@ binary_stream_done_fn(void *result, void *aux OVS_UNUSED)
     struct ovsdb_jsonrpc_monitor *m = job->monitor;
     struct ofpbuf *buf;
 
+    /* If the monitor was destroyed while we were working (session
+     * disconnect), discard all batches.  monitor_destroy sets
+     * m->session = NULL and defers free(m) to us. */
+    if (!m->session) {
+        while (!ovs_list_is_empty(&job->batches)) {
+            buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
+            ofpbuf_delete(buf);
+        }
+        free(job->table_name);
+        ovsdb_column_set_destroy(&job->columns);
+        free(job);
+
+        m->binary_tables_pending--;
+        if (m->binary_tables_pending == 0) {
+            free(m);  /* Deferred from monitor_destroy. */
+        }
+        return;
+    }
+
     /* Send all batches. */
     while (!ovs_list_is_empty(&job->batches)) {
         buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
@@ -2248,7 +2271,20 @@ ovsdb_jsonrpc_monitor_destroy(struct ovsdb_jsonrpc_monitor *m,
     hmap_remove(&m->session->monitors, &m->node);
     ovsdb_monitor_remove_jsonrpc_monitor(m->dbmon, m, m->change_set);
     ovsdb_monitor_session_condition_destroy(m->condition);
-    free(m);
+
+    if (m->binary_initial_streaming) {
+        /* Worker jobs are in flight.  We can't free the monitor
+         * struct because done_fn references job->monitor.
+         * NULL the session pointer so done_fn knows to discard
+         * results, then let done_fn free the monitor when
+         * binary_tables_pending reaches 0. */
+        m->session = NULL;
+        m->dbmon = NULL;
+        m->condition = NULL;
+        VLOG_INFO("binary streaming in flight, deferring monitor free");
+    } else {
+        free(m);
+    }
 }
 
 static struct jsonrpc_msg *
