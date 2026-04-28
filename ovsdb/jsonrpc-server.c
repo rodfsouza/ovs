@@ -1986,6 +1986,11 @@ struct binary_stream_job {
     struct seq *seq;                    /* Signals main thread on new batch. */
     bool done;                          /* True when worker has finished. */
 
+    /* Cancellation flag.  Set by cleanup_jobs on disconnect,
+     * read by worker to abort early.  Atomic because it is
+     * written by the main thread and read by the worker. */
+    ATOMIC(bool) cancelled;
+
     /* Linkage in monitor's stream_jobs list. */
     struct ovs_list job_node;
 
@@ -2041,6 +2046,12 @@ cache_through_row_cb(const struct uuid *uuid, void *aux)
 {
     struct binary_stream_worker_ctx *wctx = aux;
     const struct ovsdb_row *row;
+    bool cancelled;
+
+    atomic_read_relaxed(&wctx->job->cancelled, &cancelled);
+    if (cancelled) {
+        return;
+    }
 
     /* Read through cache: hit = memory, miss = pread + cache insert. */
     row = ovsdb_table_get_row(wctx->job->table, uuid);
@@ -2137,8 +2148,16 @@ disk_cursor_stream_worker_fn(void *arg)
 
             while ((row = ovsdb_disk_store_cursor_next(cursor,
                                                         job->table))) {
-                const struct uuid *uuid = ovsdb_row_get_uuid(row);
+                bool cancelled;
+                const struct uuid *uuid;
 
+                atomic_read_relaxed(&job->cancelled, &cancelled);
+                if (cancelled) {
+                    ovsdb_row_destroy(row);
+                    break;
+                }
+
+                uuid = ovsdb_row_get_uuid(row);
                 ovsdb_binary_serialize_row(&wctx.batch, uuid,
                                             row->fields, &job->columns,
                                             true);
@@ -2232,7 +2251,37 @@ binary_stream_drain_batches(struct ovsdb_jsonrpc_session *s,
     return all_done;
 }
 
-/* Frees all stream jobs and their resources. */
+/* Frees a single stream job and all its owned resources.
+ * Called from done_fn on the main thread AFTER the worker has
+ * finished, so no locks or atomic checks needed. */
+static void
+binary_stream_job_destroy(struct binary_stream_job *job)
+{
+    struct ofpbuf *buf;
+
+    /* Drain any batches the worker produced after cancellation. */
+    while (!ovs_list_is_empty(&job->batches)) {
+        buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
+        ofpbuf_delete(buf);
+    }
+
+    ovs_mutex_destroy(&job->mutex);
+    seq_destroy(job->seq);
+    free(job->table_name);
+    ovsdb_column_set_destroy(&job->columns);
+    free(job);
+}
+
+/* Signals cancellation and detaches all stream jobs.
+ *
+ * Does NOT free the jobs — the worker thread may still be
+ * running.  done_fn (which runs on the main thread after the
+ * worker returns) handles the actual free.
+ *
+ * This is safe because:
+ *   - atomic_store to 'cancelled' is lock-free
+ *   - batch drain under mutex is safe (worker also locks)
+ *   - ovs_list_remove only touches main-thread linkage */
 static void
 binary_stream_cleanup_jobs(struct ovsdb_jsonrpc_monitor *m)
 {
@@ -2241,7 +2290,10 @@ binary_stream_cleanup_jobs(struct ovsdb_jsonrpc_monitor *m)
     LIST_FOR_EACH_SAFE (job, job_node, &m->stream_jobs) {
         struct ofpbuf *buf;
 
-        /* Discard any remaining batches. */
+        /* Signal worker to abort. */
+        atomic_store_relaxed(&job->cancelled, true);
+
+        /* Drain batches already produced (under mutex — safe). */
         ovs_mutex_lock(&job->mutex);
         while (!ovs_list_is_empty(&job->batches)) {
             buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
@@ -2249,12 +2301,11 @@ binary_stream_cleanup_jobs(struct ovsdb_jsonrpc_monitor *m)
         }
         ovs_mutex_unlock(&job->mutex);
 
+        /* Detach from monitor's list.  The job struct stays alive
+         * until done_fn fires after the worker completes. */
         ovs_list_remove(&job->job_node);
-        ovs_mutex_destroy(&job->mutex);
-        seq_destroy(job->seq);
-        free(job->table_name);
-        ovsdb_column_set_destroy(&job->columns);
-        free(job);
+        job->monitor = NULL;
+        job->session = NULL;
     }
 }
 
@@ -2284,6 +2335,8 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
         m->stream_seqno = seq_read(first_job->seq);
 
         if (all_done) {
+            struct binary_stream_job *job;
+
             /* Send INITIAL_END. */
             struct ovsdb_binary_buf end_buf;
             ovsdb_binary_buf_init(&end_buf);
@@ -2293,7 +2346,11 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
                                         end_buf.data, end_buf.size);
             ovsdb_binary_buf_destroy(&end_buf);
 
-            binary_stream_cleanup_jobs(m);
+            /* All workers are done — safe to free jobs directly. */
+            LIST_FOR_EACH_SAFE (job, job_node, &m->stream_jobs) {
+                ovs_list_remove(&job->job_node);
+                binary_stream_job_destroy(job);
+            }
             m->binary_initial_streaming = false;
 
             {
@@ -2324,15 +2381,27 @@ ovsdb_jsonrpc_session_wait_binary_streaming(struct ovsdb_jsonrpc_session *s)
     }
 }
 
-/* Done callback: runs on main thread.  With incremental delivery,
- * the main thread already drained batches via session_run.  This
- * callback only fires after the worker returns NULL.  Nothing to
- * do here — cleanup happens in binary_stream_cleanup_jobs(). */
+/* Done callback: runs on main thread after the worker finishes.
+ *
+ * If the monitor was destroyed while the worker was running
+ * (session disconnect), job->monitor is NULL and we just free
+ * the job.  Otherwise, session_run handles normal completion. */
 static void
-binary_stream_done_fn(void *result OVS_UNUSED, void *aux OVS_UNUSED)
+binary_stream_done_fn(void *result OVS_UNUSED, void *aux)
 {
-    /* No-op.  Batches were already drained incrementally.
-     * Job cleanup happens when session_run detects all_done. */
+    struct binary_stream_job *job = aux;
+
+    if (!job) {
+        return;
+    }
+
+    /* If the monitor was torn down (disconnect during streaming),
+     * the job was detached from the list and monitor/session set
+     * to NULL.  Free the job now that the worker is done. */
+    if (!job->monitor) {
+        binary_stream_job_destroy(job);
+    }
+    /* Otherwise, session_run_binary_streaming handles completion. */
 }
 
 /* Callback context for submitting binary stream jobs per table. */
@@ -2363,6 +2432,7 @@ binary_initial_submit_table(const char *table_name,
     ovs_mutex_init(&job->mutex);
     job->seq = seq_create();
     job->done = false;
+    atomic_init(&job->cancelled, false);
     job->session = ctx->session;
     job->monitor = ctx->monitor;
 
@@ -2390,7 +2460,7 @@ binary_initial_submit_table(const char *table_name,
     }
 
     ovsdb_worker_pool_submit(ctx->pool, worker_fn,
-                             job, binary_stream_done_fn, NULL);
+                             job, binary_stream_done_fn, job);
     ctx->n_submitted++;
 }
 
