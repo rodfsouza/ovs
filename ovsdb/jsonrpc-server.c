@@ -1716,23 +1716,37 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
      * the client waiting forever. */
     if (m->binary_transport && m->version == OVSDB_MONITOR_V3
         && ovsdb_lazy_load_pool_available()) {
+        /* Build a 4-element V3 reply:
+         *   [0] found (boolean)
+         *   [1] last_txn_id (string)
+         *   [2] table_updates (empty object — rows come via binary)
+         *   [3] binary ack ({"format":"binary"})
+         *
+         * Element [2] MUST be an empty object, not the ack, because
+         * the client parses element [2] as table-updates2 and would
+         * try to interpret ack keys as table names. */
         struct json *ack = json_object_create();
         json_object_put_string(ack, "format", "binary");
-        json_object_put_string(ack, "txn_id",
-            xasprintf(UUID_FMT,
-                      UUID_ARGS(ovsdb_monitor_get_last_txnid(
-                              m->dbmon))));
 
-        /* Send the ack reply first (via the return path). */
-        struct jsonrpc_msg *reply = jsonrpc_create_reply(
-            json_array_create_3(
-                json_boolean_create(!initial),
-                json_string_create_nocopy(
-                    xasprintf(UUID_FMT,
-                              UUID_ARGS(ovsdb_monitor_get_last_txnid(
-                                      m->dbmon)))),
-                ack),
-            request_id);
+        struct json *reply_array = json_array_create_empty();
+        json_array_add(reply_array, json_boolean_create(!initial));
+        json_array_add(reply_array,
+                       json_string_create_nocopy(
+                           xasprintf(UUID_FMT,
+                                     UUID_ARGS(ovsdb_monitor_get_last_txnid(
+                                             m->dbmon)))));
+        json_array_add(reply_array, json_object_create()); /* Empty updates. */
+        json_array_add(reply_array, ack);
+
+        struct jsonrpc_msg *reply = jsonrpc_create_reply(reply_array,
+                                                          request_id);
+
+        /* Mark streaming BEFORE send, because session_send calls
+         * flush_all which would otherwise see binary_transport=true
+         * + binary_initial_streaming=false and send the initial
+         * data as a binary update batch before the reply. */
+        m->binary_initial_streaming = true;
+
         ovsdb_jsonrpc_session_send(s, reply);
 
         /* Now stream the initial data as binary batches.
