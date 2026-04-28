@@ -2206,6 +2206,14 @@ binary_stream_drain_batches(struct ovsdb_jsonrpc_session *s,
             buf = ofpbuf_from_list(ovs_list_pop_front(&job->batches));
             ovs_mutex_unlock(&job->mutex);
 
+            /* Stop sending if the connection is broken.  The session
+             * will be torn down and cleanup_jobs() will discard any
+             * remaining batches. */
+            if (!jsonrpc_session_is_connected(s->js)) {
+                ofpbuf_delete(buf);
+                return false;
+            }
+
             VLOG_DBG("sending binary initial batch for %s "
                      "(%"PRIu32" bytes)",
                      job->table_name, buf->size);
@@ -2262,6 +2270,12 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
         }
 
         bool all_done = binary_stream_drain_batches(s, m);
+
+        /* If the connection dropped during drain, stop processing.
+         * Session teardown will call monitor_destroy → cleanup_jobs. */
+        if (!jsonrpc_session_is_connected(s->js)) {
+            return;
+        }
 
         /* Update seqno after draining. */
         struct binary_stream_job *first_job;
