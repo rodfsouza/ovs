@@ -58,6 +58,8 @@ unsigned int jsonrpc_get_received_bytes(const struct jsonrpc *);
 const char *jsonrpc_get_name(const struct jsonrpc *);
 
 int jsonrpc_send(struct jsonrpc *, struct jsonrpc_msg *);
+int jsonrpc_send_binary(struct jsonrpc *, uint8_t msg_type,
+                        const void *payload, size_t payload_len);
 int jsonrpc_recv(struct jsonrpc *, struct jsonrpc_msg **);
 void jsonrpc_recv_wait(struct jsonrpc *);
 
@@ -81,6 +83,14 @@ struct jsonrpc_msg {
     struct json *result;        /* Successful reply only. */
     struct json *error;         /* Error reply only. */
     struct json *id;            /* Request or reply only. */
+
+    /* Binary transport extension.  When is_binary is true, the
+     * message was received as a binary frame (not JSON-RPC).
+     * The JSON fields above are unused in this case. */
+    bool is_binary;
+    uint8_t binary_msg_type;    /* enum ovsdb_binary_msg_type value. */
+    uint8_t *binary_payload;    /* Raw payload bytes (owned). */
+    size_t binary_payload_len;
 };
 
 struct jsonrpc_msg *jsonrpc_create_request(const char *method,
@@ -124,6 +134,8 @@ const char *jsonrpc_session_get_name(const struct jsonrpc_session *);
 size_t jsonrpc_session_get_n_remotes(const struct jsonrpc_session *);
 
 int jsonrpc_session_send(struct jsonrpc_session *, struct jsonrpc_msg *);
+int jsonrpc_session_send_binary(struct jsonrpc_session *, uint8_t msg_type,
+                                const void *payload, size_t payload_len);
 struct jsonrpc_msg *jsonrpc_session_recv(struct jsonrpc_session *);
 void jsonrpc_session_recv_wait(struct jsonrpc_session *);
 

@@ -231,6 +231,12 @@ ovsdb_row_cache_sweep_deferred__(struct ovsdb_row_cache *cache)
         /* Row was already destroyed in evict_entry__. */
         free(entry);
     }
+
+    /* Shrink the entries hmap after batch removal. */
+    if (hmap_count(&cache->entries) > 0
+        && cache->n_entries < hmap_count(&cache->entries) / 4) {
+        hmap_shrink(&cache->entries);
+    }
 }
 
 /* Clears the scan ring slot for 'entry'.  Uses entry->clock_slot
@@ -430,6 +436,13 @@ ovsdb_row_cache_evict__(struct ovsdb_row_cache *cache)
 
     /* Shrink buffer if utilization dropped. */
     ovsdb_row_cache_compact__(cache);
+
+    /* Shrink the entries hmap if utilization dropped significantly.
+     * hmap auto-expands on insert but never auto-shrinks. */
+    if (hmap_count(&cache->entries) > 0
+        && cache->n_entries < hmap_count(&cache->entries) / 4) {
+        hmap_shrink(&cache->entries);
+    }
 }
 
 /* ------------------------------------------------------------------
@@ -933,6 +946,24 @@ ovsdb_row_cache_enter_burst(struct ovsdb_row_cache *cache)
     ovs_rwlock_wrlock(&cache->rwlock);
     cache->burst_refcount++;
     cache->max_atoms = cache->high_water_atoms;
+    ovs_rwlock_unlock(&cache->rwlock);
+}
+
+/* Enter burst mode capped for query use (not startup).
+ * Limits max_atoms to 2x base to avoid resetting sweeper progress
+ * on client reconnects.  Uses the same refcount as enter_burst(). */
+void
+ovsdb_row_cache_enter_query_burst(struct ovsdb_row_cache *cache)
+{
+    size_t query_cap;
+
+    ovs_rwlock_wrlock(&cache->rwlock);
+    cache->burst_refcount++;
+    query_cap = cache->base_max_atoms * 2;
+    if (cache->max_atoms < query_cap) {
+        cache->max_atoms = query_cap;
+    }
+    /* Don't raise to high_water_atoms -- that's for startup only. */
     ovs_rwlock_unlock(&cache->rwlock);
 }
 

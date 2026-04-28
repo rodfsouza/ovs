@@ -72,6 +72,7 @@ VLOG_DEFINE_THIS_MODULE(ovsdb_server);
 /* Worker pool for async I/O and serialization (Phase 2).
  * Initialized in main(), destroyed after main_loop(). */
 #define OVSDB_IO_WORKER_THREADS 4
+static size_t n_io_workers = OVSDB_IO_WORKER_THREADS;
 static struct ovsdb_worker_pool *io_worker_pool;
 
 /* If true, ovsdb-server opens BINARYV1 databases natively using the
@@ -97,6 +98,7 @@ static bool bootstrap_ca_cert;
 static bool trim_memory = true;
 
 static unixctl_cb_func ovsdb_server_exit;
+static unixctl_cb_func ovsdb_server_get_num_workers;
 static unixctl_cb_func ovsdb_server_compact;
 static unixctl_cb_func ovsdb_server_memory_trim_on_compaction;
 static unixctl_cb_func ovsdb_server_reconnect;
@@ -833,7 +835,7 @@ main(int argc, char *argv[])
      * the pool was created after reconfigure_ovsdb_server(), which
      * meant startup warm-up was silently disabled. */
     io_worker_pool = ovsdb_worker_pool_create(
-        OVSDB_IO_WORKER_THREADS, "io-worker");
+        n_io_workers, "io-worker");
     ovsdb_lazy_load_init(io_worker_pool);
 
     if (!reconfigure_ovsdb_server(&server_config)) {
@@ -932,6 +934,8 @@ main(int argc, char *argv[])
     unixctl_command_register("ovsdb-server/get-db-storage-status", "DB", 1, 1,
                              ovsdb_server_get_db_storage_status,
                              &server_config);
+    unixctl_command_register("ovsdb-server/get-num-workers", "", 0, 0,
+                             ovsdb_server_get_num_workers, NULL);
 
     /* Simulate the behavior of OVS release prior to version 2.5 that
      * does not support the monitor_cond method.  */
@@ -2165,6 +2169,17 @@ ovsdb_server_exit(struct unixctl_conn *conn, int argc OVS_UNUSED,
 }
 
 static void
+ovsdb_server_get_num_workers(struct unixctl_conn *conn,
+                             int argc OVS_UNUSED,
+                             const char *argv[] OVS_UNUSED,
+                             void *aux OVS_UNUSED)
+{
+    char *reply = xasprintf("%"PRIuSIZE, n_io_workers);
+    unixctl_command_reply(conn, reply);
+    free(reply);
+}
+
+static void
 ovsdb_server_perf_counters_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
                                 const char *argv[] OVS_UNUSED,
                                 void *arg_ OVS_UNUSED)
@@ -2676,6 +2691,7 @@ parse_options(int argc, char *argv[],
         OPT_CONFIG_FILE,
         OPT_DISK_STORE,
         OPT_CACHE_MAX_ATOMS,
+        OPT_NUM_WORKERS,
         VLOG_OPTION_ENUMS,
         DAEMON_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
@@ -2706,6 +2722,7 @@ parse_options(int argc, char *argv[],
         {"config-file", required_argument, NULL, OPT_CONFIG_FILE},
         {"disk-store", no_argument, NULL, OPT_DISK_STORE},
         {"cache-max-atoms", required_argument, NULL, OPT_CACHE_MAX_ATOMS},
+        {"num-workers", required_argument, NULL, OPT_NUM_WORKERS},
         {NULL, 0, NULL, 0},
     };
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
@@ -2825,6 +2842,17 @@ parse_options(int argc, char *argv[],
             break;
         }
 
+        case OPT_NUM_WORKERS: {
+            unsigned long long int value;
+            if (!str_to_ullong(optarg, 10, &value)
+                || value == 0 || value > 64) {
+                ovs_fatal(0, "--num-workers: must be 1..64, got \"%s\"",
+                          optarg);
+            }
+            n_io_workers = (size_t) value;
+            break;
+        }
+
         case '?':
             exit(EXIT_FAILURE);
 
@@ -2891,9 +2919,11 @@ usage(void)
            "                          don't use column diff in database file\n"
            "  --cache-max-atoms=N     set per-table row cache atom budget\n"
            "                          (default: %d; env: OVS_OVSDB_CACHE_MAX_ATOMS)\n"
+           "  --num-workers=N         set I/O worker pool thread count\n"
+           "                          (default: %d, range: 1..64)\n"
            "  -h, --help              display this help message\n"
            "  -V, --version           display version information\n",
-           OVSDB_CACHE_MAX_ATOMS_DEFAULT);
+           OVSDB_CACHE_MAX_ATOMS_DEFAULT, OVSDB_IO_WORKER_THREADS);
     exit(EXIT_SUCCESS);
 }
 

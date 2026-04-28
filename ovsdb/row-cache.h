@@ -107,6 +107,7 @@ void ovsdb_row_cache_bulk_read_end(struct ovsdb_row_cache *);
 
 /* Burst mode (dynamic sizing). */
 void ovsdb_row_cache_enter_burst(struct ovsdb_row_cache *);
+void ovsdb_row_cache_enter_query_burst(struct ovsdb_row_cache *);
 void ovsdb_row_cache_exit_burst(struct ovsdb_row_cache *);
 void ovsdb_row_cache_set_max_atoms(struct ovsdb_row_cache *,
                                    size_t base, size_t high_water);

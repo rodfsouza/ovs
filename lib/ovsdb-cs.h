@@ -153,6 +153,9 @@ void ovsdb_cs_set_leader_only(struct ovsdb_cs *, bool leader_only);
 void ovsdb_cs_set_shuffle_remotes(struct ovsdb_cs *, bool shuffle);
 void ovsdb_cs_reset_min_index(struct ovsdb_cs *);
 
+/* Binary transport. */
+void ovsdb_cs_set_binary_transport(struct ovsdb_cs *, bool enable);
+
 /* Database locks. */
 void ovsdb_cs_set_lock(struct ovsdb_cs *, const char *lock_name);
 const char *ovsdb_cs_get_lock(const struct ovsdb_cs *);

@@ -20,6 +20,7 @@
 
 #include <errno.h>
 
+#include "binary-protocol.h"
 #include "byteq.h"
 #include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
@@ -46,6 +47,14 @@ struct jsonrpc {
     struct byteq input;
     uint8_t input_buffer[4096];
     struct json_parser *parser;
+
+    /* Binary frame receive state. */
+    bool binary_frame_active;           /* Reading a binary frame. */
+    uint8_t binary_frame_hdr[8];        /* Frame header accumulator. */
+    size_t binary_frame_hdr_read;       /* Bytes of header read so far. */
+    uint8_t *binary_frame_payload;      /* Payload buffer (malloc'd). */
+    size_t binary_frame_payload_read;   /* Bytes of payload read. */
+    size_t binary_frame_payload_len;    /* Total payload length. */
 
     /* Output. */
     struct ovs_list output;     /* Contains "struct ofpbuf"s. */
@@ -305,6 +314,49 @@ jsonrpc_send(struct jsonrpc *rpc, struct jsonrpc_msg *msg)
     return rpc->status;
 }
 
+int
+jsonrpc_send_binary(struct jsonrpc *rpc, uint8_t msg_type,
+                    const void *payload, size_t payload_len)
+{
+    uint8_t hdr[OVSDB_BINARY_FRAME_HDR_SIZE];
+    struct ofpbuf *buf;
+    size_t total;
+
+    if (rpc->status) {
+        return rpc->status;
+    }
+
+    ovsdb_binary_frame_encode(hdr, msg_type, payload_len);
+    total = sizeof hdr + payload_len;
+
+    buf = ofpbuf_new(total);
+    ofpbuf_put(buf, hdr, sizeof hdr);
+    ofpbuf_put(buf, payload, payload_len);
+    ovs_list_push_back(&rpc->output, &buf->list_node);
+    rpc->output_count++;
+    rpc->backlog += total;
+
+    /* Apply the same backlog thresholds as jsonrpc_send(). */
+    if (rpc->output_count >= 50) {
+        if (rpc->max_output && rpc->output_count > rpc->max_output) {
+            VLOG_WARN("binary sending backlog exceeded maximum (%"
+                      PRIuSIZE" > %"PRIuSIZE"), disconnecting: %s.",
+                      rpc->output_count, rpc->max_output, rpc->name);
+            jsonrpc_error(rpc, E2BIG);
+        } else if (rpc->max_backlog && rpc->backlog > rpc->max_backlog) {
+            VLOG_WARN("binary sending backlog exceeded maximum size (%"
+                      PRIuSIZE" > %"PRIuSIZE" bytes), disconnecting: %s.",
+                      rpc->backlog, rpc->max_backlog, rpc->name);
+            jsonrpc_error(rpc, E2BIG);
+        }
+    }
+
+    if (rpc->backlog == total) {
+        jsonrpc_run(rpc);
+    }
+    return rpc->status;
+}
+
 /* Attempts to receive a message from 'rpc'.
  *
  * If successful, stores the received message in '*msgp' and returns 0.  The
@@ -357,7 +409,99 @@ jsonrpc_recv(struct jsonrpc *rpc, struct jsonrpc_msg **msgp)
             byteq_advance_head(&rpc->input, retval);
         }
 
-        /* We have some input.  Feed it into the JSON parser. */
+        /* We have some input.  Check whether it's a binary frame or
+         * JSON.  Between messages (parser == NULL and not already
+         * reading a binary frame), peek the first byte: 0xDB means
+         * binary frame, anything else means JSON. */
+        if (!rpc->parser && !rpc->binary_frame_active
+            && !byteq_is_empty(&rpc->input)) {
+            uint8_t peek = *(uint8_t *) byteq_tail(&rpc->input);
+            if (ovsdb_binary_is_magic(peek)) {
+                rpc->binary_frame_active = true;
+                rpc->binary_frame_hdr_read = 0;
+                rpc->binary_frame_payload = NULL;
+                rpc->binary_frame_payload_read = 0;
+                rpc->binary_frame_payload_len = 0;
+            }
+        }
+
+        /* Binary frame accumulation.  Read header (8 bytes), then
+         * payload_len bytes.  Once complete, deliver a binary msg. */
+        if (rpc->binary_frame_active) {
+            /* Accumulate header bytes. */
+            while (rpc->binary_frame_hdr_read < OVSDB_BINARY_FRAME_HDR_SIZE
+                   && !byteq_is_empty(&rpc->input)) {
+                rpc->binary_frame_hdr[rpc->binary_frame_hdr_read++] =
+                    *(uint8_t *) byteq_tail(&rpc->input);
+                byteq_advance_tail(&rpc->input, 1);
+            }
+            if (rpc->binary_frame_hdr_read < OVSDB_BINARY_FRAME_HDR_SIZE) {
+                break;  /* Need more data for header. */
+            }
+
+            /* Parse header (on first complete read). */
+            /* Detect first time header is complete: both payload pointer
+             * and length are zero (from initialization).  For zero-length
+             * payloads this still works because the payload accumulation
+             * loop below completes immediately and delivers the frame
+             * in the same iteration. */
+            if (!rpc->binary_frame_payload
+                && !rpc->binary_frame_payload_len) {
+                uint8_t frame_msg_type;
+                uint32_t frame_payload_len;
+                if (!ovsdb_binary_frame_decode(rpc->binary_frame_hdr,
+                                               &frame_msg_type,
+                                               &frame_payload_len)) {
+                    VLOG_WARN("%s: invalid binary frame header",
+                              rpc->name);
+                    jsonrpc_error(rpc, EPROTO);
+                    return rpc->status;
+                }
+                if (frame_payload_len > OVSDB_BINARY_MAX_PAYLOAD) {
+                    VLOG_WARN("%s: binary frame payload too large "
+                              "(%"PRIu32" > %d)",
+                              rpc->name, frame_payload_len,
+                              OVSDB_BINARY_MAX_PAYLOAD);
+                    jsonrpc_error(rpc, EPROTO);
+                    return rpc->status;
+                }
+                rpc->binary_frame_payload_len = frame_payload_len;
+                rpc->binary_frame_payload =
+                    frame_payload_len ? xmalloc(frame_payload_len) : NULL;
+            }
+
+            /* Accumulate payload bytes. */
+            while (rpc->binary_frame_payload_read
+                   < rpc->binary_frame_payload_len
+                   && !byteq_is_empty(&rpc->input)) {
+                size_t want = rpc->binary_frame_payload_len
+                              - rpc->binary_frame_payload_read;
+                size_t avail = byteq_tailroom(&rpc->input);
+                size_t chunk = MIN(want, avail);
+                memcpy(rpc->binary_frame_payload
+                       + rpc->binary_frame_payload_read,
+                       byteq_tail(&rpc->input), chunk);
+                byteq_advance_tail(&rpc->input, chunk);
+                rpc->binary_frame_payload_read += chunk;
+            }
+            if (rpc->binary_frame_payload_read
+                < rpc->binary_frame_payload_len) {
+                break;  /* Need more data for payload. */
+            }
+
+            /* Complete binary frame — deliver as a message. */
+            struct jsonrpc_msg *msg = xzalloc(sizeof *msg);
+            msg->is_binary = true;
+            msg->binary_msg_type = rpc->binary_frame_hdr[2];
+            msg->binary_payload = rpc->binary_frame_payload;
+            msg->binary_payload_len = rpc->binary_frame_payload_len;
+            rpc->binary_frame_payload = NULL;  /* Ownership transferred. */
+            rpc->binary_frame_active = false;
+            *msgp = msg;
+            return 0;
+        }
+
+        /* Standard JSON path. */
         if (!rpc->parser) {
             rpc->parser = json_parser_create(0);
         }
@@ -534,6 +678,10 @@ jsonrpc_cleanup(struct jsonrpc *rpc)
     json_parser_abort(rpc->parser);
     rpc->parser = NULL;
 
+    free(rpc->binary_frame_payload);
+    rpc->binary_frame_payload = NULL;
+    rpc->binary_frame_active = false;
+
     ofpbuf_list_delete(&rpc->output);
     rpc->backlog = 0;
     rpc->output_count = 0;
@@ -544,7 +692,7 @@ jsonrpc_create(enum jsonrpc_msg_type type, const char *method,
                 struct json *params, struct json *result, struct json *error,
                 struct json *id)
 {
-    struct jsonrpc_msg *msg = xmalloc(sizeof *msg);
+    struct jsonrpc_msg *msg = xzalloc(sizeof *msg);
     msg->type = type;
     msg->method = nullable_xstrdup(method);
     msg->params = params;
@@ -598,11 +746,21 @@ jsonrpc_create_error(struct json *error, const struct json *id)
 struct jsonrpc_msg *
 jsonrpc_msg_clone(const struct jsonrpc_msg *old)
 {
-    return jsonrpc_create(old->type, old->method,
-                          json_nullable_clone(old->params),
-                          json_nullable_clone(old->result),
-                          json_nullable_clone(old->error),
-                          json_nullable_clone(old->id));
+    struct jsonrpc_msg *new;
+
+    new = jsonrpc_create(old->type, old->method,
+                         json_nullable_clone(old->params),
+                         json_nullable_clone(old->result),
+                         json_nullable_clone(old->error),
+                         json_nullable_clone(old->id));
+    new->is_binary = old->is_binary;
+    new->binary_msg_type = old->binary_msg_type;
+    if (old->binary_payload && old->binary_payload_len) {
+        new->binary_payload = xmemdup(old->binary_payload,
+                                      old->binary_payload_len);
+        new->binary_payload_len = old->binary_payload_len;
+    }
+    return new;
 }
 
 const char *
@@ -693,6 +851,7 @@ jsonrpc_msg_destroy(struct jsonrpc_msg *m)
         json_destroy(m->result);
         json_destroy(m->error);
         json_destroy(m->id);
+        free(m->binary_payload);
         free(m);
     }
 }
@@ -1165,6 +1324,17 @@ jsonrpc_session_send(struct jsonrpc_session *s, struct jsonrpc_msg *msg)
     }
 }
 
+int
+jsonrpc_session_send_binary(struct jsonrpc_session *s, uint8_t msg_type,
+                            const void *payload, size_t payload_len)
+{
+    if (s->rpc) {
+        return jsonrpc_send_binary(s->rpc, msg_type, payload, payload_len);
+    } else {
+        return ENOTCONN;
+    }
+}
+
 struct jsonrpc_msg *
 jsonrpc_session_recv(struct jsonrpc_session *s)
 {
@@ -1187,7 +1357,11 @@ jsonrpc_session_recv(struct jsonrpc_session *s)
         }
 
         if (msg) {
-            if (msg->type == JSONRPC_REQUEST && !strcmp(msg->method, "echo")) {
+            if (msg->is_binary) {
+                /* Binary frame — return directly to caller. */
+                return msg;
+            } else if (msg->type == JSONRPC_REQUEST
+                       && !strcmp(msg->method, "echo")) {
                 /* Echo request.  Send reply. */
                 struct jsonrpc_msg *reply;
 

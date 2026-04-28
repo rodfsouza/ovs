@@ -699,7 +699,7 @@ ovsdb_table_query(struct ovsdb_table *table,
     bool burst_active = false;
     if (table->cache) {
         if (!check_cond) {
-            ovsdb_row_cache_enter_burst(table->cache);
+            ovsdb_row_cache_enter_query_burst(table->cache);
             burst_active = true;
         } else {
             ovsdb_row_cache_bulk_read_start(table->cache);

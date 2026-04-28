@@ -65,6 +65,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/bfd.c \
 	lib/bfd.h \
 	lib/bitmap.h \
+	lib/binary-protocol.c \
+	lib/binary-protocol.h \
 	lib/bundle.c \
 	lib/bundle.h \
 	lib/byte-order.h \

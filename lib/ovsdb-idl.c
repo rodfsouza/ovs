@@ -388,6 +388,12 @@ ovsdb_idl_set_leader_only(struct ovsdb_idl *idl, bool leader_only)
     ovsdb_cs_set_leader_only(idl->cs, leader_only);
 }
 
+void
+ovsdb_idl_set_binary_transport(struct ovsdb_idl *idl, bool enable)
+{
+    ovsdb_cs_set_binary_transport(idl->cs, enable);
+}
+
 static void
 ovsdb_idl_clear(struct ovsdb_idl *db)
 {

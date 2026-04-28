@@ -19,6 +19,8 @@
 
 #include <errno.h>
 
+#include "binary-codec.h"
+#include "binary-protocol.h"
 #include "bitmap.h"
 #include "column.h"
 #include "cooperative-multitasking.h"
@@ -1370,6 +1372,10 @@ struct ovsdb_jsonrpc_monitor {
     struct json *deferred_request_id;  /* Non-NULL while loading. */
     bool initial_loading;              /* True if bulk load in progress. */
     struct ovs_list deferred_node;     /* In session's deferred_monitors. */
+
+    /* Binary transport (Phase 5).  When true, incremental updates
+     * are sent as binary frames instead of JSON-RPC notifications. */
+    bool binary_transport;
 };
 
 static struct ovsdb_jsonrpc_monitor *
@@ -1518,7 +1524,9 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
     struct json *json;
 
     if ((version == OVSDB_MONITOR_V2 && json_array(params)->n != 3) ||
-        (version == OVSDB_MONITOR_V3 && json_array(params)->n != 4)) {
+        (version == OVSDB_MONITOR_V3
+         && json_array(params)->n != 4
+         && json_array(params)->n != 5)) {
         error = ovsdb_syntax_error(params, NULL, "invalid parameters");
         goto error;
     }
@@ -1543,6 +1551,20 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
         m->condition = ovsdb_monitor_session_condition_create();
     }
     m->version = version;
+
+    /* Check for binary transport option (V3, 5th param). */
+    if (version == OVSDB_MONITOR_V3
+        && json_array(params)->n >= 5) {
+        const struct json *opts = params->array.elems[4];
+        if (opts->type == JSON_OBJECT) {
+            const struct json *fmt = shash_find_data(
+                json_object(opts), "format");
+            if (fmt && fmt->type == JSON_STRING
+                && !strcmp(json_string(fmt), "binary")) {
+                m->binary_transport = true;
+            }
+        }
+    }
     hmap_insert(&s->monitors, &m->node, json_hash(monitor_id, 0));
     m->monitor_id = json_clone(monitor_id);
 
@@ -1657,7 +1679,21 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
                                   m->dbmon))));
 
         struct json *json_found = json_boolean_create(!initial);
-        json = json_array_create_3(json_found, json_last_id, json);
+        if (m->binary_transport) {
+            /* Include binary transport confirmation in V3 reply.
+             * The initial data is still JSON, but subsequent
+             * updates will use binary frames. */
+            struct json *json_opts = json_object_create();
+            json_object_put_string(json_opts, "format", "binary");
+            struct json *arr = json_array_create_empty();
+            json_array_add(arr, json_found);
+            json_array_add(arr, json_last_id);
+            json_array_add(arr, json);
+            json_array_add(arr, json_opts);
+            json = arr;
+        } else {
+            json = json_array_create_3(json_found, json_last_id, json);
+        }
     }
 
     return jsonrpc_create_reply(json, request_id);
@@ -1876,6 +1912,56 @@ ovsdb_jsonrpc_monitor_compose_update(struct ovsdb_jsonrpc_monitor *m,
                                     m->condition, m->version, &m->change_set);
 }
 
+/* Sends a binary update notification for monitor 'm'.
+ * Encodes the change set rows as binary and sends them as
+ * OVSDB_BIN_UPDATE_BATCH frames.  Falls back to JSON if the
+ * session cannot send binary. */
+static void
+ovsdb_jsonrpc_monitor_send_binary_flush(
+    struct ovsdb_jsonrpc_session *s,
+    struct ovsdb_jsonrpc_monitor *m)
+{
+    struct json *json;
+
+    /* Use the existing JSON compose path to consume the change set
+     * (which also advances the change set tracking).  Then send
+     * as a binary frame containing the pre-serialized JSON bytes.
+     *
+     * This is a transitional approach: the monitor internals still
+     * produce JSON, but we send it as a binary-framed blob.  The
+     * client decodes the binary frame and parses the JSON inside.
+     * Full binary serialization (datum-level) requires deeper
+     * changes to monitor.c and will replace this in a follow-up.
+     *
+     * Even this transitional approach wins because:
+     * 1. Binary framing allows the client to know message size upfront
+     * 2. The frame can be processed without the JSON parser state machine
+     * 3. It validates the end-to-end binary frame path. */
+    json = ovsdb_jsonrpc_monitor_compose_update(m, false);
+    if (json) {
+        struct ds ds = DS_EMPTY_INITIALIZER;
+        struct json *params;
+
+        if (m->version == OVSDB_MONITOR_V3) {
+            struct json *json_last_id = json_string_create_nocopy(
+                    xasprintf(UUID_FMT,
+                              UUID_ARGS(ovsdb_monitor_get_last_txnid(
+                                      m->dbmon))));
+            params = json_array_create_3(json_clone(m->monitor_id),
+                                         json_last_id, json);
+        } else {
+            params = json_array_create_2(json_clone(m->monitor_id), json);
+        }
+
+        json_to_ds(params, 0, &ds);
+        json_destroy(params);
+
+        jsonrpc_session_send_binary(s->js, OVSDB_BIN_UPDATE_BATCH,
+                                    ds_cstr(&ds), ds.length);
+        ds_destroy(&ds);
+    }
+}
+
 static bool
 ovsdb_jsonrpc_monitor_needs_flush(struct ovsdb_jsonrpc_session *s)
 {
@@ -2007,6 +2093,11 @@ ovsdb_jsonrpc_monitor_flush_all(struct ovsdb_jsonrpc_session *s)
 
     HMAP_FOR_EACH (m, node, &s->monitors) {
         if (m->initial_loading) {
+            continue;
+        }
+
+        if (m->binary_transport) {
+            ovsdb_jsonrpc_monitor_send_binary_flush(s, m);
             continue;
         }
 

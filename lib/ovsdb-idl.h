@@ -72,6 +72,7 @@ void ovsdb_idl_reset_min_index(struct ovsdb_idl *);
 void ovsdb_idl_destroy(struct ovsdb_idl *);
 
 void ovsdb_idl_set_leader_only(struct ovsdb_idl *, bool leader_only);
+void ovsdb_idl_set_binary_transport(struct ovsdb_idl *, bool enable);
 
 void ovsdb_idl_run(struct ovsdb_idl *);
 void ovsdb_idl_wait(struct ovsdb_idl *);

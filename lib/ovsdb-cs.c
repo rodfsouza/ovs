@@ -226,6 +226,9 @@ struct ovsdb_cs {
     uint64_t min_index;      /* Minimum allowed index, to avoid regression. */
     bool leader_only;        /* If true, do not connect to Raft followers. */
     bool shuffle_remotes;    /* If true, connect to servers in random order. */
+
+    /* Binary transport. */
+    bool binary_transport;   /* If true, request binary format from server. */
 };
 
 static void ovsdb_cs_transition_at(struct ovsdb_cs *, enum ovsdb_cs_state,
@@ -541,6 +544,48 @@ ovsdb_cs_process_response(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
 static void
 ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
 {
+    /* Binary frames: the transitional binary format wraps JSON-encoded
+     * update data inside a binary frame.  Extract the JSON payload
+     * and process it as a normal update notification.  This allows
+     * the client to benefit from binary framing (known message size,
+     * faster dispatch) while still using the JSON update parser.
+     *
+     * Binary frames are only used for the data database monitor, not
+     * the _Server database (which uses V1/V2 monitors that do not
+     * negotiate binary transport). */
+    if (msg->is_binary) {
+        if (msg->binary_payload && msg->binary_payload_len) {
+            struct json *json;
+            char *payload_str;
+
+            /* Null-terminate the payload for JSON parsing. */
+            payload_str = xmemdup0((const char *) msg->binary_payload,
+                                   msg->binary_payload_len);
+            json = json_from_string(payload_str);
+            free(payload_str);
+            if (json->type == JSON_ARRAY) {
+                /* The payload is the monitor update params array.
+                 * Feed it into the existing update path by creating
+                 * a synthetic JSON-RPC notification. */
+                int version = cs->data.monitor_version;
+                const char *method = (version == 1 ? "update"
+                                      : version == 2 ? "update2"
+                                      : "update3");
+                struct jsonrpc_msg *synthetic;
+
+                synthetic = jsonrpc_create_notify(method, json);
+                ovsdb_cs_db_parse_update_rpc(&cs->data, synthetic);
+                jsonrpc_msg_destroy(synthetic);
+            } else {
+                VLOG_WARN_RL(&syntax_rl,
+                             "failed to parse binary frame payload "
+                             "as JSON array");
+                json_destroy(json);
+            }
+        }
+        return;
+    }
+
     bool is_response = (msg->type == JSONRPC_REPLY ||
                         msg->type == JSONRPC_ERROR);
 
@@ -1208,6 +1253,12 @@ ovsdb_cs_set_shuffle_remotes(struct ovsdb_cs *cs, bool shuffle)
     cs->shuffle_remotes = shuffle;
 }
 
+void
+ovsdb_cs_set_binary_transport(struct ovsdb_cs *cs, bool enable)
+{
+    cs->binary_transport = enable;
+}
+
 /* Reset min_index to 0. This prevents a situation where the client
  * thinks all databases have stale data, when they actually have all
  * been destroyed and rebuilt from scratch.
@@ -1563,6 +1614,13 @@ ovsdb_cs_send_monitor_request(struct ovsdb_cs *cs, struct ovsdb_cs_db *db,
         struct json *json_last_id = json_string_create_nocopy(
             xasprintf(UUID_FMT, UUID_ARGS(&db->last_id)));
         json_array_add(params, json_last_id);
+
+        /* Add binary transport option if enabled. */
+        if (cs->binary_transport) {
+            struct json *opts = json_object_create();
+            json_object_put_string(opts, "format", "binary");
+            json_array_add(params, opts);
+        }
     }
     ovsdb_cs_send_request(cs, jsonrpc_create_request(method, params, NULL));
 }
@@ -1601,7 +1659,10 @@ ovsdb_cs_db_parse_monitor_reply(struct ovsdb_cs_db *db,
     const struct json *table_updates;
     bool clear;
     if (version == 3) {
-        if (result->type != JSON_ARRAY || result->array.n != 3
+        /* Accept 3 elements (standard V3) or 4 elements (V3 with
+         * binary transport confirmation in the 4th element). */
+        if (result->type != JSON_ARRAY
+            || (result->array.n != 3 && result->array.n != 4)
             || (result->array.elems[0]->type != JSON_TRUE &&
                 result->array.elems[0]->type != JSON_FALSE)
             || result->array.elems[1]->type != JSON_STRING
