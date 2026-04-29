@@ -117,6 +117,20 @@ DOC_SOURCE = \
 	Documentation/internals/ovsdb-compressed-row-cache-plan.md \
 	Documentation/internals/ovsdb-disk-store-serve-paths-fix-plan.md \
 	Documentation/internals/ovsdb_architecture.md \
+	Documentation/internals/async-compaction-plan.md \
+	Documentation/internals/cache-improvements-plan.md \
+	Documentation/internals/clock_sweep_cache_spec.md \
+	Documentation/internals/condition-aware-idl-plan.md \
+	Documentation/internals/full-scan-optimization-plan.md \
+	Documentation/internals/ovsdb-clock-sweep-cache.md \
+	Documentation/internals/ovsdb-deferred-monitor-fix-plan.md \
+	Documentation/internals/ovsdb-disk-store-architecture.md \
+	Documentation/internals/ovsdb-multithread-architecture.md \
+	Documentation/internals/ovsdb-phase3-deferred-serialization-plan.md \
+	Documentation/internals/plan-binary-streaming-protocol.md \
+	Documentation/internals/plan-binary-streaming-worker-offload.md \
+	Documentation/internals/plan-materialized-json-snapshot.md \
+	Documentation/internals/secondary-name-index-plan.md \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
 	Documentation/internals/contributing/inclusive-language.rst \

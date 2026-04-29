@@ -22,7 +22,13 @@ EXTRA_DIST += \
 	$(srcdir)/tests/test-dpparse.py \
 	$(srcdir)/tests/test-ofparse.py \
 	$(srcdir)/tests/testsuite \
-	$(srcdir)/tests/testsuite.patch
+	$(srcdir)/tests/testsuite.patch \
+	tests/stress/ovn-bulk-create.sh \
+	tests/stress/ovn-parallel-query.sh \
+	tests/stress/ovn-full-scan-under-load.sh \
+	tests/stress/ovn-disconnect-storm.sh \
+	tests/stress/ovn-latency-bench.sh \
+	tests/stress/run-all.sh
 
 COMMON_MACROS_AT = \
 	tests/ovsdb-macros.at \
