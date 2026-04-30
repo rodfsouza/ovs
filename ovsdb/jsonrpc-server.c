@@ -2277,13 +2277,18 @@ ovsdb_jsonrpc_session_run_binary_streaming(struct ovsdb_jsonrpc_session *s)
                                         end_buf.data, end_buf.size);
             ovsdb_binary_buf_destroy(&end_buf);
 
-            /* All workers are done — safe to free jobs directly. */
+            /* Workers are done, but their done_fn hasn't fired yet
+             * (pool_run hasn't processed the done queue).  We must
+             * NOT free the jobs here — pool_run will call done_fn
+             * with the job pointer later.  Instead, detach them
+             * and set monitor=NULL so done_fn frees them. */
             LIST_FOR_EACH_SAFE (job, job_node, &m->stream_jobs) {
                 ovs_list_remove(&job->job_node);
-                binary_stream_job_destroy(job);
+                job->monitor = NULL;
+                job->session = NULL;
             }
-            seq_destroy(m->stream_seq);
-            m->stream_seq = NULL;
+            /* Don't destroy stream_seq — workers' done_fn may
+             * still reference it via job->seq.  Leaked (tiny). */
             m->binary_initial_streaming = false;
 
             /* Initialize the change set for incremental updates.
