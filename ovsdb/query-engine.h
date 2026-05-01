@@ -103,7 +103,26 @@ struct ovsdb_query_result *ovsdb_query_engine_execute(
 const struct ovsdb_row *ovsdb_query_result_next(
     struct ovsdb_query_result *);
 
+/* Steals ownership of the single-row result.  After this call, close()
+ * will NOT destroy the row — the caller is responsible for it.
+ * Only valid for POINT_LOOKUP / INDEX_LOOKUP results. */
+struct ovsdb_row *ovsdb_query_result_steal_row(
+    struct ovsdb_query_result *);
+
 /* Closes the result and frees resources. */
 void ovsdb_query_result_close(struct ovsdb_query_result *);
+
+/* --- Convenience: direct point lookup (avoids plan/condition overhead) --- */
+
+/* Looks up a single row by UUID using the index set and storage engine.
+ * Handles: bloom → cache → pread → cache insert.
+ * Returns the row (cached or disk-read), or NULL if not found.
+ * The returned pointer is stable (cached) or owned by the cache. */
+const struct ovsdb_row *ovsdb_query_engine_lookup_uuid(
+    struct ovsdb_storage_engine *,
+    struct ovsdb_index_set *,
+    struct ovsdb_row_cache *,             /* May be NULL */
+    struct ovsdb_table *,
+    const struct uuid *);
 
 #endif /* ovsdb/query-engine.h */

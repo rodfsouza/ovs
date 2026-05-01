@@ -431,6 +431,38 @@ ovsdb_query_result_next(struct ovsdb_query_result *result)
     OVS_NOT_REACHED();
 }
 
+struct ovsdb_row *
+ovsdb_query_result_steal_row(struct ovsdb_query_result *result)
+{
+    struct ovsdb_row *row;
+
+    switch (result->type) {
+    case OVSDB_PLAN_POINT_LOOKUP:
+    case OVSDB_PLAN_INDEX_LOOKUP:
+        if (result->single_row) {
+            row = result->single_row;
+            result->single_row = NULL;  /* Transfer ownership. */
+            return row;
+        }
+        if (result->current_row) {
+            /* Cached row — not owned by result.  Clone it so the
+             * caller has a stable owned copy. */
+            return ovsdb_row_clone(result->current_row);
+        }
+        return NULL;
+
+    case OVSDB_PLAN_FULL_SCAN:
+        if (result->current_row) {
+            row = result->current_row;
+            result->current_row = NULL;
+            return row;
+        }
+        return NULL;
+    }
+
+    OVS_NOT_REACHED();
+}
+
 void
 ovsdb_query_result_close(struct ovsdb_query_result *result)
 {
@@ -458,4 +490,59 @@ ovsdb_query_result_close(struct ovsdb_query_result *result)
     }
 
     free(result);
+}
+
+/* ------------------------------------------------------------------ */
+/* Convenience: direct UUID lookup (no plan/condition overhead).       */
+/* ------------------------------------------------------------------ */
+
+const struct ovsdb_row *
+ovsdb_query_engine_lookup_uuid(struct ovsdb_storage_engine *storage,
+                                struct ovsdb_index_set *indexes,
+                                struct ovsdb_row_cache *cache,
+                                struct ovsdb_table *table,
+                                const struct uuid *uuid)
+{
+    const struct ovsdb_index *bloom;
+    const struct ovsdb_row *cached;
+    struct ovsdb_row *row;
+
+    /* Bloom filter fast negative. */
+    bloom = ovsdb_index_set_find_bloom(indexes);
+    if (bloom && !ovsdb_index_contains(bloom, uuid)) {
+        return NULL;
+    }
+
+    /* Cache hit? */
+    if (cache) {
+        cached = ovsdb_row_cache_lookup(cache, uuid);
+        if (cached) {
+            return cached;
+        }
+    }
+
+    /* Disk read. */
+    row = ovsdb_storage_engine_read_row(storage, table, uuid);
+    if (!row) {
+        return NULL;
+    }
+
+    /* Populate cache.  Cache takes ownership of row. */
+    if (cache) {
+        size_t n_atoms = ovsdb_row_count_atoms(row);
+        ovsdb_row_cache_insert(cache, row, n_atoms);
+        /* Return the cached pointer (stable). */
+        cached = ovsdb_row_cache_lookup(cache, uuid);
+        if (cached) {
+            return cached;
+        }
+        /* Cache evicted immediately — row was destroyed by insert.
+         * This shouldn't happen for a single row, but handle it. */
+        return NULL;
+    }
+
+    /* No cache — the caller gets the row but has no way to own it.
+     * This path shouldn't be reached in disk-store mode (cache
+     * is always present).  Leak the row rather than crash. */
+    return row;
 }

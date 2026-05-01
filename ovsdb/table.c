@@ -387,40 +387,15 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
     }
 
     /* Disk-store path via query engine.
-     * The engine handles: bloom → cache → disk → cache insert. */
+     * Direct UUID lookup: bloom → cache → pread → cache insert.
+     * No plan/condition allocation overhead. */
     if (table->storage_engine && table->index_set) {
-        struct ovsdb_condition cond;
-        struct ovsdb_clause clause;
-        struct ovsdb_execution_plan *plan;
-        struct ovsdb_query_result *result;
-        const struct ovsdb_row *found;
-
-        /* Build a UUID exact-match condition on the stack. */
-        memset(&clause, 0, sizeof clause);
-        clause.function = OVSDB_F_EQ;
-        clause.column = ovsdb_table_schema_get_column(
-            table->schema, "_uuid");
-        ovsdb_datum_init_empty(&clause.arg);
-        clause.arg.n = 1;
-        clause.arg.keys = xmalloc(sizeof *clause.arg.keys);
-        clause.arg.keys[0].uuid = *uuid;
-
-        memset(&cond, 0, sizeof cond);
-        cond.n_clauses = 1;
-        cond.clauses = &clause;
-
-        plan = ovsdb_query_engine_plan(&cond, table->index_set, table);
-        result = ovsdb_query_engine_execute(
-            plan, CONST_CAST(struct ovsdb_storage_engine *,
-                              table->storage_engine),
+        return ovsdb_query_engine_lookup_uuid(
+            CONST_CAST(struct ovsdb_storage_engine *,
+                        table->storage_engine),
             table->index_set, table->cache,
-            CONST_CAST(struct ovsdb_table *, table));
-        found = ovsdb_query_result_next(result);
-        ovsdb_query_result_close(result);
-        ovsdb_execution_plan_destroy(plan);
-        free(clause.arg.keys);
-
-        return found;
+            CONST_CAST(struct ovsdb_table *, table),
+            uuid);
     }
 
     /* Legacy path for non-disk-store tables. */
