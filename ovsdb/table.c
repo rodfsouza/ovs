@@ -31,6 +31,7 @@
 #include "disk-store.h"
 #include "index-engine.h"
 #include "lazy-load.h"
+#include "query-engine.h"
 #include "storage-engine.h"
 #include "ovsdb.h"
 #include "transaction.h"
@@ -378,33 +379,66 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
 {
     struct ovsdb_row *row;
 
-    /* Fast path: search in-memory rows hmap. */
+    /* Fast path: search in-memory rows hmap (transaction mods). */
     HMAP_FOR_EACH_WITH_HASH (row, hmap_node, uuid_hash(uuid), &table->rows) {
         if (uuid_equals(ovsdb_row_get_uuid(row), uuid)) {
             return row;
         }
     }
 
-    /* Check the row cache (Phase 1). */
+    /* Disk-store path via query engine.
+     * The engine handles: bloom → cache → disk → cache insert. */
+    if (table->storage_engine && table->index_set) {
+        struct ovsdb_condition cond;
+        struct ovsdb_clause clause;
+        struct ovsdb_execution_plan *plan;
+        struct ovsdb_query_result *result;
+        const struct ovsdb_row *found;
+
+        /* Build a UUID exact-match condition on the stack. */
+        memset(&clause, 0, sizeof clause);
+        clause.function = OVSDB_F_EQ;
+        clause.column = ovsdb_table_schema_get_column(
+            table->schema, "_uuid");
+        ovsdb_datum_init_empty(&clause.arg);
+        clause.arg.n = 1;
+        clause.arg.keys = xmalloc(sizeof *clause.arg.keys);
+        clause.arg.keys[0].uuid = *uuid;
+
+        memset(&cond, 0, sizeof cond);
+        cond.n_clauses = 1;
+        cond.clauses = &clause;
+
+        plan = ovsdb_query_engine_plan(&cond, table->index_set, table);
+        result = ovsdb_query_engine_execute(
+            plan, CONST_CAST(struct ovsdb_storage_engine *,
+                              table->storage_engine),
+            table->index_set, table->cache,
+            CONST_CAST(struct ovsdb_table *, table));
+        found = ovsdb_query_result_next(result);
+        ovsdb_query_result_close(result);
+        ovsdb_execution_plan_destroy(plan);
+        free(clause.arg.keys);
+
+        return found;
+    }
+
+    /* Legacy path for non-disk-store tables. */
     if (table->cache) {
-        row = ovsdb_row_cache_lookup(table->cache, uuid);
-        if (row) {
-            return row;
+        const struct ovsdb_row *cached;
+
+        cached = ovsdb_row_cache_lookup(table->cache, uuid);
+        if (cached) {
+            return cached;
         }
     }
 
-    /* Disk-store path: bloom filter → disk index → pread → cache.
-     * The cache starts cold (no UNLOADED entries); misses go
-     * directly to disk via the UUID→offset index. */
     if (table->disk_store) {
-        /* Fast negative: bloom filter rejects non-existent UUIDs
-         * without any disk I/O. */
         if (table->bloom
             && !ovsdb_bloom_filter_may_contain(table->bloom, uuid)) {
             return NULL;
         }
 
-        /* Synchronous disk read using the UUID→offset index. */
         row = ovsdb_disk_store_read_row(
             table->disk_store,
             CONST_CAST(struct ovsdb_table *, table),
