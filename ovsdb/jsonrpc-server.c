@@ -1703,11 +1703,16 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
         /* Binary transport: skip the expensive get_initial change set
          * population — workers will read directly from disk.
          *
-         * Only enter this path if the worker pool is available.
-         * Otherwise fall through to the JSON path which needs
-         * the change set. */
+         * Only for UNCONDITIONED monitors (full table/DB scans).
+         * Conditioned monitors (UUID lookup, name lookup, filtered
+         * scan) use the JSON path which calls get_initial_conditioned
+         * with UUID/name/condition pushdown via ovsdb_table_query().
+         *
+         * Also requires the worker pool to be available. */
         if (m->binary_transport && m->version == OVSDB_MONITOR_V3
-            && ovsdb_lazy_load_pool_available()) {
+            && ovsdb_lazy_load_pool_available()
+            && !ovsdb_monitor_session_condition_is_conditional(
+                   m->condition)) {
             /* Build a 4-element V3 reply:
              *   [0] found (boolean)
              *   [1] last_txn_id (string)
