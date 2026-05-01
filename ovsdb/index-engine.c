@@ -66,7 +66,8 @@ atom_hash(const union ovsdb_atom *atom, enum ovsdb_atomic_type type)
 {
     switch (type) {
     case OVSDB_TYPE_INTEGER:
-        return hash_int(atom->integer, 0);
+        return hash_2words((uint32_t) atom->integer,
+                           (uint32_t) (atom->integer >> 32));
     case OVSDB_TYPE_REAL:
         return hash_bytes(&atom->real, sizeof atom->real, 0);
     case OVSDB_TYPE_BOOLEAN:

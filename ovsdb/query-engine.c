@@ -234,11 +234,12 @@ execute_point_lookup(const struct ovsdb_execution_plan *plan,
     VLOG_DBG("EXPLAIN: POINT_LOOKUP disk read for " UUID_FMT,
              UUID_ARGS(&plan->target_uuid));
 
-    /* Populate cache. */
+    /* Populate cache.  Cache takes ownership of 'row' — do NOT
+     * dereference 'row' after this call. */
     if (cache) {
         size_t n_atoms = ovsdb_row_count_atoms(row);
         ovsdb_row_cache_insert(cache, row, n_atoms);
-        /* Cache owns the row now.  Return pointer to it. */
+        /* row is now owned by cache (or destroyed if evicted). */
         cached = ovsdb_row_cache_lookup(cache, &plan->target_uuid);
         if (cached) {
             struct ovsdb_query_result *result = xzalloc(sizeof *result);
@@ -248,6 +249,8 @@ execute_point_lookup(const struct ovsdb_execution_plan *plan,
             result->current_row = CONST_CAST(struct ovsdb_row *, cached);
             return result;
         }
+        /* Cache evicted the row immediately — it's gone. */
+        return make_empty_result();
     }
 
     return make_single_result(row);
@@ -294,11 +297,14 @@ execute_index_lookup(const struct ovsdb_execution_plan *plan,
     VLOG_DBG("EXPLAIN: INDEX_LOOKUP disk read via \"%s\" → " UUID_FMT,
              ovsdb_index_get_name(plan->index), UUID_ARGS(&entry->uuid));
 
-    /* Populate cache. */
+    /* Populate cache.  Cache takes ownership of 'row'. */
     if (cache) {
+        struct uuid row_uuid = entry->uuid;
         size_t n_atoms = ovsdb_row_count_atoms(row);
+
         ovsdb_row_cache_insert(cache, row, n_atoms);
-        cached = ovsdb_row_cache_lookup(cache, &entry->uuid);
+        /* row is now owned by cache — do NOT dereference. */
+        cached = ovsdb_row_cache_lookup(cache, &row_uuid);
         if (cached) {
             struct ovsdb_query_result *result = xzalloc(sizeof *result);
             result->type = OVSDB_PLAN_INDEX_LOOKUP;
@@ -307,6 +313,7 @@ execute_index_lookup(const struct ovsdb_execution_plan *plan,
             result->current_row = CONST_CAST(struct ovsdb_row *, cached);
             return result;
         }
+        return make_empty_result();
     }
 
     return make_single_result(row);
@@ -342,9 +349,11 @@ ovsdb_query_engine_execute(const struct ovsdb_execution_plan *plan,
                             struct ovsdb_row_cache *cache,
                             struct ovsdb_table *table)
 {
-    char *desc = ovsdb_execution_plan_describe(plan);
-    VLOG_DBG("query-engine: executing %s", desc);
-    free(desc);
+    if (VLOG_IS_DBG_ENABLED()) {
+        char *desc = ovsdb_execution_plan_describe(plan);
+        VLOG_DBG("query-engine: executing %s", desc);
+        free(desc);
+    }
 
     switch (plan->type) {
     case OVSDB_PLAN_POINT_LOOKUP:
@@ -409,18 +418,21 @@ ovsdb_query_result_next(struct ovsdb_query_result *result)
 
             /* Optionally cache. */
             if (result->cache) {
+                struct uuid row_uuid = *ovsdb_row_get_uuid(row);
                 size_t n_atoms = ovsdb_row_count_atoms(row);
+
                 ovsdb_row_cache_insert(result->cache, row, n_atoms);
-                /* Cache owns the row.  Lookup to get stable pointer. */
+                /* row is now owned by cache — do NOT dereference. */
                 const struct ovsdb_row *cached =
-                    ovsdb_row_cache_lookup(
-                        result->cache, ovsdb_row_get_uuid(row));
+                    ovsdb_row_cache_lookup(result->cache, &row_uuid);
                 if (cached) {
                     result->current_row = NULL;
                     return cached;
                 }
-                /* Cache evicted it immediately (over budget).
-                 * Fall through and return the row we have. */
+                /* Cache evicted it immediately — row is gone.
+                 * Skip to next row (don't return freed pointer). */
+                result->current_row = NULL;
+                continue;
             }
 
             result->current_row = row;
@@ -541,8 +553,8 @@ ovsdb_query_engine_lookup_uuid(struct ovsdb_storage_engine *storage,
         return NULL;
     }
 
-    /* No cache — the caller gets the row but has no way to own it.
-     * This path shouldn't be reached in disk-store mode (cache
-     * is always present).  Leak the row rather than crash. */
-    return row;
+    /* No cache — cannot return a stable pointer because the caller
+     * doesn't own the row.  In disk-store mode cache is always
+     * present, so this path should be unreachable. */
+    OVS_NOT_REACHED();
 }

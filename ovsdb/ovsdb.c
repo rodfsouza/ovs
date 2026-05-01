@@ -831,7 +831,18 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
             ovsdb_index_set_bloom_filter(bloom_idx, table->bloom);
             ovsdb_index_set_add(iset, bloom_idx);
 
-            /* HASH indexes — one per schema-declared single-column index. */
+            /* HASH indexes — one per schema-declared single-column index.
+             *
+             * NOTE: HASH indexes are created empty here.  They are
+             * NOT populated with existing rows during startup.  The
+             * legacy name_index (built above via build_name_index)
+             * handles name lookups until the HASH indexes are
+             * populated in the startup optimization phase.
+             *
+             * Currently, ovsdb_table_get_row uses lookup_uuid which
+             * goes through bloom+cache+disk, NOT through HASH
+             * indexes.  The query engine's INDEX_LOOKUP plan type
+             * will use HASH indexes once they are populated. */
             for (size_t j = 0; j < table->schema->n_indexes; j++) {
                 const struct ovsdb_column_set *sidx
                     = &table->schema->indexes[j];
