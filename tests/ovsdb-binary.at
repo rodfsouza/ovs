@@ -1,3 +1,13 @@
+AT_BANNER([OVSDB storage engine tests])
+
+AT_SETUP([storage engine - lifecycle and API surface])
+AT_KEYWORDS([ovsdb storage engine])
+AT_CHECK([test-storage-engine], [0], [lifecycle: PASSED
+api_surface: PASSED
+schema: PASSED
+])
+AT_CLEANUP
+
 AT_BANNER([OVSDB binary codec and protocol tests])
 
 dnl ========== Unit Tests ==========
