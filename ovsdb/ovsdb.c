@@ -38,6 +38,8 @@
 #include "seq.h"
 #include "simap.h"
 #include "storage.h"
+#include "storage-engine.h"
+#include "index-engine.h"
 #include "table.h"
 #include "timeval.h"
 #include "transaction.h"
@@ -810,14 +812,57 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
             }
         }
 
+        /* Three-layer data access: create storage engine + index set.
+         * These coexist with the legacy bloom/name_index during
+         * transition.  Phase 4b will migrate callers. */
+        table->storage_engine = ovsdb_storage_engine_create(ds);
+        {
+            struct ovsdb_index_set *iset = xmalloc(sizeof *iset);
+            struct ovsdb_index_spec bloom_spec;
+            struct ovsdb_index *bloom_idx;
+
+            ovsdb_index_set_init(iset);
+
+            /* BLOOM index — wraps the bloom filter we just built. */
+            memset(&bloom_spec, 0, sizeof bloom_spec);
+            bloom_spec.type = OVSDB_IDX_BLOOM;
+            bloom_spec.name = "bloom";
+            bloom_idx = ovsdb_index_create(&bloom_spec);
+            ovsdb_index_set_bloom_filter(bloom_idx, table->bloom);
+            ovsdb_index_set_add(iset, bloom_idx);
+
+            /* HASH indexes — one per schema-declared single-column index. */
+            for (size_t j = 0; j < table->schema->n_indexes; j++) {
+                const struct ovsdb_column_set *sidx
+                    = &table->schema->indexes[j];
+                if (sidx->n_columns == 1
+                    && (sidx->columns[0]->type.key.type == OVSDB_TYPE_STRING
+                        || sidx->columns[0]->type.key.type == OVSDB_TYPE_INTEGER
+                        || sidx->columns[0]->type.key.type == OVSDB_TYPE_UUID)
+                    && sidx->columns[0]->type.n_max == 1) {
+                    struct ovsdb_index_spec hash_spec;
+
+                    memset(&hash_spec, 0, sizeof hash_spec);
+                    hash_spec.type = OVSDB_IDX_HASH;
+                    hash_spec.name = sidx->columns[0]->name;
+                    hash_spec.column_name = sidx->columns[0]->name;
+                    hash_spec.key_type = sidx->columns[0]->type.key.type;
+                    ovsdb_index_set_add(iset, ovsdb_index_create(&hash_spec));
+                }
+            }
+            table->index_set = iset;
+        }
+
         /* No proactive warm-up.  The cache starts cold and fills
          * on demand as rows are accessed (cache miss → index lookup
          * → pread → cache insert).  The sweeper handles ongoing
          * eviction once the cache is active. */
         ovsdb_row_cache_start_sweeper(table->cache);
 
-        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store",
-                 db->name, node->name, n_rows);
+        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store"
+                 " (%"PRIuSIZE" engine indexes)",
+                 db->name, node->name, n_rows,
+                 table->index_set ? table->index_set->n_indexes : 0);
     }
     db->disk_store_mode = true;
 }

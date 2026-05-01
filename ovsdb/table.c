@@ -29,7 +29,9 @@
 #include "bloom-filter.h"
 #include "row-cache.h"
 #include "disk-store.h"
+#include "index-engine.h"
 #include "lazy-load.h"
+#include "storage-engine.h"
 #include "ovsdb.h"
 #include "transaction.h"
 #include "openvswitch/vlog.h"
@@ -356,6 +358,15 @@ ovsdb_table_destroy(struct ovsdb_table *table)
          * Do NOT close it here — it is closed via
          * ovsdb_storage_close(). */
         table->disk_store = NULL;
+
+        /* Three-layer data access cleanup. */
+        if (table->storage_engine) {
+            ovsdb_storage_engine_destroy(table->storage_engine);
+        }
+        if (table->index_set) {
+            ovsdb_index_set_destroy(table->index_set);
+            free(table->index_set);
+        }
 
         ovsdb_table_schema_destroy(table->schema);
         free(table);

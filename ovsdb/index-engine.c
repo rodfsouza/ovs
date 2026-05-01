@@ -221,6 +221,19 @@ ovsdb_index_remove(struct ovsdb_index *idx,
 }
 
 /* ------------------------------------------------------------------ */
+/* BLOOM-specific.                                                     */
+/* ------------------------------------------------------------------ */
+
+void
+ovsdb_index_set_bloom_filter(struct ovsdb_index *idx,
+                              struct ovsdb_bloom_filter *filter)
+{
+    ovs_assert(idx->type == OVSDB_IDX_BLOOM);
+    idx->bloom.filter = filter;
+    idx->bloom.owns_filter = false;
+}
+
+/* ------------------------------------------------------------------ */
 /* Lookup.                                                             */
 /* ------------------------------------------------------------------ */
 

@@ -59,6 +59,8 @@ const struct ovsdb_column *ovsdb_table_schema_get_column(
 
 struct ovsdb_row_cache;
 struct ovsdb_disk_store;
+struct ovsdb_storage_engine;
+struct ovsdb_index_set;
 
 struct ovsdb_table {
     struct ovsdb_table_schema *schema;
@@ -81,6 +83,10 @@ struct ovsdb_table {
     struct ovsdb_name_index *name_index; /* Secondary name→UUID index.
                                           * NULL if no indexed column
                                           * or no disk_store. */
+
+    /* Three-layer data access (Phase 4). */
+    struct ovsdb_storage_engine *storage_engine; /* Pure disk I/O. */
+    struct ovsdb_index_set *index_set;           /* BLOOM + HASH indexes. */
 
     /* Back-pointer to owning database (for lazy-load). */
     struct ovsdb *db;

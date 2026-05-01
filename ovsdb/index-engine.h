@@ -88,6 +88,13 @@ struct disk_store_index_entry *ovsdb_index_lookup(
     const struct ovsdb_index *,
     const union ovsdb_atom *key);
 
+/* --- BLOOM-specific --- */
+
+/* Attach an existing bloom filter to a BLOOM index.
+ * The index does NOT take ownership — caller manages lifetime. */
+void ovsdb_index_set_bloom_filter(struct ovsdb_index *,
+                                   struct ovsdb_bloom_filter *);
+
 /* --- Metadata --- */
 enum ovsdb_index_type ovsdb_index_get_type(const struct ovsdb_index *);
 const char *ovsdb_index_get_name(const struct ovsdb_index *);
