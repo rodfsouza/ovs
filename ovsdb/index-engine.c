@@ -18,8 +18,10 @@
 #include "index-engine.h"
 
 #include "bloom-filter.h"
+#include "column.h"
 #include "disk-store.h"
 #include "ovsdb-data.h"
+#include "table.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/json.h"
 #include "openvswitch/vlog.h"
@@ -358,4 +360,66 @@ ovsdb_index_set_find_bloom(const struct ovsdb_index_set *set)
         }
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Auto-detect from schema.                                            */
+/* ------------------------------------------------------------------ */
+
+struct ovsdb_index_set *
+ovsdb_index_set_from_schema(const struct ovsdb_table_schema *ts,
+                             struct ovsdb_bloom_filter *bloom)
+{
+    struct ovsdb_index_set *set = xmalloc(sizeof *set);
+    struct ovsdb_index_spec spec;
+    struct ovsdb_index *idx;
+    size_t i;
+
+    ovsdb_index_set_init(set);
+
+    /* Always create BLOOM index for UUID existence. */
+    memset(&spec, 0, sizeof spec);
+    spec.type = OVSDB_IDX_BLOOM;
+    spec.name = "bloom";
+    idx = ovsdb_index_create(&spec);
+    if (bloom) {
+        ovsdb_index_set_bloom_filter(idx, bloom);
+    }
+    ovsdb_index_set_add(set, idx);
+
+    /* HASH indexes — one per single-column schema index.
+     * Supports string, integer, and UUID key types.
+     * Multi-column indexes are skipped (future). */
+    for (i = 0; i < ts->n_indexes; i++) {
+        const struct ovsdb_column_set *sidx = &ts->indexes[i];
+
+        if (sidx->n_columns != 1) {
+            continue;  /* Multi-column — skip. */
+        }
+        if (sidx->columns[0]->type.n_max != 1) {
+            continue;  /* Set/map column — skip. */
+        }
+
+        switch (sidx->columns[0]->type.key.type) {
+        case OVSDB_TYPE_STRING:
+        case OVSDB_TYPE_INTEGER:
+        case OVSDB_TYPE_UUID:
+            memset(&spec, 0, sizeof spec);
+            spec.type = OVSDB_IDX_HASH;
+            spec.name = sidx->columns[0]->name;
+            spec.column_name = sidx->columns[0]->name;
+            spec.key_type = sidx->columns[0]->type.key.type;
+            ovsdb_index_set_add(set, ovsdb_index_create(&spec));
+            break;
+
+        case OVSDB_TYPE_REAL:
+        case OVSDB_TYPE_BOOLEAN:
+        case OVSDB_TYPE_VOID:
+        case OVSDB_N_TYPES:
+        default:
+            break;  /* Not indexable. */
+        }
+    }
+
+    return set;
 }

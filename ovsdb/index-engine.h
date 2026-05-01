@@ -111,6 +111,17 @@ void ovsdb_index_set_init(struct ovsdb_index_set *);
 void ovsdb_index_set_destroy(struct ovsdb_index_set *);
 void ovsdb_index_set_add(struct ovsdb_index_set *, struct ovsdb_index *);
 
+/* Auto-detect indexes from table schema:
+ *   - BLOOM for UUID existence (always)
+ *   - HASH for each single-column index declared in schema
+ *     (string, integer, or UUID columns with n_max==1)
+ * The BLOOM index wraps 'bloom' (not owned by the set).
+ * HASH indexes are created empty — caller must populate. */
+struct ovsdb_table_schema;
+struct ovsdb_index_set *ovsdb_index_set_from_schema(
+    const struct ovsdb_table_schema *,
+    struct ovsdb_bloom_filter *bloom);  /* Attached to BLOOM index */
+
 /* Find the first HASH index covering 'column_name', or NULL. */
 struct ovsdb_index *ovsdb_index_set_find_for_column(
     const struct ovsdb_index_set *, const char *column_name);

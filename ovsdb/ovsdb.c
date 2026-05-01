@@ -816,53 +816,13 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
          * These coexist with the legacy bloom/name_index during
          * transition.  Phase 4b will migrate callers. */
         table->storage_engine = ovsdb_storage_engine_create(ds);
-        {
-            struct ovsdb_index_set *iset = xmalloc(sizeof *iset);
-            struct ovsdb_index_spec bloom_spec;
-            struct ovsdb_index *bloom_idx;
 
-            ovsdb_index_set_init(iset);
-
-            /* BLOOM index — wraps the bloom filter we just built. */
-            memset(&bloom_spec, 0, sizeof bloom_spec);
-            bloom_spec.type = OVSDB_IDX_BLOOM;
-            bloom_spec.name = "bloom";
-            bloom_idx = ovsdb_index_create(&bloom_spec);
-            ovsdb_index_set_bloom_filter(bloom_idx, table->bloom);
-            ovsdb_index_set_add(iset, bloom_idx);
-
-            /* HASH indexes — one per schema-declared single-column index.
-             *
-             * NOTE: HASH indexes are created empty here.  They are
-             * NOT populated with existing rows during startup.  The
-             * legacy name_index (built above via build_name_index)
-             * handles name lookups until the HASH indexes are
-             * populated in the startup optimization phase.
-             *
-             * Currently, ovsdb_table_get_row uses lookup_uuid which
-             * goes through bloom+cache+disk, NOT through HASH
-             * indexes.  The query engine's INDEX_LOOKUP plan type
-             * will use HASH indexes once they are populated. */
-            for (size_t j = 0; j < table->schema->n_indexes; j++) {
-                const struct ovsdb_column_set *sidx
-                    = &table->schema->indexes[j];
-                if (sidx->n_columns == 1
-                    && (sidx->columns[0]->type.key.type == OVSDB_TYPE_STRING
-                        || sidx->columns[0]->type.key.type == OVSDB_TYPE_INTEGER
-                        || sidx->columns[0]->type.key.type == OVSDB_TYPE_UUID)
-                    && sidx->columns[0]->type.n_max == 1) {
-                    struct ovsdb_index_spec hash_spec;
-
-                    memset(&hash_spec, 0, sizeof hash_spec);
-                    hash_spec.type = OVSDB_IDX_HASH;
-                    hash_spec.name = sidx->columns[0]->name;
-                    hash_spec.column_name = sidx->columns[0]->name;
-                    hash_spec.key_type = sidx->columns[0]->type.key.type;
-                    ovsdb_index_set_add(iset, ovsdb_index_create(&hash_spec));
-                }
-            }
-            table->index_set = iset;
-        }
+        /* Auto-detect indexes from schema:
+         *   - BLOOM wrapping the bloom filter we just built
+         *   - HASH for each single-column schema index
+         * HASH indexes are created empty — populated later. */
+        table->index_set = ovsdb_index_set_from_schema(
+            table->schema, table->bloom);
 
         /* No proactive warm-up.  The cache starts cold and fills
          * on demand as rows are accessed (cache miss → index lookup
