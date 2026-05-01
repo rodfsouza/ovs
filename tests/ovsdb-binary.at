@@ -1,3 +1,16 @@
+AT_BANNER([OVSDB query engine tests])
+
+AT_SETUP([query engine - plan types and EXPLAIN])
+AT_KEYWORDS([ovsdb query engine])
+AT_CHECK([test-query-engine], [0], [plan_null_condition: PASSED
+plan_uuid_condition: PASSED
+plan_name_with_index: PASSED
+plan_name_without_index: PASSED
+explain_format: PASSED
+plan_destroy_with_key: PASSED
+])
+AT_CLEANUP
+
 AT_BANNER([OVSDB index engine tests])
 
 AT_SETUP([index engine - HASH string/int/UUID + remove + multi + stress])

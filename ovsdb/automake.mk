@@ -54,6 +54,8 @@ ovsdb_libovsdb_la_SOURCES = \
 	ovsdb/storage-engine.h \
 	ovsdb/index-engine.c \
 	ovsdb/index-engine.h \
+	ovsdb/query-engine.c \
+	ovsdb/query-engine.h \
 	ovsdb/table.c \
 	ovsdb/table.h \
 	ovsdb/trigger.c \
