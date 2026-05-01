@@ -46,6 +46,7 @@
 #include "server.h"
 #include "simap.h"
 #include "storage.h"
+#include "storage-engine.h"
 #include "stream.h"
 #include "worker-pool.h"
 #include "table.h"
@@ -2070,7 +2071,41 @@ disk_cursor_stream_worker_fn(void *arg)
     wctx.rows_in_batch = 0;
     ovsdb_binary_buf_init(&wctx.batch);
 
-    if (job->table->disk_store) {
+    if (job->table->storage_engine) {
+        struct ovsdb_storage_cursor *cursor;
+
+        cursor = ovsdb_storage_engine_cursor_open(
+            job->table->storage_engine, job->table_name);
+        if (cursor) {
+            struct ovsdb_row *row;
+
+            while ((row = ovsdb_storage_engine_cursor_next(
+                        cursor, job->table))) {
+                bool cancelled;
+                const struct uuid *uuid;
+
+                atomic_read_relaxed(&job->cancelled, &cancelled);
+                if (cancelled) {
+                    ovsdb_row_destroy(row);
+                    break;
+                }
+
+                uuid = ovsdb_row_get_uuid(row);
+                ovsdb_binary_serialize_row(&wctx.batch, uuid,
+                                            row->fields, &job->columns,
+                                            true);
+                wctx.rows_in_batch++;
+                ovsdb_row_destroy(row);
+
+                if (wctx.batch.size >= BINARY_BATCH_MAX_BYTES
+                    || wctx.rows_in_batch >= BINARY_BATCH_MAX_ROWS) {
+                    binary_stream_flush_batch(&wctx);
+                }
+            }
+            ovsdb_storage_engine_cursor_close(cursor);
+        }
+    } else if (job->table->disk_store) {
+        /* Legacy fallback for tables without storage engine. */
         struct ovsdb_disk_store_cursor *cursor;
 
         cursor = ovsdb_disk_store_cursor_open(job->table->disk_store,
