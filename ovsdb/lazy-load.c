@@ -18,6 +18,7 @@
 #include "lazy-load.h"
 
 #include "disk-store.h"
+#include "storage-engine.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/uuid.h"
 #include "openvswitch/vlog.h"
@@ -58,9 +59,11 @@ row_load_worker(void *arg)
     struct row_load_request *req = arg;
     struct ovsdb_row *row;
 
-    row = ovsdb_disk_store_read_row(req->table->disk_store,
-                                    req->table,
-                                    &req->uuid);
+    row = req->table->storage_engine
+        ? ovsdb_storage_engine_read_row(req->table->storage_engine,
+                                         req->table, &req->uuid)
+        : ovsdb_disk_store_read_row(req->table->disk_store,
+                                     req->table, &req->uuid);
     return row;
 }
 
