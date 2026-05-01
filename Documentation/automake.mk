@@ -131,6 +131,7 @@ DOC_SOURCE = \
 	Documentation/internals/plan-binary-streaming-worker-offload.md \
 	Documentation/internals/plan-materialized-json-snapshot.md \
 	Documentation/internals/secondary-name-index-plan.md \
+	Documentation/internals/plan-three-layer-data-access.md \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
 	Documentation/internals/contributing/inclusive-language.rst \

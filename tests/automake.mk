@@ -435,6 +435,10 @@ $(srcdir)/package.m4: $(top_srcdir)/configure.ac
 	  echo 'm4_define([AT_PACKAGE_BUGREPORT], [$(PACKAGE_BUGREPORT)])'; \
 	} >'$(srcdir)/package.m4'
 
+noinst_PROGRAMS += tests/test-index-engine
+tests_test_index_engine_SOURCES = tests/test-index-engine.c
+tests_test_index_engine_LDADD = ovsdb/libovsdb.la lib/libopenvswitch.la
+
 noinst_PROGRAMS += tests/test-storage-engine
 tests_test_storage_engine_SOURCES = tests/test-storage-engine.c
 tests_test_storage_engine_LDADD = ovsdb/libovsdb.la lib/libopenvswitch.la

@@ -1,3 +1,19 @@
+AT_BANNER([OVSDB index engine tests])
+
+AT_SETUP([index engine - HASH string/int/UUID + remove + multi + stress])
+AT_KEYWORDS([ovsdb index engine])
+AT_CHECK([test-index-engine], [0], [hash_string_lookup: PASSED
+hash_integer_lookup: PASSED
+hash_uuid_lookup: PASSED
+hash_remove: PASSED
+multi_index: PASSED
+index_set: PASSED
+pointer_identity: PASSED
+stress: PASSED (10000 entries)
+metadata: PASSED
+])
+AT_CLEANUP
+
 AT_BANNER([OVSDB storage engine tests])
 
 AT_SETUP([storage engine - lifecycle and API surface])

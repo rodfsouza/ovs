@@ -86,22 +86,7 @@ VLOG_DEFINE_THIS_MODULE(disk_store);
 #define DISK_STORE_N_COLUMNS_OFFSET 20  /* Byte offset of n_columns
                                          * within the row header. */
 
-/* In-memory index entry mapping UUID -> file location.
- * Also serves as the anchor for the secondary name index:
- * both the UUID hmap and name hmap reference the same entry. */
-struct disk_store_index_entry {
-    struct hmap_node hmap_node;   /* In ovsdb_disk_store.index. */
-    struct uuid uuid;             /* Row UUID. */
-    off_t offset;                 /* Byte offset in file. */
-    uint32_t length;              /* Total record length on disk. */
-    char *table_name;             /* Owning table name. */
-    bool deleted;                 /* Marked for lazy deletion. */
-
-    /* Secondary name index linkage. */
-    char *name_value;             /* Indexed column value, or NULL. */
-    struct hmap_node name_node;   /* In name_index.entries (by name hash). */
-    bool in_name_index;           /* True if name_node is inserted. */
-};
+/* disk_store_index_entry is defined in disk-store.h (public). */
 
 /* The disk store handle. */
 struct ovsdb_disk_store {

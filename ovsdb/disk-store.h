@@ -29,6 +29,26 @@ struct ovsdb_schema;
 struct ovsdb_disk_store;
 struct ovsdb_disk_store_cursor;
 
+/* Clustered index entry: the primary key for all disk-backed rows.
+ * Maps UUID → file offset.  Every secondary index (bloom, hash)
+ * points to one of these entries via pointer — no UUID copies.
+ *
+ * This struct is public so the index engine can reference it. */
+struct disk_store_index_entry {
+    struct hmap_node hmap_node;   /* In ovsdb_disk_store.index. */
+    struct uuid uuid;             /* Row UUID. */
+    off_t offset;                 /* Byte offset in file. */
+    uint32_t length;              /* Total record length on disk. */
+    char *table_name;             /* Owning table name. */
+    bool deleted;                 /* Marked for lazy deletion. */
+
+    /* Secondary name index linkage (legacy — will be replaced
+     * by index engine in Phase 4). */
+    char *name_value;
+    struct hmap_node name_node;
+    bool in_name_index;
+};
+
 /* Lifecycle. */
 struct ovsdb_disk_store *ovsdb_disk_store_open(
     const char *filename, const struct ovsdb_schema *);
