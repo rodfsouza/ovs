@@ -398,36 +398,6 @@ ovsdb_table_get_row(const struct ovsdb_table *table, const struct uuid *uuid)
             uuid);
     }
 
-    /* Legacy path for non-disk-store tables. */
-    if (table->cache) {
-        const struct ovsdb_row *cached;
-
-        cached = ovsdb_row_cache_lookup(table->cache, uuid);
-        if (cached) {
-            return cached;
-        }
-    }
-
-    if (table->disk_store) {
-        if (table->bloom
-            && !ovsdb_bloom_filter_may_contain(table->bloom, uuid)) {
-            return NULL;
-        }
-
-        row = ovsdb_disk_store_read_row(
-            table->disk_store,
-            CONST_CAST(struct ovsdb_table *, table),
-            uuid);
-        if (row) {
-            if (table->cache) {
-                ovsdb_row_cache_insert(
-                    table->cache, row,
-                    ovsdb_row_count_atoms(row));
-            }
-            return row;
-        }
-    }
-
     return NULL;
 }
 

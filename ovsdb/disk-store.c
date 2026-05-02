@@ -694,6 +694,112 @@ disk_store_extract_column_string(const uint8_t *record,
     return NULL;
 }
 
+/* Generalized column extraction: returns the first atom value
+ * for a named column of any supported type (string, integer, UUID).
+ * Sets *out and *out_type on success.  Returns true if found.
+ * Caller must call ovsdb_atom_destroy(out, *out_type) on success. */
+static bool
+disk_store_extract_column_atom(const uint8_t *record,
+                               uint32_t total_len,
+                               uint16_t n_columns,
+                               uint16_t table_name_len,
+                               const char *target_column,
+                               union ovsdb_atom *out,
+                               enum ovsdb_atomic_type *out_type)
+{
+    size_t target_len = strlen(target_column);
+    size_t pos = DISK_STORE_ROW_HEADER_SIZE
+                 + sizeof(uint16_t) + table_name_len;
+    uint16_t c;
+
+    for (c = 0; c < n_columns && pos < total_len; c++) {
+        uint16_t col_name_len;
+        size_t col_name_pos;
+        uint8_t key_type;
+        uint8_t val_type;
+
+        if (pos + sizeof(uint16_t) > total_len) {
+            break;
+        }
+        memcpy(&col_name_len, record + pos, sizeof col_name_len);
+        pos += sizeof col_name_len;
+
+        if (pos + col_name_len + 2 > total_len) {
+            break;
+        }
+        col_name_pos = pos;
+        pos += col_name_len;
+
+        key_type = record[pos++];
+        val_type = record[pos++];
+
+        if (col_name_len == target_len
+            && !memcmp((const char *)(record + col_name_pos),
+                       target_column, target_len)) {
+            /* Found target column.  Extract first atom. */
+            uint32_t datum_n;
+
+            if (pos + sizeof(uint32_t) > total_len) {
+                break;
+            }
+            memcpy(&datum_n, record + pos, sizeof datum_n);
+            pos += sizeof datum_n;
+
+            if (datum_n < 1) {
+                return false;
+            }
+
+            switch (key_type) {
+            case OVSDB_TYPE_STRING:
+                if (pos + sizeof(uint32_t) <= total_len) {
+                    uint32_t str_len;
+                    char *s;
+
+                    memcpy(&str_len, record + pos, sizeof str_len);
+                    pos += sizeof str_len;
+                    if (pos + str_len <= total_len) {
+                        s = xmemdup0(
+                            (const char *)(record + pos), str_len);
+                        out->s = json_string_create(s);
+                        free(s);
+                        *out_type = OVSDB_TYPE_STRING;
+                        return true;
+                    }
+                }
+                return false;
+
+            case OVSDB_TYPE_INTEGER:
+                if (pos + sizeof(int64_t) <= total_len) {
+                    memcpy(&out->integer, record + pos,
+                           sizeof out->integer);
+                    *out_type = OVSDB_TYPE_INTEGER;
+                    return true;
+                }
+                return false;
+
+            case OVSDB_TYPE_UUID:
+                if (pos + sizeof(struct uuid) <= total_len) {
+                    memcpy(&out->uuid, record + pos,
+                           sizeof out->uuid);
+                    *out_type = OVSDB_TYPE_UUID;
+                    return true;
+                }
+                return false;
+
+            default:
+                return false;
+            }
+        }
+
+        /* Skip this column's datum. */
+        if (pos + sizeof(uint32_t) > total_len) {
+            break;
+        }
+        pos += disk_store_skip_datum(record + pos, key_type, val_type);
+    }
+    return false;
+}
+
 static struct ovsdb_error *
 disk_store_rebuild_index(struct ovsdb_disk_store *store)
 {
@@ -1708,21 +1814,19 @@ populate_hash_indexes(struct ovsdb_table_index_build_ctx *ctx,
     for (i = 0; i < ctx->index_set->n_indexes; i++) {
         struct ovsdb_index *idx = ctx->index_set->indexes[i];
         const char *col_name;
-        char *value;
+        union ovsdb_atom atom;
+        enum ovsdb_atomic_type atom_type;
 
         if (ovsdb_index_get_type(idx) != OVSDB_IDX_HASH) {
             continue;
         }
 
         col_name = ovsdb_index_get_name(idx);
-        value = disk_store_extract_column_string(
-            record, record_len, n_columns, table_name_len, col_name);
-        if (value) {
-            union ovsdb_atom key;
-            key.s = json_string_create(value);
-            ovsdb_index_add(idx, &key, entry);
-            json_destroy(key.s);
-            free(value);
+        if (disk_store_extract_column_atom(
+                record, (uint32_t) record_len, n_columns,
+                table_name_len, col_name, &atom, &atom_type)) {
+            ovsdb_index_add(idx, &atom, entry);
+            ovsdb_atom_destroy(&atom, atom_type);
         }
     }
 }

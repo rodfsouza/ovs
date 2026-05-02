@@ -786,18 +786,6 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
         /* Create bloom filter (empty — populated in single-pass below). */
         table->bloom = ovsdb_bloom_filter_create(n_rows);
 
-        /* Legacy name index (kept during transition). */
-        for (size_t i = 0; i < table->schema->n_indexes; i++) {
-            const struct ovsdb_column_set *idx = &table->schema->indexes[i];
-            if (idx->n_columns == 1
-                && idx->columns[0]->type.key.type == OVSDB_TYPE_STRING
-                && idx->columns[0]->type.n_max == 1) {
-                table->name_index = ovsdb_name_index_create(
-                    idx->columns[0]->name, idx->columns[0]->index);
-                break;
-            }
-        }
-
         /* Three-layer: storage engine + index set (auto-detect). */
         table->storage_engine = ovsdb_storage_engine_create(ds);
         table->index_set = ovsdb_index_set_from_schema(
@@ -823,14 +811,10 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
      * bloom filters + HASH indexes for ALL tables. */
     ovsdb_disk_store_build_all_indexes(ds, &build_ctxs);
 
-    /* Also build the legacy name index (kept during transition).
-     * This is a separate pass until the legacy path is removed. */
+    /* Start cache sweepers. */
     SHASH_FOR_EACH (node, &db->tables) {
         struct ovsdb_table *table = node->data;
 
-        if (table->name_index) {
-            ovsdb_disk_store_build_name_index(ds, table->name_index);
-        }
         ovsdb_row_cache_start_sweeper(table->cache);
     }
 
