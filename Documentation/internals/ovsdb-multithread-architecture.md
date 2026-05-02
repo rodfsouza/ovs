@@ -749,6 +749,228 @@ make check TESTSUITEFLAGS="-j4 -k ovsdb"
 
 ---
 
+## 18. Three-Layer Data Access Architecture
+
+The three-layer refactoring (branch `branch-3.3-three-layer-refactor`)
+introduces a clean separation of concerns for all disk-backed data access.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    CALLERS                           │
+│  (monitor.c, jsonrpc-server.c, execution.c,         │
+│   transaction.c, lazy-load.c, ovsdb-tool.c)         │
+└────────────────────────┬────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│            QUERY ENGINE  (query-engine.h/c)         │
+│                                                     │
+│  plan(condition, indexes, table) → execution_plan   │
+│  execute(plan, storage, indexes, cache) → iterator  │
+│  lookup_uuid(storage, indexes, cache, table, uuid)  │
+│  describe(plan) → EXPLAIN string                    │
+│                                                     │
+│  Orchestrates all three lower layers.               │
+└───────┬──────────────────┬──────────────┬───────────┘
+        │                  │              │
+        ▼                  ▼              ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────────┐
+│ INDEX       │  │ STORAGE     │  │ CACHE            │
+│ ENGINE      │  │ ENGINE      │  │ (row-cache.h)    │
+│             │  │             │  │                  │
+│ BLOOM: UUID │  │ read_row    │  │ lookup(uuid)     │
+│  existence  │  │ cursor_*    │  │ insert(row)      │
+│ HASH: col → │  │ count       │  │ remove(uuid)     │
+│  entry *    │  │ contains    │  │ enter/exit_burst │
+│             │  │             │  │ sweeper          │
+│ All point   │  │ Pure disk   │  │                  │
+│ to cluster  │  │ I/O. No     │  │ Independent.     │
+│ entry       │  │ cache or    │  │ No disk I/O.     │
+│             │  │ indexes.    │  │ No indexes.      │
+└─────────────┘  └─────────────┘  └─────────────────┘
+```
+
+### Storage Engine (`ovsdb/storage-engine.h/c`)
+
+Pure disk I/O facade over `ovsdb_disk_store`.  No cache, no indexes,
+no query logic.
+
+```c
+ovsdb_storage_engine_create(disk_store)
+ovsdb_storage_engine_read_row(se, table, uuid)   /* pread via UUID→offset */
+ovsdb_storage_engine_cursor_open(se, table_name)  /* sequential scan */
+ovsdb_storage_engine_cursor_next(cursor, table)
+ovsdb_storage_engine_cursor_close(cursor)
+ovsdb_storage_engine_count(se, table_name)
+ovsdb_storage_engine_contains(se, uuid)
+```
+
+Thread-safe for reads (uses `pread`).  Write operations main-thread only.
+
+### Index Engine (`ovsdb/index-engine.h/c`)
+
+Generic secondary index interface built on the **clustered index model**.
+
+**Clustered index:** `disk_store_index_entry` (uuid → offset) is the
+primary key.  Every secondary index points to it via pointer — no UUID
+copies.
+
+```
+                    Clustered Index
+                    (uuid → offset)
+                         │
+            ┌────────────┼────────────┐
+            ▼            ▼            ▼
+        BLOOM        HASH "name"  HASH "logical_port"
+        (uuid)       key → entry* key → entry*
+```
+
+**Index types:**
+
+| Type | Purpose | Lookup returns |
+|------|---------|---------------|
+| BLOOM | Fast negative UUID check | `bool` (may exist / definitely not) |
+| HASH | Exact match on column value | `disk_store_index_entry *` (clustered) |
+
+**External node model (Option B):**
+
+```c
+struct ovsdb_index_node {
+    struct hmap_node hmap_node;            /* In index's hmap */
+    struct disk_store_index_entry *entry;  /* → clustered entry */
+    union ovsdb_atom key;                  /* Indexed column value */
+};
+```
+
+Path: `hash(key) → index_node → entry → entry->offset → pread`
+
+**Supports:** STRING, INTEGER, UUID column types.  Multiple indexes per table.
+
+**Index Set:** Per-table collection created automatically from schema:
+
+```c
+struct ovsdb_index_set *ovsdb_index_set_from_schema(schema, bloom);
+struct ovsdb_index_set *ovsdb_index_set_from_schema_with_config(
+    schema, bloom, config);  /* With optional config overlay */
+```
+
+### Query Engine (`ovsdb/query-engine.h/c`)
+
+Plans and executes queries.  Orchestrates storage + index + cache.
+
+**Plan types:**
+
+| Plan | Condition | Path |
+|------|-----------|------|
+| `POINT_LOOKUP` | `_uuid == <uuid>` | bloom → cache → pread |
+| `INDEX_LOOKUP` | `column == <value>` + HASH index | index → entry → cache → pread |
+| `FULL_SCAN` | NULL or complex | cursor + condition filter |
+
+**Planning logic:**
+
+```
+plan(condition, indexes, table):
+  NULL condition → FULL_SCAN
+  _uuid == uuid  → POINT_LOOKUP
+  column == value + index exists → INDEX_LOOKUP
+  else → FULL_SCAN with filter
+```
+
+**EXPLAIN output (logged via VLOG_DBG):**
+
+```
+POINT_LOOKUP uuid=a93b5600-5ac4-448f-9199-a9127f10378a
+INDEX_LOOKUP via "idx_name"
+FULL_SCAN (unconditioned), cache=no
+```
+
+**Convenience function** for the hot path (zero allocations on cache hit):
+
+```c
+const struct ovsdb_row *ovsdb_query_engine_lookup_uuid(
+    storage, indexes, cache, table, uuid);
+```
+
+### Index Configuration (`ovsdb/index-config.h/c`)
+
+INI-style config file for declaring indexes beyond schema defaults.
+
+```ini
+# /etc/openvswitch/index-ovn-sb.conf
+
+[SB_Global]
+bloom = false          # maxRows=1, bloom wasteful
+
+[Logical_Flow]
+hash = logical_datapath  # Extra HASH index for fast lookup
+
+[Port_Binding]
+hash = datapath          # Beyond schema's "logical_port" index
+```
+
+Usage: `ovsdb-server --index-config=index-ovn-sb.conf sb.db`
+
+Pre-generated configs for all OVN schemas (77 tables):
+- `ovsdb/index-ovn-nb.conf` — OVN Northbound (30 tables)
+- `ovsdb/index-ovn-sb.conf` — OVN Southbound (34 tables)
+- `ovsdb/index-ovn-ic-nb.conf` — IC Northbound (4 tables)
+- `ovsdb/index-ovn-ic-sb.conf` — IC Southbound (9 tables)
+
+### Single-Pass Index Build
+
+At startup, `ovsdb_disk_store_build_all_indexes()` walks the clustered
+index hmap ONCE to build all per-table indexes:
+
+```
+HMAP_FOR_EACH (entry, hmap_node, &store->index):
+    ctx = shash_find_data(table_ctxs, entry->table_name)  /* O(1) */
+    bloom_filter_add(ctx->bloom, &entry->uuid)
+    if HASH indexes:
+        pread(fd, record, entry->length, entry->offset)
+        for each HASH index:
+            extract_column_atom(record, col_name) → atom
+            ovsdb_index_add(index, &atom, entry)
+```
+
+Replaces the previous multi-pass approach:
+- **Before:** `for_each_uuid` × N_tables (67M strcmp) + `build_name_index` (pread per row)
+- **After:** One hmap walk with `shash_find` per entry (O(1) dispatch)
+
+### How `ovsdb_table_get_row` Works After Refactoring
+
+```c
+ovsdb_table_get_row(table, uuid):
+    /* 1. In-memory hmap (transaction modifications). */
+    HMAP_FOR_EACH_WITH_HASH → found? return
+
+    /* 2. Query engine (disk-store tables). */
+    if storage_engine && index_set:
+        return ovsdb_query_engine_lookup_uuid(...)
+            /* Internally: bloom → cache → pread → cache_insert */
+
+    /* 3. Not found. */
+    return NULL
+```
+
+---
+
+## 19. Caller Migration Summary
+
+All callers now go through the three-layer engines:
+
+| Caller | Before | After |
+|--------|--------|-------|
+| `table.c:get_row` | Direct bloom + cache + disk_store | `query_engine_lookup_uuid` |
+| `table.c:query` | 3-path switch (UUID/name/scan) | Query engine for disk, legacy for in-memory |
+| `jsonrpc-server.c:worker` | Direct disk_store_cursor | `storage_engine_cursor_*` |
+| `lazy-load.c:worker` | Direct disk_store_read_row | `storage_engine_read_row` |
+| `monitor.c:get_initial` | Calls table.c (indirect) | Same — table.c is migrated |
+| `ovsdb.c:attach` | Hardcoded bloom + name_index | `index_set_from_schema` + `build_all_indexes` |
+
+---
+
 ## Appendix: Commit History
 
 | Commit | Description |
@@ -768,3 +990,17 @@ make check TESTSUITEFLAGS="-j4 -k ovsdb"
 | `88986a01a` | Remove cache-through worker (all bypass cache) |
 | `37092b3b4` | Skip synchronous initial scan + shared seq |
 | `0815b5880` | Change set head for incremental updates |
+| `4dd201815` | Route conditioned monitors to JSON with index pushdown |
+| `617c1e2b6` | Fix use-after-free on normal streaming completion |
+| `efe24da5d` | Storage engine layer (Phase 1) |
+| `03045e98b` | Index engine layer (Phase 2) |
+| `327e7acb1` | Query engine layer (Phase 3) |
+| `a486d8ac1` | Wire storage+index into table (Phase 4a) |
+| `fb1055df1` | Migrate get_row to query engine (Phase 4b) |
+| `8244b2bf5` | Migrate streaming worker (Phase 4c) |
+| `de52435c2` | Migrate lazy-load worker (Phase 4e) |
+| `7d467d6cf` | Index auto-detect from schema (Phase 5) |
+| `9d39bf84d` | Single-pass index build (Phase A) |
+| `0c67b569a` | Index configuration file (Phase B) |
+| `49132a86a` | Remove legacy code + OVN index configs |
+| `6e9fd00d8` | Index config tests + bloom=false fix |

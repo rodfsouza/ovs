@@ -363,3 +363,119 @@ UUID→Offset Index (disk_store_index_entry):
 | Memory usage (1M rows) | ~1 GB RSS | ~cache budget (configurable) |
 | Cache pollution on lookup | All rows cached | Only matching row cached |
 | Compaction file layout | Random order | Grouped by table, sorted by UUID |
+
+## Three-Layer Data Access (branch-3.3-three-layer-refactor)
+
+The disk-store architecture was further refined with a three-layer
+separation of concerns.  This section describes how the original
+components evolved into the new architecture.
+
+### Evolution: Before → After
+
+| Before (direct access) | After (three-layer) |
+|------------------------|---------------------|
+| `table.c` calls `ovsdb_disk_store_read_row` directly | `table.c` calls `query_engine_lookup_uuid` |
+| `table.c` calls `bloom_filter_may_contain` directly | Query engine calls `index_contains` on BLOOM |
+| `table.c` has hardcoded 3-path query switch | Query engine selects plan (POINT/INDEX/SCAN) |
+| `ovsdb.c` creates bloom + name_index separately | `index_set_from_schema` auto-detects all indexes |
+| Multiple startup passes (67M strcmp + pread per row) | Single-pass `build_all_indexes` |
+| `name_index` only for first string column | HASH indexes for any column type (string/int/UUID) |
+| Index config hardcoded in C | Optional `--index-config` INI file |
+
+### Clustered Index Model
+
+The `disk_store_index_entry` serves as the **clustered index** — the
+single source of truth for where a row lives on disk:
+
+```c
+struct disk_store_index_entry {
+    struct hmap_node hmap_node;   /* In UUID hmap (clustered index) */
+    struct uuid uuid;
+    off_t offset;                 /* Byte position in disk file */
+    uint32_t length;              /* Record size */
+    char *table_name;
+    bool deleted;
+};
+```
+
+Every secondary index (BLOOM, HASH) points to this entry via pointer.
+No UUID copies.  One `pread` path regardless of which index found it.
+
+### How Indexes Are Built at Startup
+
+```
+ovsdb_attach_disk_store():
+    Phase 0: disk_store_open() → sequential file read
+             → builds clustered index (uuid → offset hmap)
+
+    Phase 1: Per-table setup (no I/O):
+             → create bloom filter (empty)
+             → create storage_engine
+             → create index_set (auto-detect from schema)
+             → register in build_ctxs shash
+
+    Phase 2: build_all_indexes — ONE hmap walk:
+             for each entry:
+                 shash_find → table context (O(1))
+                 bloom_filter_add(uuid)
+                 if HASH indexes: pread → extract column → index_add
+
+    Phase 3: Start cache sweepers
+```
+
+### File Layout
+
+```
+ovsdb/
+├── disk-store.h/c         Disk I/O + clustered index + build_all_indexes
+├── storage-engine.h/c     Pure disk I/O facade
+├── index-engine.h/c       BLOOM + HASH (generic, clustered model)
+├── index-config.h/c       INI config file parser
+├── query-engine.h/c       Plan + execute + EXPLAIN
+├── row-cache.h/c          Clock-sweep LRU (independent)
+├── bloom-filter.h/c       Probabilistic UUID existence
+├── worker-pool.h/c        N-threaded async I/O
+└── lazy-load.h/c          Async row loading
+
+Index configuration:
+├── index.conf.example     Annotated example
+├── index-ovn-nb.conf      OVN Northbound (30 tables)
+├── index-ovn-sb.conf      OVN Southbound (34 tables)
+├── index-ovn-ic-nb.conf   IC Northbound (4 tables)
+└── index-ovn-ic-sb.conf   IC Southbound (9 tables)
+```
+
+### Data Access Patterns After Refactoring
+
+**Point lookup** (`ovn-sbctl list logical_flow <uuid>`):
+```
+query_engine_lookup_uuid:
+    bloom.contains(uuid) → false? return NULL (fast negative)
+    cache_lookup(uuid) → hit? return cached
+    storage_engine_read_row(uuid) → pread at offset
+    cache_insert(row) → return cached pointer
+```
+
+**Index lookup** (`ovn-nbctl list Logical_Router <name>`):
+```
+query_engine_plan → INDEX_LOOKUP via hash index
+    hash_idx.lookup("name-value") → entry*
+    cache_lookup(entry->uuid) → hit? return cached
+    storage_engine_read_row(entry->uuid) → pread
+    cache_insert(row) → return cached pointer
+```
+
+**Full scan** (`ovn-nbctl list Logical_Router` — no filter):
+```
+query_engine_plan → FULL_SCAN (unconditioned)
+    → binary streaming: worker thread does cursor scan
+    → main thread drains batches → send binary frames
+    → cache bypassed entirely (no lock contention)
+```
+
+**Conditioned scan** (`ovn-sbctl list logical_flow priority>=100`):
+```
+query_engine_plan → FULL_SCAN with filter
+    → synchronous JSON path (get_initial_conditioned)
+    → condition pushdown to ovsdb_table_query
+```
