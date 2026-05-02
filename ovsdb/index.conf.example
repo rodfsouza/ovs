@@ -1,0 +1,45 @@
+# index.conf — OVSDB index configuration example.
+#
+# This file declares additional indexes beyond what the database
+# schema provides.  Schema-declared indexes (e.g., "indexes": [["name"]])
+# are ALWAYS created.  This file adds EXTRA indexes.
+#
+# Usage:
+#   ovsdb-server --index-config=/etc/openvswitch/index.conf db.bin
+#
+# Format:
+#   [TableName]
+#   bloom = true|false       Default: true.  Set false to skip bloom
+#                            filter for tiny tables (saves memory).
+#   hash = column_name       Creates a HASH index on the column for
+#                            O(1) exact-match lookups.  One per line,
+#                            multiple allowed.
+#
+# Supported column types for HASH: string, integer, uuid.
+# Multi-column and set/map columns are not supported.
+
+# --- OVN Southbound examples ---
+
+# Logical_Flow has no schema indexes.  Add one on logical_datapath
+# for fast lookups by datapath UUID.
+[Logical_Flow]
+hash = logical_datapath
+
+# Port_Binding already has "logical_port" from schema.  Add
+# "datapath" for fast datapath-based queries.
+[Port_Binding]
+hash = datapath
+
+# SB_Global has maxRows=1.  Bloom filter is wasteful for a
+# single-row table.
+[SB_Global]
+bloom = false
+
+# --- OVN Northbound examples ---
+
+# Logical_Router already has "name" from schema.  No extras needed.
+# [Logical_Router]
+
+# ACL has no schema indexes.  If you frequently query by "direction":
+# [ACL]
+# hash = direction

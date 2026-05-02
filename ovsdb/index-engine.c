@@ -20,6 +20,7 @@
 #include "bloom-filter.h"
 #include "column.h"
 #include "disk-store.h"
+#include "index-config.h"
 #include "ovsdb-data.h"
 #include "table.h"
 #include "openvswitch/hmap.h"
@@ -418,6 +419,62 @@ ovsdb_index_set_from_schema(const struct ovsdb_table_schema *ts,
         case OVSDB_N_TYPES:
         default:
             break;  /* Not indexable. */
+        }
+    }
+
+    return set;
+}
+
+struct ovsdb_index_set *
+ovsdb_index_set_from_schema_with_config(
+    const struct ovsdb_table_schema *ts,
+    struct ovsdb_bloom_filter *bloom,
+    const struct ovsdb_index_config *config)
+{
+    struct ovsdb_index_set *set;
+    bool want_bloom;
+
+    /* Check if config overrides bloom for this table. */
+    want_bloom = ovsdb_index_config_get_bloom(config, ts->name);
+
+    /* Build base set from schema (with or without bloom). */
+    set = ovsdb_index_set_from_schema(ts, want_bloom ? bloom : NULL);
+
+    /* Add extra HASH indexes from config. */
+    if (config) {
+        const char **extra_cols;
+        size_t n_extra;
+        size_t i;
+
+        n_extra = ovsdb_index_config_get_hash_columns(
+            config, ts->name, &extra_cols);
+        for (i = 0; i < n_extra; i++) {
+            /* Only add if not already covered by schema. */
+            if (!ovsdb_index_set_find_for_column(set, extra_cols[i])) {
+                const struct ovsdb_column *col;
+
+                col = ovsdb_table_schema_get_column(ts, extra_cols[i]);
+                if (col && col->type.n_max == 1
+                    && (col->type.key.type == OVSDB_TYPE_STRING
+                        || col->type.key.type == OVSDB_TYPE_INTEGER
+                        || col->type.key.type == OVSDB_TYPE_UUID)) {
+                    struct ovsdb_index_spec spec;
+
+                    memset(&spec, 0, sizeof spec);
+                    spec.type = OVSDB_IDX_HASH;
+                    spec.name = col->name;
+                    spec.column_name = col->name;
+                    spec.key_type = col->type.key.type;
+                    ovsdb_index_set_add(set, ovsdb_index_create(&spec));
+
+                    VLOG_INFO("index-config: added HASH index on %s.%s",
+                              ts->name, col->name);
+                } else {
+                    VLOG_WARN("index-config: cannot index %s.%s "
+                              "(unsupported type or not found)",
+                              ts->name, extra_cols[i]);
+                }
+            }
         }
     }
 

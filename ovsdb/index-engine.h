@@ -122,6 +122,14 @@ struct ovsdb_index_set *ovsdb_index_set_from_schema(
     const struct ovsdb_table_schema *,
     struct ovsdb_bloom_filter *bloom);  /* Attached to BLOOM index */
 
+/* Like from_schema, but overlays config: extra HASH indexes
+ * and bloom on/off overrides.  'config' may be NULL. */
+struct ovsdb_index_config;
+struct ovsdb_index_set *ovsdb_index_set_from_schema_with_config(
+    const struct ovsdb_table_schema *,
+    struct ovsdb_bloom_filter *bloom,
+    const struct ovsdb_index_config *config);
+
 /* Find the first HASH index covering 'column_name', or NULL. */
 struct ovsdb_index *ovsdb_index_set_find_for_column(
     const struct ovsdb_index_set *, const char *column_name);
