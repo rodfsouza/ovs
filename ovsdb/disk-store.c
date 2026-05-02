@@ -35,6 +35,7 @@
 #include "openvswitch/shash.h"
 #include "openvswitch/uuid.h"
 #include "openvswitch/vlog.h"
+#include "index-engine.h"
 #include "ovs-thread.h"
 #include "row.h"
 #include "sha1.h"
@@ -1676,6 +1677,116 @@ ovsdb_disk_store_rebuild_bloom(struct ovsdb_disk_store *store,
     struct ovsdb_bloom_filter *old = *bloom_p;
     *bloom_p = new_bloom;
     ovsdb_bloom_filter_destroy(old);
+}
+
+/* ------------------------------------------------------------------ */
+/* Single-pass index build.                                            */
+/* ------------------------------------------------------------------ */
+
+/* Populate HASH indexes for one entry by extracting column values
+ * from the raw disk record. */
+static void
+populate_hash_indexes(struct ovsdb_table_index_build_ctx *ctx,
+                      struct disk_store_index_entry *entry,
+                      const uint8_t *record, size_t record_len)
+{
+    size_t i;
+    uint16_t n_columns;
+    uint16_t table_name_len;
+
+    if (!ctx->index_set) {
+        return;
+    }
+
+    memcpy(&table_name_len,
+           record + DISK_STORE_ROW_HEADER_SIZE,
+           sizeof table_name_len);
+    memcpy(&n_columns,
+           record + DISK_STORE_N_COLUMNS_OFFSET,
+           sizeof n_columns);
+
+    for (i = 0; i < ctx->index_set->n_indexes; i++) {
+        struct ovsdb_index *idx = ctx->index_set->indexes[i];
+        const char *col_name;
+        char *value;
+
+        if (ovsdb_index_get_type(idx) != OVSDB_IDX_HASH) {
+            continue;
+        }
+
+        col_name = ovsdb_index_get_name(idx);
+        value = disk_store_extract_column_string(
+            record, record_len, n_columns, table_name_len, col_name);
+        if (value) {
+            union ovsdb_atom key;
+            key.s = json_string_create(value);
+            ovsdb_index_add(idx, &key, entry);
+            json_destroy(key.s);
+            free(value);
+        }
+    }
+}
+
+void
+ovsdb_disk_store_build_all_indexes(struct ovsdb_disk_store *ds,
+                                    struct shash *table_ctxs)
+{
+    struct disk_store_index_entry *e;
+    bool has_hash_indexes = false;
+    struct shash_node *sn;
+
+    /* Check if any table has HASH indexes that need population.
+     * If none, we can skip the pread entirely. */
+    SHASH_FOR_EACH (sn, table_ctxs) {
+        struct ovsdb_table_index_build_ctx *ctx = sn->data;
+        size_t i;
+
+        if (!ctx->index_set) {
+            continue;
+        }
+        for (i = 0; i < ctx->index_set->n_indexes; i++) {
+            if (ovsdb_index_get_type(ctx->index_set->indexes[i])
+                == OVSDB_IDX_HASH) {
+                has_hash_indexes = true;
+                break;
+            }
+        }
+        if (has_hash_indexes) {
+            break;
+        }
+    }
+
+    /* Single walk over the clustered index. */
+    HMAP_FOR_EACH (e, hmap_node, &ds->index) {
+        struct ovsdb_table_index_build_ctx *ctx;
+
+        if (e->deleted) {
+            continue;
+        }
+
+        ctx = shash_find_data(table_ctxs, e->table_name);
+        if (!ctx) {
+            continue;
+        }
+
+        /* 1. Bloom filter: add UUID. */
+        if (ctx->bloom) {
+            ovsdb_bloom_filter_add(ctx->bloom, &e->uuid);
+        }
+
+        /* 2. HASH indexes: pread + extract column values. */
+        if (has_hash_indexes && ctx->index_set) {
+            uint8_t *record = xmalloc(e->length);
+            ssize_t n = pread(ds->fd, record, e->length, e->offset);
+
+            if (n == (ssize_t) e->length) {
+                populate_hash_indexes(ctx, e, record, (size_t) n);
+            }
+            free(record);
+        }
+    }
+
+    VLOG_INFO("build_all_indexes: single-pass complete");
 }
 
 /* ------------------------------------------------------------------ */

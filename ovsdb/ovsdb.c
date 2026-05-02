@@ -749,12 +749,8 @@ ovsdb_snapshot(struct ovsdb *db, bool trim_memory OVS_UNUSED)
     return error;
 }
 
-static void
-add_bloom_cb(const struct uuid *uuid, void *aux)
-{
-    struct ovsdb_bloom_filter *bloom = aux;
-    ovsdb_bloom_filter_add(bloom, uuid);
-}
+/* add_bloom_cb removed — bloom populated in single-pass
+ * ovsdb_disk_store_build_all_indexes. */
 
 /* Attaches the binary disk store from storage to each table,
  * creating a row cache per table and building indexes (bloom
@@ -774,7 +770,10 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
         return;
     }
 
+    struct shash build_ctxs = SHASH_INITIALIZER(&build_ctxs);
     struct shash_node *node;
+
+    /* Phase 1: Create per-table structures (no I/O). */
     SHASH_FOR_EACH (node, &db->tables) {
         struct ovsdb_table *table = node->data;
 
@@ -784,18 +783,10 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
 
         size_t n_rows = ovsdb_disk_store_count(ds, node->name);
 
-        /* Build a bloom filter from all indexed UUIDs.
-         * This enables fast negative lookups without touching
-         * the cache or disk.  Memory is outside the atom budget. */
+        /* Create bloom filter (empty — populated in single-pass below). */
         table->bloom = ovsdb_bloom_filter_create(n_rows);
-        ovsdb_disk_store_for_each_uuid(
-            ds, node->name, add_bloom_cb, table->bloom);
 
-        /* Build secondary name index for the first single-column
-         * string index declared in the schema (typically "name").
-         * This does a second pass reading each row from disk to
-         * extract the indexed column value.  Runs during startup
-         * before workers are active — no lock needed. */
+        /* Legacy name index (kept during transition). */
         for (size_t i = 0; i < table->schema->n_indexes; i++) {
             const struct ovsdb_column_set *idx = &table->schema->indexes[i];
             if (idx->n_columns == 1
@@ -803,38 +794,52 @@ ovsdb_attach_disk_store(struct ovsdb *db, size_t cache_max_atoms)
                 && idx->columns[0]->type.n_max == 1) {
                 table->name_index = ovsdb_name_index_create(
                     idx->columns[0]->name, idx->columns[0]->index);
-                ovsdb_disk_store_build_name_index(ds, table->name_index);
-                VLOG_DBG("%s: table %s: built name index on column '%s' "
-                         "(%"PRIuSIZE" entries)",
-                         db->name, node->name, idx->columns[0]->name,
-                         hmap_count(&table->name_index->entries));
                 break;
             }
         }
 
-        /* Three-layer data access: create storage engine + index set.
-         * These coexist with the legacy bloom/name_index during
-         * transition.  Phase 4b will migrate callers. */
+        /* Three-layer: storage engine + index set (auto-detect). */
         table->storage_engine = ovsdb_storage_engine_create(ds);
-
-        /* Auto-detect indexes from schema:
-         *   - BLOOM wrapping the bloom filter we just built
-         *   - HASH for each single-column schema index
-         * HASH indexes are created empty — populated later. */
         table->index_set = ovsdb_index_set_from_schema(
             table->schema, table->bloom);
 
-        /* No proactive warm-up.  The cache starts cold and fills
-         * on demand as rows are accessed (cache miss → index lookup
-         * → pread → cache insert).  The sweeper handles ongoing
-         * eviction once the cache is active. */
-        ovsdb_row_cache_start_sweeper(table->cache);
+        /* Register for single-pass index build. */
+        {
+            struct ovsdb_table_index_build_ctx *bctx;
 
-        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows indexed from disk store"
-                 " (%"PRIuSIZE" engine indexes)",
+            bctx = xzalloc(sizeof *bctx);
+            bctx->bloom = table->bloom;
+            bctx->index_set = table->index_set;
+            bctx->table = table;
+            shash_add(&build_ctxs, node->name, bctx);
+        }
+
+        VLOG_DBG("%s: table %s: %"PRIuSIZE" rows, %"PRIuSIZE" engine indexes",
                  db->name, node->name, n_rows,
                  table->index_set ? table->index_set->n_indexes : 0);
     }
+
+    /* Phase 2: Single-pass index build — one hmap walk builds
+     * bloom filters + HASH indexes for ALL tables. */
+    ovsdb_disk_store_build_all_indexes(ds, &build_ctxs);
+
+    /* Also build the legacy name index (kept during transition).
+     * This is a separate pass until the legacy path is removed. */
+    SHASH_FOR_EACH (node, &db->tables) {
+        struct ovsdb_table *table = node->data;
+
+        if (table->name_index) {
+            ovsdb_disk_store_build_name_index(ds, table->name_index);
+        }
+        ovsdb_row_cache_start_sweeper(table->cache);
+    }
+
+    /* Cleanup build contexts. */
+    SHASH_FOR_EACH_SAFE (node, &build_ctxs) {
+        free(node->data);
+    }
+    shash_destroy(&build_ctxs);
+
     db->disk_store_mode = true;
 }
 

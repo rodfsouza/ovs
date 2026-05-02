@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "compiler.h"
 #include "openvswitch/hmap.h"
+#include "openvswitch/shash.h"
 #include "openvswitch/uuid.h"
 
 struct ovsdb_bloom_filter;
@@ -113,6 +114,30 @@ void ovsdb_disk_store_name_index_remove(
 void ovsdb_disk_store_rebuild_bloom(struct ovsdb_disk_store *,
                                     struct ovsdb_bloom_filter **bloom_p,
                                     const char *table_name);
+
+/* Single-pass index build.
+ *
+ * Walks the in-memory UUID→offset hmap ONCE, dispatching to
+ * per-table builders via shash lookup (O(1) per entry).
+ * For each non-deleted entry:
+ *   1. Adds UUID to the table's bloom filter
+ *   2. If HASH indexes exist, preads the row and extracts
+ *      indexed column values via ovsdb_index_add
+ *
+ * 'table_ctxs' maps table_name → ovsdb_table_index_build_ctx.
+ * Replaces the previous multi-pass approach (for_each_uuid ×
+ * N_tables + build_name_index per indexed table). */
+struct ovsdb_index_set;
+
+struct ovsdb_table_index_build_ctx {
+    struct ovsdb_bloom_filter *bloom;
+    struct ovsdb_index_set *index_set;
+    const struct ovsdb_table *table;
+};
+
+void ovsdb_disk_store_build_all_indexes(
+    struct ovsdb_disk_store *,
+    struct shash *table_ctxs);  /* table_name → build_ctx */
 
 /* Format detection and schema extraction. */
 bool ovsdb_disk_store_is_binary(const char *filename);
