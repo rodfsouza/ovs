@@ -1,3 +1,16 @@
+AT_BANNER([OVSDB index config tests])
+
+AT_SETUP([index config - parse + from_schema_with_config + bloom])
+AT_KEYWORDS([ovsdb index config])
+AT_CHECK([test-index-config 2>/dev/null], [0], [parse_valid: PASSED
+parse_empty: PASSED
+parse_unknown_table: PASSED
+from_schema_with_config: PASSED
+bloom_false: PASSED
+null_config: PASSED
+])
+AT_CLEANUP
+
 AT_BANNER([OVSDB query engine tests])
 
 AT_SETUP([query engine - plan types and EXPLAIN])

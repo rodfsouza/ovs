@@ -54,6 +54,11 @@ ovsdb_libovsdb_la_SOURCES = \
 	ovsdb/storage-engine.h \
 	ovsdb/index-config.c \
 	ovsdb/index-config.h \
+	ovsdb/index.conf.example \
+	ovsdb/index-ovn-nb.conf \
+	ovsdb/index-ovn-sb.conf \
+	ovsdb/index-ovn-ic-nb.conf \
+	ovsdb/index-ovn-ic-sb.conf \
 	ovsdb/index-engine.c \
 	ovsdb/index-engine.h \
 	ovsdb/query-engine.c \

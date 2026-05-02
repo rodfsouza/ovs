@@ -437,8 +437,46 @@ ovsdb_index_set_from_schema_with_config(
     /* Check if config overrides bloom for this table. */
     want_bloom = ovsdb_index_config_get_bloom(config, ts->name);
 
-    /* Build base set from schema (with or without bloom). */
-    set = ovsdb_index_set_from_schema(ts, want_bloom ? bloom : NULL);
+    if (want_bloom) {
+        /* Normal: build with BLOOM + schema HASH indexes. */
+        set = ovsdb_index_set_from_schema(ts, bloom);
+    } else {
+        /* bloom=false: build schema HASH indexes only, no BLOOM.
+         * We can't use from_schema because it always creates BLOOM.
+         * Build the HASH portion manually. */
+        size_t i;
+
+        set = xmalloc(sizeof *set);
+        ovsdb_index_set_init(set);
+
+        for (i = 0; i < ts->n_indexes; i++) {
+            const struct ovsdb_column_set *sidx = &ts->indexes[i];
+            struct ovsdb_index_spec hash_spec;
+
+            if (sidx->n_columns != 1 || sidx->columns[0]->type.n_max != 1) {
+                continue;
+            }
+            switch (sidx->columns[0]->type.key.type) {
+            case OVSDB_TYPE_STRING:
+            case OVSDB_TYPE_INTEGER:
+            case OVSDB_TYPE_UUID:
+                memset(&hash_spec, 0, sizeof hash_spec);
+                hash_spec.type = OVSDB_IDX_HASH;
+                hash_spec.name = sidx->columns[0]->name;
+                hash_spec.column_name = sidx->columns[0]->name;
+                hash_spec.key_type = sidx->columns[0]->type.key.type;
+                ovsdb_index_set_add(set, ovsdb_index_create(&hash_spec));
+                break;
+
+            case OVSDB_TYPE_VOID:
+            case OVSDB_TYPE_REAL:
+            case OVSDB_TYPE_BOOLEAN:
+            case OVSDB_N_TYPES:
+            default:
+                break;
+            }
+        }
+    }
 
     /* Add extra HASH indexes from config. */
     if (config) {
