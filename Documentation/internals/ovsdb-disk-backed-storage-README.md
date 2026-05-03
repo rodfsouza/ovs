@@ -1,7 +1,8 @@
-# OVSDB Disk-Backed Storage and Multi-Threaded Serialization
+# OVSDB Disk-Backed Storage, Binary Streaming, and Three-Layer Architecture
 
-This document describes the new disk-backed storage engine, row cache, worker
-pool, and non-blocking snapshot features introduced in OVS branch 3.3.
+This document describes the disk-backed storage engine, row cache, worker
+pool, binary streaming protocol, and three-layer data access architecture
+introduced in OVS branches 3.3-multithread and 3.3-three-layer-refactor.
 
 ## Overview
 
@@ -12,20 +13,33 @@ For databases exceeding 2 GB, this caused:
 - 30-60 second main thread stalls (no client requests processed)
 - 4 GB+ peak memory usage (in-memory database + serialized copy)
 - 60-120 second startup times (full JSON log replay)
+- Clients downloading all rows even when querying a single row by UUID
 
-The new infrastructure addresses all three problems through three phases:
+The infrastructure addresses these problems through multiple phases:
 
 - **Phase 0 -- Non-blocking snapshots**: Standalone databases now use
   background threads for snapshot serialization (previously only clustered
   mode did this).
 
 - **Phase 1 -- Disk store and row cache**: A binary on-disk row format
-  (BINARYV1) with an LRU cache enables bounded memory usage and streaming
-  snapshots.
+  (BINARYV1) with a clock-sweep LRU cache enables bounded memory usage
+  and on-demand row loading.
 
-- **Phase 2 -- I/O worker pool**: A thread pool with async row loading
-  allows the server to accept connections immediately and load rows on
-  demand.
+- **Phase 2 -- I/O worker pool**: A configurable thread pool (`--num-workers`)
+  with async row loading allows the server to accept connections immediately
+  and load rows on demand.
+
+- **Phase 3 -- Binary streaming protocol**: A binary wire protocol
+  (`0xDB` magic byte) coexists with JSON-RPC on the same TCP connection.
+  Worker threads stream initial snapshots as binary ROW_BATCH frames,
+  fully unblocking the main thread.  Clients auto-negotiate binary via
+  `monitor_cond_since` V3 extension.
+
+- **Phase 4 -- Three-layer data access**: Storage engine (pure disk I/O),
+  index engine (BLOOM + HASH with clustered index model), and query engine
+  (plan + execute + EXPLAIN) replace the fragmented direct access pattern.
+  All callers go through the query engine.  Index configuration files
+  declare additional indexes beyond the schema.
 
 ## Getting Started
 
@@ -36,11 +50,22 @@ The new infrastructure addresses all three problems through three phases:
   upgrade.
 
 - **Phase 1** (binary disk store + row cache): Available via
-  `ovsdb-tool convert-format` CLI and the C library.
+  `ovsdb-tool convert-format` CLI and the C library.  Clock-sweep LRU
+  cache with configurable atom budget and background sweeper thread.
 
-- **Phase 2** (I/O worker pool + lazy loading): Fully wired.  The worker
-  pool (4 threads) loads rows from disk asynchronously.  Triggers park
+- **Phase 2** (I/O worker pool + lazy loading): Fully wired.  Worker
+  pool configurable via `--num-workers=N` (default 4).  Triggers park
   while waiting for row data and resume automatically.
+
+- **Phase 3** (binary streaming protocol): Binary transport enabled by
+  default for all IDL clients.  Worker threads stream initial snapshots
+  as binary ROW_BATCH frames.  Conditioned monitors (UUID/name lookup)
+  use the JSON path with index pushdown.
+
+- **Phase 4** (three-layer architecture): Storage engine, index engine,
+  and query engine replace direct disk-store/bloom/cache calls.  HASH
+  indexes auto-detected from schema.  Optional `--index-config` for
+  declaring additional indexes.  Single-pass index build at startup.
 
 - **Native binary serving**: ovsdb-server can open and serve BINARYV1
   databases directly using the `--disk-store` flag.  The storage layer
@@ -201,28 +226,51 @@ ovsdb-tool convert-format conf.db json
 ovsdb-server --remote=punix:db.sock --pidfile --detach conf.db
 ```
 
-### How Async Row Loading Works
+### How Row Lookup Works (Three-Layer Architecture)
 
-When a client sends a request that references a row not yet in memory:
+After the three-layer refactoring, `ovsdb_table_get_row` uses the
+query engine for all disk-backed row access:
 
 ```
 1. Client sends transact/query
-2. ovsdb_table_get_row() checks cache state:
-   - CACHED  → return row immediately
-   - LOADING → return NULL (trigger parks)
-   - UNLOADED → submit load job to worker pool,
-                 set state to LOADING, return NULL
-3. Worker thread reads row from disk via pread()
-4. Main thread picks up result in pool_run():
-   - Insert row into cache (state = CACHED)
-   - Set run_triggers = true
-5. Parked trigger retries, finds row in cache, succeeds
-6. Client receives response
+2. ovsdb_table_get_row(table, uuid):
+   a. Check in-memory hmap (transaction modifications) → found? return
+   b. If storage_engine + index_set available:
+      → ovsdb_query_engine_lookup_uuid(storage, indexes, cache, table, uuid)
+        i.   BLOOM index: bloom.contains(uuid) → false? return NULL
+        ii.  CACHE: cache_lookup(uuid) → hit? return cached row
+        iii. STORAGE: storage_engine_read_row(uuid) → pread at offset
+        iv.  CACHE: cache_insert(row) → return cached pointer
+   c. Not found → return NULL
+3. On cache miss: <1ms latency (single pread)
+4. On cache hit: zero allocations, zero disk I/O
 ```
 
-For most queries this adds <1ms latency on first access.  Subsequent
-accesses hit the cache with zero disk I/O.  The LRU cache evicts
-cold rows when the atom budget is exceeded.
+For monitor queries with conditions (UUID, name), the query engine's
+planning selects the optimal path:
+
+- **UUID condition** → `POINT_LOOKUP` (bloom + cache + pread)
+- **Name condition + HASH index** → `INDEX_LOOKUP` (index → entry → pread)
+- **No condition** → `FULL_SCAN` (binary streaming via worker threads)
+
+### Binary Streaming for Monitors
+
+When a client connects with binary transport (auto-negotiated by
+default), unconditioned monitors use worker-based streaming:
+
+```
+1. Client sends monitor_cond_since with {"format":"binary"}
+2. Server sends 4-element V3 ack: [found, txn_id, {}, {"format":"binary"}]
+3. Worker threads open disk cursors and serialize rows to binary batches
+4. Main thread drains batches via mutex+seq and sends as binary frames
+5. When all workers done → send INITIAL_END with txn_id
+6. Client accumulates ROW_BATCH events until INITIAL_END
+7. IDL processes complete snapshot → has_ever_connected = true
+```
+
+The main thread is **never blocked** by disk I/O during binary streaming.
+Conditioned monitors (UUID/name lookup) use the synchronous JSON path
+with index pushdown via `ovsdb_table_query`.
 
 ### Using the Binary Disk Store C API (Phase 1)
 
@@ -574,21 +622,23 @@ three-step async pattern:
 
 ### Table Integration (`ovsdb/table.h`, `ovsdb/table.c`)
 
-`struct ovsdb_table` now has two optional fields:
+`struct ovsdb_table` now has these disk-backed fields:
 
 ```c
-struct ovsdb_row_cache *cache;       /* NULL if cache disabled.      */
-struct ovsdb_disk_store *disk_store; /* NULL if disk store disabled. */
+struct ovsdb_row_cache *cache;                /* Clock-sweep LRU cache.   */
+struct ovsdb_disk_store *disk_store;          /* Shared disk store ptr.   */
+struct ovsdb_bloom_filter *bloom;             /* UUID existence filter.   */
+struct ovsdb_storage_engine *storage_engine;  /* Three-layer: disk I/O.   */
+struct ovsdb_index_set *index_set;            /* Three-layer: BLOOM+HASH. */
 ```
 
-`ovsdb_table_get_row()` searches in this order:
+`ovsdb_table_get_row()` uses the query engine when available:
 
-1. In-memory `rows` hmap (unchanged fast path)
-2. Row cache lookup
-3. Disk store read (on cache miss, result inserted into cache)
+1. In-memory `rows` hmap (transaction modifications)
+2. `ovsdb_query_engine_lookup_uuid()` → bloom → cache → pread → cache insert
 
-`ovsdb_table_create()` initializes both to NULL.
-`ovsdb_table_destroy()` cleans up cache and closes disk store.
+`ovsdb_table_create()` initializes all to NULL.
+`ovsdb_table_destroy()` cleans up all resources.
 
 ### Transaction Integration (`ovsdb/transaction.c`)
 
@@ -746,6 +796,26 @@ TSAN can be enabled for the worker pool tests by building with
 | `tests/ovsdb-lazy-load.at`  |  7 | Worker pool test harness            |
 | `tests/ovsdb-integration.at`| 12 | Cross-component integration         |
 
+**Binary Streaming and Three-Layer (Phase 3-4):**
+
+| File                          | Lines | Description                        |
+|-------------------------------|------:|------------------------------------|
+| `lib/binary-codec.h/c`       |   530 | Atom/datum/row serialization       |
+| `lib/binary-protocol.h/c`    |    70 | Binary wire frame format           |
+| `ovsdb/storage-engine.h/c`   |   200 | Pure disk I/O facade               |
+| `ovsdb/index-engine.h/c`     |   620 | BLOOM + HASH clustered indexes     |
+| `ovsdb/query-engine.h/c`     |   690 | Plan + execute + EXPLAIN           |
+| `ovsdb/index-config.h/c`     |   290 | INI config file parser             |
+| `ovsdb/index-ovn-nb.conf`    |    79 | OVN NB index config (30 tables)    |
+| `ovsdb/index-ovn-sb.conf`    |    95 | OVN SB index config (34 tables)    |
+| `ovsdb/index-ovn-ic-nb.conf` |    15 | OVN IC-NB config (4 tables)        |
+| `ovsdb/index-ovn-ic-sb.conf` |    34 | OVN IC-SB config (9 tables)        |
+| `tests/test-binary-codec.c`  |   900 | Codec tests + 10K stress           |
+| `tests/test-index-engine.c`  |   472 | HASH index tests + 10K stress      |
+| `tests/test-query-engine.c`  |   339 | Plan selection tests               |
+| `tests/test-storage-engine.c`|   148 | Storage engine lifecycle tests      |
+| `tests/test-index-config.c`  |   312 | Config parsing tests               |
+
 ### Modified Files
 
 | File                     | Change                                       |
@@ -811,13 +881,31 @@ through to the binary file on disk.  However:
 
 ### Other Limitations
 
-- **Chunked monitor protocol** (Phase 4) and **chunked Raft snapshots**
-  (Phase 5) are not yet implemented.  The disk store cursor API supports
-  streaming iteration for when these are added.
+- **Multi-column indexes** are not yet supported by the index engine.
+  Schema entries like `indexes:[["datapath","tunnel_key"]]` are skipped.
+  Only single-column indexes are auto-detected.
 
-- **JSON disk cache** (Phase 3) for deferred serialization is designed
-  but not yet implemented.
+- **Compound HASH indexes** (future OVSDB_IDX_BTREE) for range queries
+  are designed but not implemented.
 
-- **Row cache budget is hardcoded** at 1,000,000 atoms
-  (`OVSDB_CACHE_MAX_ATOMS`).  A command-line option for cache sizing
-  is planned.
+- **Index configuration via `--index-config`** is not yet wired into
+  the `ovsdb-server` CLI option parser.  Use `ovsdb_index_set_from_schema_with_config()`
+  programmatically or via the C API.
+
+- **Row cache budget is configurable** but defaults to 1,000,000 atoms.
+  Use `--cache-max-atoms` for runtime tuning (if wired).
+
+### Related Documentation
+
+- `ovsdb-multithread-architecture.md` — Comprehensive reference covering
+  all components: cache, workers, binary streaming, three-layer architecture.
+
+- `ovsdb-disk-store-architecture.md` — Disk store internals: file format,
+  indexes, compaction, data flow diagrams.
+
+- `ovsdb-three-layer-architecture.md` — Three-layer refactoring reference:
+  storage engine, index engine, query engine, clustered index model,
+  index configuration, single-pass build.
+
+- `plan-three-layer-data-access.md` — Original design plan (future tense,
+  implementation guidance) for the three-layer refactoring.
