@@ -247,7 +247,7 @@ class Idl(object):
         Monitor.monitor_cond_since: IDL_S_DATA_MONITOR_COND_SINCE_REQUESTED}
 
     def __init__(self, remote, schema_helper, probe_interval=None,
-                 leader_only=True):
+                 leader_only=True, binary=False):
         """Creates and returns a connection to the database named 'db_name' on
         'remote', which should be in a form acceptable to
         ovs.jsonrpc.session.open().  The connection will maintain an in-memory
@@ -323,6 +323,11 @@ class Idl(object):
 
         self.cond_changed = False
         self.cond_seqno = 0
+
+        # Binary transport support.
+        self.binary_transport = binary
+        self._binary_active = False
+        self._binary_initial_done = True
 
     def _parse_remotes(self, remote):
         # If remote is -
@@ -401,6 +406,43 @@ class Idl(object):
                     self.last_id = str(uuid.UUID(int=0))
                     self.cond_changed = True
 
+    def _process_binary_frame(self, msg_type, payload):
+        """Process a binary frame from the OVSDB server."""
+        from ovs.db import binary_protocol
+        from ovs.db import binary_codec
+
+        if msg_type == binary_protocol.INITIAL_BEGIN:
+            pass  # Streaming is starting — nothing to do.
+
+        elif msg_type == binary_protocol.ROW_BATCH:
+            reader = binary_codec.BinaryReader(payload)
+            table_updates = binary_codec.deserialize_row_batch(
+                reader, self.tables)
+            self.__parse_update(table_updates, OVSDB_UPDATE2)
+
+        elif msg_type == binary_protocol.INITIAL_END:
+            self._binary_initial_done = True
+            self.change_seqno += 1
+
+        elif msg_type in (binary_protocol.UPDATE,
+                          binary_protocol.UPDATE_BATCH):
+            # Incremental updates use a transitional format: the
+            # payload is a JSON-serialized [monitor_id, last_txn_id,
+            # table_updates] array wrapped in a binary frame.  Parse
+            # the JSON and feed through the standard update path.
+            import ovs.json
+            json = ovs.json.from_string(payload.decode('utf-8'))
+            if isinstance(json, str):
+                vlog.warn("error parsing binary update JSON: %s" % json)
+                return
+            # V3 format: [monitor_id, last_txn_id, table_updates]
+            if isinstance(json, list) and len(json) >= 3:
+                self.__parse_update(json[2], OVSDB_UPDATE3)
+                self.last_id = json[1]
+            else:
+                self.__parse_update(json, OVSDB_UPDATE2)
+            self.change_seqno += 1
+
     def restart_fsm(self):
         # Resync data DB table conditions to avoid missing updated due to
         # conditions that were in flight or changed locally while the
@@ -408,6 +450,9 @@ class Idl(object):
         self.sync_conditions()
         self.__send_server_schema_request()
         self.state = self.IDL_S_SERVER_SCHEMA_REQUESTED
+        # Reset binary transport state on reconnect.
+        self._binary_active = False
+        self._binary_initial_done = True
 
     def run(self):
         """Processes a batch of messages from the database server.  Returns
@@ -451,6 +496,12 @@ class Idl(object):
             msg = self._session.recv()
             if msg is None:
                 break
+
+            # Handle binary frames directly (not JSON-RPC messages).
+            if isinstance(msg, ovs.jsonrpc.BinaryFrame):
+                self._process_binary_frame(msg.msg_type, msg.payload)
+                continue
+
             is_response = msg.type in (ovs.jsonrpc.Message.T_REPLY,
                                        ovs.jsonrpc.Message.T_ERROR)
 
@@ -486,20 +537,41 @@ class Idl(object):
                   and self._monitor_request_id == msg.id):
                 # Reply to our "monitor" request.
                 try:
-                    self.change_seqno += 1
                     self._monitor_request_id = None
                     if (self.state ==
                             self.IDL_S_DATA_MONITOR_COND_SINCE_REQUESTED):
-                        # If 'found' is false, clear table rows for new dump
-                        if not msg.result[0]:
+                        result = msg.result
+                        if not result[0]:
                             self.__clear()
-                        self.__parse_update(msg.result[2], OVSDB_UPDATE3)
-                        self.last_id = msg.result[1]
+
+                        # Detect binary ack: 4-element reply with
+                        # {"format": "binary"} at index 3.
+                        if (self.binary_transport
+                                and isinstance(result, list)
+                                and len(result) >= 4
+                                and isinstance(result[3], dict)
+                                and result[3].get("format") == "binary"):
+                            self._binary_active = True
+                            self._binary_initial_done = False
+                            self.last_id = result[1]
+                            # Enable binary demux on the connection.
+                            if self._session.rpc:
+                                self._session.rpc.binary_enabled = True
+                            # result[2] is empty — rows arrive via
+                            # binary frames.  change_seqno will be
+                            # bumped by INITIAL_END handler.
+                        else:
+                            self._binary_active = False
+                            self.change_seqno += 1
+                            self.__parse_update(result[2], OVSDB_UPDATE3)
+                            self.last_id = result[1]
                     elif self.state == self.IDL_S_DATA_MONITOR_COND_REQUESTED:
+                        self.change_seqno += 1
                         self.__clear()
                         self.__parse_update(msg.result, OVSDB_UPDATE2)
                     else:
                         assert self.state == self.IDL_S_DATA_MONITOR_REQUESTED
+                        self.change_seqno += 1
                         self.__clear()
                         self.__parse_update(msg.result, OVSDB_UPDATE)
                     self.state = self.IDL_S_MONITORING
@@ -887,6 +959,8 @@ class Idl(object):
         args = [self._db.name, str(self.uuid), monitor_requests]
         if method == "monitor_cond_since":
             args.append(str(self.last_id))
+            if self.binary_transport:
+                args.append({"format": "binary"})
         msg = ovs.jsonrpc.Message.create_request(method, args)
         self._monitor_request_id = msg.id
         self.send_request(msg)

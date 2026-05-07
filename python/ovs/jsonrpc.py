@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import codecs
+import collections
 import errno
 import os
 import random
 import sys
 
+import ovs.db.binary_protocol
 import ovs.json
 import ovs.poller
 import ovs.reconnect
@@ -27,6 +29,19 @@ import ovs.vlog
 
 EOF = ovs.util.EOF
 vlog = ovs.vlog.Vlog("jsonrpc")
+
+
+class BinaryFrame:
+    """A binary frame received from the OVSDB server.
+
+    Binary frames use a 0xDB magic byte and coexist with JSON-RPC
+    messages on the same TCP stream.
+    """
+    __slots__ = ('msg_type', 'payload')
+
+    def __init__(self, msg_type, payload):
+        self.msg_type = msg_type
+        self.payload = payload
 
 
 class Message(object):
@@ -189,6 +204,13 @@ class Connection(object):
         self.output = ""
         self.parser = None
         self.received_bytes = 0
+        # Binary frame accumulation state.
+        self._binary_buf = b""
+        self._binary_queue = collections.deque()
+        self._binary_state = 0      # 0=IDLE, 1=HEADER, 2=PAYLOAD
+        self._binary_need = 0       # Bytes still needed for current phase.
+        self._binary_msg_type = 0   # msg_type of frame being accumulated.
+        self.binary_enabled = False  # Set True after binary negotiation.
 
     def close(self):
         self.stream.close()
@@ -261,23 +283,18 @@ class Connection(object):
         if self.status:
             return self.status, None
 
+        # Return queued binary frames before processing JSON.
+        if self._binary_queue:
+            msg_type, payload = self._binary_queue.popleft()
+            return 0, BinaryFrame(msg_type, payload)
+
         decoder = codecs.getincrementaldecoder('utf-8')()
         while True:
             if not self.input:
                 error, data = self.stream.recv(4096)
-                # Python 3 has separate types for strings and bytes.  We
-                # received bytes from a socket.  We expect it to be string
-                # data, so we convert it here as soon as possible.
-                if data and not error:
-                    try:
-                        data = decoder.decode(data)
-                    except UnicodeError:
-                        error = errno.EILSEQ
                 if error:
                     if (sys.platform == "win32" and
                             error == errno.WSAEWOULDBLOCK):
-                        # WSAEWOULDBLOCK would be the equivalent on Windows
-                        # for EAGAIN on Unix.
                         error = errno.EAGAIN
                     if error == errno.EAGAIN:
                         return error, None
@@ -290,9 +307,42 @@ class Connection(object):
                 elif not data:
                     self.error(EOF)
                     return EOF, None
+
+                self.received_bytes += len(data)
+
+                # Demux binary frames from JSON when binary transport
+                # has been negotiated.  OVSDB JSON is ASCII-only (all
+                # bytes < 0x80), so the 0xDB magic byte can never
+                # appear in valid JSON data on this connection.
+                if self.binary_enabled or self._binary_state != 0:
+                    json_data = self._demux_binary(data)
+
+                    if self._binary_queue:
+                        if json_data:
+                            try:
+                                self.input += decoder.decode(json_data)
+                            except UnicodeError:
+                                self.error(errno.EILSEQ)
+                                return self.status, None
+                        msg_type, payload = self._binary_queue.popleft()
+                        return 0, BinaryFrame(msg_type, payload)
+
+                    if json_data:
+                        try:
+                            self.input += decoder.decode(json_data)
+                        except UnicodeError:
+                            self.error(errno.EILSEQ)
+                            return self.status, None
+                    else:
+                        # All data consumed by binary accumulator
+                        # but no complete frame yet.
+                        continue
                 else:
-                    self.input += data
-                    self.received_bytes += len(data)
+                    try:
+                        self.input += decoder.decode(data)
+                    except UnicodeError:
+                        self.error(errno.EILSEQ)
+                        return self.status, None
             else:
                 if self.parser is None:
                     self.parser = ovs.json.Parser()
@@ -307,6 +357,69 @@ class Connection(object):
                         return 0, msg
                     else:
                         return self.status, None
+
+    def _demux_binary(self, data):
+        """Separate binary frames from JSON data in raw bytes.
+
+        Accumulates complete binary frames in self._binary_queue.
+        Returns remaining bytes that are JSON data (may be empty).
+
+        Safety: OVSDB JSON-RPC uses ASCII-only encoding (non-ASCII
+        characters are \\uXXXX-escaped), so 0xDB never appears in
+        well-formed OVSDB JSON.  This method should only be called
+        when binary transport has been negotiated (binary_enabled=True)
+        or when a binary frame is partially accumulated
+        (_binary_state != 0).
+        """
+        json_parts = []
+        pos = 0
+
+        while pos < len(data):
+            if self._binary_state == 0:  # IDLE
+                if data[pos] == 0xDB:
+                    self._binary_state = 1  # HEADER
+                    self._binary_buf = bytes([data[pos]])
+                    self._binary_need = 7  # 7 more for 8-byte header
+                    pos += 1
+                else:
+                    # Scan ahead for next 0xDB or end of data.
+                    end = pos + 1
+                    while end < len(data) and data[end] != 0xDB:
+                        end += 1
+                    json_parts.append(data[pos:end])
+                    pos = end
+
+            elif self._binary_state == 1:  # READING HEADER
+                take = min(self._binary_need, len(data) - pos)
+                self._binary_buf += data[pos:pos + take]
+                self._binary_need -= take
+                pos += take
+                if self._binary_need == 0:
+                    msg_type, payload_len = \
+                        ovs.db.binary_protocol.decode_frame_header(
+                            self._binary_buf)
+                    self._binary_msg_type = msg_type
+                    if payload_len == 0:
+                        self._binary_queue.append((msg_type, b""))
+                        self._binary_state = 0
+                        self._binary_buf = b""
+                    else:
+                        self._binary_state = 2  # PAYLOAD
+                        self._binary_need = payload_len
+                        self._binary_buf = b""
+
+            elif self._binary_state == 2:  # READING PAYLOAD
+                take = min(self._binary_need, len(data) - pos)
+                self._binary_buf += data[pos:pos + take]
+                self._binary_need -= take
+                pos += take
+                if self._binary_need == 0:
+                    self._binary_queue.append(
+                        (self._binary_msg_type, self._binary_buf))
+                    self._binary_state = 0
+                    self._binary_buf = b""
+
+        return b"".join(json_parts)
 
     def recv_block(self):
         while True:
@@ -356,7 +469,7 @@ class Connection(object):
         return msg
 
     def recv_wait(self, poller):
-        if self.status or self.input:
+        if self.status or self.input or self._binary_queue:
             poller.immediate_wake()
         else:
             self.stream.recv_wait(poller)
@@ -582,6 +695,10 @@ class Session(object):
                 self.reconnect.activity(now)
 
             if not error:
+                # Pass binary frames through without JSON-RPC handling.
+                if isinstance(msg, BinaryFrame):
+                    return msg
+
                 if msg.type == Message.T_REQUEST and msg.method == "echo":
                     # Echo request.  Send reply.
                     self.send(Message.create_reply(msg.params, msg.id))
