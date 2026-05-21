@@ -566,7 +566,7 @@ ovsdb_file_txn_add_row(struct ovsdb_file_txn *ftxn,
 
 static struct ovsdb *
 ovsdb_file_read__(const char *filename, bool rw,
-                  struct ovsdb_schema *new_schema)
+                  struct ovsdb_schema *new_schema, bool force)
 {
     struct ovsdb_storage *storage = ovsdb_storage_open_standalone(filename,
                                                                   rw);
@@ -595,12 +595,23 @@ ovsdb_file_read__(const char *filename, bool rw,
         error = ovsdb_file_txn_from_json(ovsdb, txn_json, new_schema != NULL,
                                          &txn);
         if (error) {
+            if (force) {
+                VLOG_WARN("%s (--force, skipping transaction)",
+                          ovsdb_error_to_string_free(error));
+                json_destroy(txn_json);
+                continue;
+            }
             ovs_fatal(0, "%s", ovsdb_error_to_string_free(error));
         }
         json_destroy(txn_json);
 
         error = ovsdb_txn_replay_commit(txn);
         if (error) {
+            if (force) {
+                VLOG_WARN("%s (--force, dropping transaction)",
+                          ovsdb_error_to_string_free(error));
+                continue;
+            }
             ovsdb_error_destroy(error);
             ovsdb_storage_unread(storage);
             break;
@@ -617,9 +628,9 @@ ovsdb_file_read__(const char *filename, bool rw,
  *
  * Consumes 'schema'. */
 struct ovsdb *
-ovsdb_file_read(const char *filename, bool rw)
+ovsdb_file_read(const char *filename, bool rw, bool force)
 {
-    return ovsdb_file_read__(filename, rw, NULL);
+    return ovsdb_file_read__(filename, rw, NULL, force);
 }
 
 /* Reads 'filename' as a standalone database, using 'schema' in place of the
@@ -628,7 +639,8 @@ ovsdb_file_read(const char *filename, bool rw)
  *
  * Consumes 'schema'. */
 struct ovsdb *
-ovsdb_file_read_as_schema(const char *filename, struct ovsdb_schema *schema)
+ovsdb_file_read_as_schema(const char *filename, struct ovsdb_schema *schema,
+                          bool force)
 {
-    return ovsdb_file_read__(filename, false, schema);
+    return ovsdb_file_read__(filename, false, schema, force);
 }

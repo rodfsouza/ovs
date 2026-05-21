@@ -2120,7 +2120,7 @@ do_restore(struct jsonrpc *rpc, const char *database,
     }
     set_binary_mode(stdin);
 
-    struct ovsdb *backup = ovsdb_file_read("/dev/stdin", false);
+    struct ovsdb *backup = ovsdb_file_read("/dev/stdin", false, false);
     ovsdb_storage_close(backup->storage);
     backup->storage = NULL;
 

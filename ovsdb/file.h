@@ -35,9 +35,10 @@ struct ovsdb_error *ovsdb_file_txn_from_json(struct ovsdb *,
                                              struct ovsdb_txn **)
     OVS_WARN_UNUSED_RESULT;
 
-struct ovsdb *ovsdb_file_read(const char *filename, bool rw);
+struct ovsdb *ovsdb_file_read(const char *filename, bool rw, bool force);
 struct ovsdb *ovsdb_file_read_as_schema(const char *filename,
-                                        struct ovsdb_schema *);
+                                        struct ovsdb_schema *,
+                                        bool force);
 
 struct ovsdb_error *ovsdb_convert(const struct ovsdb *src,
                                   const struct ovsdb_schema *new_schema,

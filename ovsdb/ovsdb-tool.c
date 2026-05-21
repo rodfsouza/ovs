@@ -52,6 +52,9 @@
 /* -m, --more: Verbosity level for "show-log" command output. */
 static int show_log_verbosity;
 
+/* --force: Skip inconsistent transactions instead of aborting. */
+static bool force_mode;
+
 /* --role: RBAC role to use for "transact" and "query" commands. */
 static const char *rbac_role;
 
@@ -90,12 +93,14 @@ parse_options(int argc, char *argv[])
         OPT_RBAC_ROLE = UCHAR_MAX + 1,
         OPT_CID,
         OPT_ELECTION_TIMER,
+        OPT_FORCE,
     };
     static const struct option long_options[] = {
         {"more", no_argument, NULL, 'm'},
         {"rbac-role", required_argument, NULL, OPT_RBAC_ROLE},
         {"cid", required_argument, NULL, OPT_CID},
         {"election-timer", required_argument, NULL, OPT_ELECTION_TIMER},
+        {"force", no_argument, NULL, OPT_FORCE},
         {"verbose", optional_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {"option", no_argument, NULL, 'o'},
@@ -134,6 +139,10 @@ parse_options(int argc, char *argv[])
             if (error) {
                 ovs_fatal(0, "%s", ovsdb_error_to_string_free(error));
             }
+            break;
+
+        case OPT_FORCE:
+            force_mode = true;
             break;
 
         case 'h':
@@ -199,6 +208,8 @@ usage(void)
 \nOther options:\n\
   -m, --more                  increase show-log verbosity\n\
   --rbac-role=ROLE            RBAC role for transact and query commands\n\
+  --force                     skip inconsistent transactions instead of\n\
+                              aborting (for compact and cluster-to-standalone)\n\
   -h, --help                  display this help message\n\
   -V, --version               display version information\n");
     exit(EXIT_SUCCESS);
@@ -302,7 +313,7 @@ do_create_cluster(struct ovs_cmdl_context *ctx)
         /* Not a schema file.  Try reading it as a standalone database. */
         ovsdb_error_destroy(error);
 
-        struct ovsdb *ovsdb = ovsdb_file_read(src_file_name, false);
+        struct ovsdb *ovsdb = ovsdb_file_read(src_file_name, false, false);
         char *comment = xasprintf("created from %s", src_file_name);
         data = ovsdb_to_txn_json(ovsdb, comment, true);
         free(comment);
@@ -411,8 +422,9 @@ compact_or_convert(const char *src_name_, const char *dst_name_,
 
     /* Save a copy. */
     struct ovsdb *ovsdb = (new_schema
-                           ? ovsdb_file_read_as_schema(src_name, new_schema)
-                           : ovsdb_file_read(src_name, false));
+                           ? ovsdb_file_read_as_schema(src_name, new_schema,
+                                                      force_mode)
+                           : ovsdb_file_read(src_name, false, force_mode));
     ovsdb_storage_close(ovsdb->storage);
     ovsdb->storage = NULL;
     check_ovsdb_error(write_standalone_db(dst_name, comment, ovsdb));
@@ -640,7 +652,7 @@ transact(struct ovs_cmdl_context *ctx, bool rw)
     const char *db_file_name = ctx->argc >= 3 ? ctx->argv[1] : default_db();
     const char *transaction = ctx->argv[ctx->argc - 1];
 
-    struct ovsdb *ovsdb = ovsdb_file_read(db_file_name, rw);
+    struct ovsdb *ovsdb = ovsdb_file_read(db_file_name, rw, false);
     struct json *request = parse_json(transaction);
     struct json *result = ovsdb_execute(ovsdb, NULL, request, false,
                                         rbac_role, NULL, 0, NULL);
@@ -1038,7 +1050,7 @@ raft_record_to_standalone_log(const char *db_file_name,
 
                 check_ovsdb_error(ovsdb_log_commit_block(db_log_data));
 
-                old_db = ovsdb_file_read(db_file_name, false);
+                old_db = ovsdb_file_read(db_file_name, false, force_mode);
                 check_ovsdb_error(ovsdb_convert(old_db, schema, &new_db));
                 ovsdb_destroy(old_db);
 
