@@ -294,10 +294,39 @@ ovsdb_cs_event_destroy(struct ovsdb_cs_event *event)
         case OVSDB_CS_EVENT_TYPE_TXN_REPLY:
             jsonrpc_msg_destroy(event->txn_reply);
             break;
+
+        case OVSDB_CS_EVENT_TYPE_BINARY_UPDATE:
+            ovsdb_cs_binary_db_update_destroy(event->binary_update.du);
+            break;
         }
         free(event);
     }
 }
+
+void
+ovsdb_cs_binary_db_update_destroy(struct ovsdb_cs_binary_db_update *du)
+{
+    if (!du) {
+        return;
+    }
+    for (size_t i = 0; i < du->n; i++) {
+        struct ovsdb_cs_binary_table_update *tu = &du->table_updates[i];
+        for (size_t j = 0; j < tu->n; j++) {
+            struct ovsdb_cs_binary_row_update *ru = &tu->row_updates[j];
+            for (size_t k = 0; k < ru->n_columns; k++) {
+                free(ru->columns[k].col_name);
+                ovsdb_datum_destroy(&ru->columns[k].datum,
+                                    &ru->columns[k].col_type);
+            }
+            free(ru->columns);
+        }
+        free(tu->table_name);
+        free(tu->row_updates);
+    }
+    free(du->table_updates);
+    free(du);
+}
+
 
 /* Lifecycle. */
 
@@ -582,9 +611,9 @@ ovsdb_cs_process_response(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
     }
 }
 
-/* Process a binary ROW_BATCH frame: deserialize binary rows,
- * convert to JSON <table-updates2> format, and feed to the
- * existing update parser via a synthetic notification. */
+/* Process a binary ROW_BATCH frame: deserialize binary rows directly
+ * into ovsdb_datum values and emit a BINARY_UPDATE event, skipping
+ * the JSON intermediate representation entirely. */
 static void
 ovsdb_cs_process_binary_row_batch(struct ovsdb_cs *cs,
                                   const uint8_t *payload,
@@ -593,13 +622,6 @@ ovsdb_cs_process_binary_row_batch(struct ovsdb_cs *cs,
     struct ovsdb_binary_reader reader;
     char *table_name = NULL;
     uint16_t n_rows;
-    struct json *table_updates;
-    struct json *table_rows;
-    uint16_t i;
-    int version;
-    const char *method;
-    struct json *params;
-    struct jsonrpc_msg *synthetic;
 
     ovsdb_binary_reader_init(&reader, payload, payload_len);
 
@@ -610,92 +632,100 @@ ovsdb_cs_process_binary_row_batch(struct ovsdb_cs *cs,
         return;
     }
 
-    table_updates = json_object_create();
-    table_rows = json_object_create();
-    json_object_put(table_updates, table_name, table_rows);
-    free(table_name);
+    if (n_rows == 0) {
+        free(table_name);
+        return;
+    }
 
-    for (i = 0; i < n_rows; i++) {
-        struct uuid row_uuid;
-        uint16_t n_cols, c;
-        struct json *row_json;
-        struct json *row_update;
-        char uuid_str[UUID_LEN + 1];
+    /* Allocate binary table update. */
+    struct ovsdb_cs_binary_row_update *row_updates =
+        xmalloc(n_rows * sizeof *row_updates);
+    size_t n_parsed = 0;
 
-        if (!ovsdb_binary_reader_get_uuid(&reader, &row_uuid)
+    for (uint16_t i = 0; i < n_rows; i++) {
+        struct ovsdb_cs_binary_row_update *ru = &row_updates[i];
+        uint16_t n_cols;
+
+        if (!ovsdb_binary_reader_get_uuid(&reader, &ru->row_uuid)
             || !ovsdb_binary_reader_get_uint16(&reader, &n_cols, true)) {
             break;
         }
 
-        row_json = json_object_create();
-        for (c = 0; c < n_cols; c++) {
+        /* ROW_BATCH is used for initial snapshots where all rows are inserts.
+         * Phase D (binary UPDATE_BATCH) will read the operation type from
+         * the wire format to support modify/delete/xor. */
+        ru->type = OVSDB_CS_ROW_INSERT;
+        ru->columns = xmalloc(n_cols * sizeof *ru->columns);
+        ru->n_columns = 0;
+
+        bool row_ok = true;
+        for (uint16_t c = 0; c < n_cols; c++) {
+            struct ovsdb_cs_binary_column *bc = &ru->columns[c];
             char *col_name = NULL;
             uint8_t key_type, val_type;
-            struct ovsdb_datum datum;
-            struct ovsdb_type col_type;
 
             if (!ovsdb_binary_reader_get_string(&reader, &col_name, true)
                 || !ovsdb_binary_reader_get_uint8(&reader, &key_type)
                 || !ovsdb_binary_reader_get_uint8(&reader, &val_type)) {
                 free(col_name);
-                json_destroy(row_json);
-                goto done;
+                row_ok = false;
+                break;
             }
 
-            /* Validate type tags from wire. */
-            if (key_type >= OVSDB_N_TYPES
-                || key_type == OVSDB_TYPE_VOID) {
+            if (key_type >= OVSDB_N_TYPES || key_type == OVSDB_TYPE_VOID) {
                 free(col_name);
-                json_destroy(row_json);
-                goto done;
+                row_ok = false;
+                break;
             }
 
-            memset(&col_type, 0, sizeof col_type);
-            col_type.key.type = key_type;
-            col_type.value.type = val_type;
-            col_type.n_min = 0;
-            col_type.n_max = UINT_MAX;
+            memset(&bc->col_type, 0, sizeof bc->col_type);
+            bc->col_type.key.type = key_type;
+            bc->col_type.value.type = val_type;
+            bc->col_type.n_min = 0;
+            bc->col_type.n_max = UINT_MAX;
 
-            if (!ovsdb_binary_deserialize_datum(&reader, &datum,
-                                                &col_type, true)) {
+            if (!ovsdb_binary_deserialize_datum(&reader, &bc->datum,
+                                                &bc->col_type, true)) {
                 free(col_name);
-                json_destroy(row_json);
-                goto done;
+                row_ok = false;
+                break;
             }
 
-            json_object_put(row_json, col_name,
-                            ovsdb_datum_to_json(&datum, &col_type));
-            ovsdb_datum_destroy(&datum, &col_type);
-            free(col_name);
+            /* Transfer ownership of col_name and datum to bc. */
+            bc->col_name = col_name;
+            ru->n_columns++;
         }
 
-        row_update = json_object_create();
-        json_object_put(row_update, "initial", row_json);
-
-        snprintf(uuid_str, sizeof uuid_str,
-                 UUID_FMT, UUID_ARGS(&row_uuid));
-        json_object_put(table_rows, uuid_str, row_update);
+        if (!row_ok) {
+            /* Clean up partially parsed columns for this row. */
+            for (size_t k = 0; k < ru->n_columns; k++) {
+                free(ru->columns[k].col_name);
+                ovsdb_datum_destroy(&ru->columns[k].datum,
+                                    &ru->columns[k].col_type);
+            }
+            free(ru->columns);
+            VLOG_WARN_RL(&syntax_rl, "truncated binary ROW_BATCH: parsed "
+                         "%"PRIuSIZE" of %"PRIu16" rows for table %s",
+                         n_parsed, n_rows, table_name);
+            break;
+        }
+        n_parsed++;
     }
 
-done:
-    version = cs->data.monitor_version;
-    method = (version == 1 ? "update"
-              : version == 2 ? "update2"
-              : "update3");
+    /* Build the binary DB update with a single table. */
+    struct ovsdb_cs_binary_db_update *du = xmalloc(sizeof *du);
+    du->table_updates = xmalloc(sizeof *du->table_updates);
+    du->n = 1;
+    du->table_updates[0].table_name = table_name;
+    du->table_updates[0].row_updates = row_updates;
+    du->table_updates[0].n = n_parsed;
 
-    if (version == 3) {
-        struct json *last_id = json_string_create_nocopy(
-            xasprintf(UUID_FMT, UUID_ARGS(&cs->data.last_id)));
-        params = json_array_create_3(
-            json_clone(cs->data.monitor_id), last_id, table_updates);
-    } else {
-        params = json_array_create_2(
-            json_clone(cs->data.monitor_id), table_updates);
-    }
-
-    synthetic = jsonrpc_create_notify(method, params);
-    ovsdb_cs_db_parse_update_rpc(&cs->data, synthetic);
-    jsonrpc_msg_destroy(synthetic);
+    /* Emit a binary update event. */
+    struct ovsdb_cs_event *event = xmalloc(sizeof *event);
+    event->type = OVSDB_CS_EVENT_TYPE_BINARY_UPDATE;
+    event->binary_update.clear = false;
+    event->binary_update.du = du;
+    ovs_list_push_back(&cs->data.events, &event->list_node);
 }
 
 static void
