@@ -30,6 +30,8 @@
 #include "openvswitch/list.h"
 #include "openvswitch/shash.h"
 #include "openvswitch/uuid.h"
+#include "ovsdb-data.h"
+#include "ovsdb-types.h"
 
 struct json;
 struct jsonrpc_session_options;
@@ -70,10 +72,12 @@ struct ovsdb_cs_event {
     struct ovs_list list_node;
 
     enum ovsdb_cs_event_type {
-        OVSDB_CS_EVENT_TYPE_RECONNECT,   /* Connection lost. */
-        OVSDB_CS_EVENT_TYPE_LOCKED,      /* Got the lock we wanted. */
-        OVSDB_CS_EVENT_TYPE_UPDATE,      /* Received update notification. */
-        OVSDB_CS_EVENT_TYPE_TXN_REPLY,   /* Received reply to transaction. */
+        OVSDB_CS_EVENT_TYPE_RECONNECT,       /* Connection lost. */
+        OVSDB_CS_EVENT_TYPE_LOCKED,          /* Got the lock we wanted. */
+        OVSDB_CS_EVENT_TYPE_UPDATE,          /* Received update notification. */
+        OVSDB_CS_EVENT_TYPE_TXN_REPLY,       /* Received reply to transaction. */
+        OVSDB_CS_EVENT_TYPE_BINARY_UPDATE,   /* Binary update with pre-parsed
+                                              * datums (no JSON intermediate). */
     } type;
 
     union {
@@ -108,6 +112,14 @@ struct ovsdb_cs_event {
          * client can match 'txn_reply->id' against the ID in a transaction it
          * sent.  */
         struct jsonrpc_msg *txn_reply;
+
+        /* Binary update with pre-deserialized datums.  Skips the
+         * binary→JSON→datum round-trip by carrying ovsdb_datum values
+         * directly from the binary wire format. */
+        struct ovsdb_cs_binary_update_event {
+            bool clear;
+            struct ovsdb_cs_binary_db_update *du;
+        } binary_update;
     };
 };
 void ovsdb_cs_event_destroy(struct ovsdb_cs_event *);
@@ -207,6 +219,35 @@ void ovsdb_cs_db_update_destroy(struct ovsdb_cs_db_update *);
 const struct ovsdb_cs_table_update *ovsdb_cs_db_update_find_table(
     const struct ovsdb_cs_db_update *, const char *table_name);
 
+
+/* Binary update structures — carry pre-deserialized ovsdb_datum values
+ * directly from the binary wire format, skipping JSON intermediaries. */
+struct ovsdb_cs_binary_column {
+    char *col_name;
+    struct ovsdb_datum datum;
+    struct ovsdb_type col_type;
+};
+
+struct ovsdb_cs_binary_row_update {
+    struct uuid row_uuid;
+    enum ovsdb_cs_row_update_type type;
+    struct ovsdb_cs_binary_column *columns;
+    size_t n_columns;
+};
+
+struct ovsdb_cs_binary_table_update {
+    char *table_name;
+    struct ovsdb_cs_binary_row_update *row_updates;
+    size_t n;
+};
+
+struct ovsdb_cs_binary_db_update {
+    struct ovsdb_cs_binary_table_update *table_updates;
+    size_t n;
+};
+
+void ovsdb_cs_binary_db_update_destroy(struct ovsdb_cs_binary_db_update *);
+
 /* Simple parsing of OVSDB schemas for use by ovsdb_cs clients.  */
 
 struct shash *ovsdb_cs_parse_schema(const struct json *schema_json);

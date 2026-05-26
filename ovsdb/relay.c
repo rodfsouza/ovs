@@ -412,6 +412,11 @@ ovsdb_relay_run(void)
             case OVSDB_CS_EVENT_TYPE_LOCKED:
                 VLOG_WARN("%s: Unexpected LOCKED event.", ctx->db->name);
                 break;
+
+            case OVSDB_CS_EVENT_TYPE_BINARY_UPDATE:
+                /* Binary updates are only consumed by the IDL layer.
+                 * Relay should not receive them. */
+                break;
             }
             ovsdb_cs_event_destroy(event);
         }
