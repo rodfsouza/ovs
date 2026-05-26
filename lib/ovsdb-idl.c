@@ -156,6 +156,10 @@ static bool ovsdb_idl_modify_row(struct ovsdb_idl_row *,
                                  const struct shash *values, bool xor);
 static void ovsdb_idl_parse_update(struct ovsdb_idl *,
                                    const struct ovsdb_cs_update_event *);
+static void ovsdb_idl_process_binary_update(
+    struct ovsdb_idl *, const struct ovsdb_cs_binary_update_event *);
+static struct ovsdb_idl_row *ovsdb_idl_get_row(struct ovsdb_idl_table *,
+                                               const struct uuid *);
 static void ovsdb_idl_reparse_deleted(struct ovsdb_idl *);
 static void ovsdb_idl_reparse_refs_to_inserted(struct ovsdb_idl *);
 
@@ -482,6 +486,10 @@ ovsdb_idl_run(struct ovsdb_idl *idl)
 
         case OVSDB_CS_EVENT_TYPE_UPDATE:
             ovsdb_idl_parse_update(idl, &event->update);
+            break;
+
+        case OVSDB_CS_EVENT_TYPE_BINARY_UPDATE:
+            ovsdb_idl_process_binary_update(idl, &event->binary_update);
             break;
 
         case OVSDB_CS_EVENT_TYPE_TXN_REPLY:
@@ -1667,6 +1675,191 @@ ovsdb_idl_parse_update(struct ovsdb_idl *idl,
     ovsdb_cs_db_update_destroy(du);
     if (error) {
         log_parse_update_error(error);
+    }
+}
+
+/* Apply pre-deserialized binary column datums to a row.
+ * Parallel to ovsdb_idl_row_change() but skips JSON parsing entirely. */
+static bool
+ovsdb_idl_binary_row_change(struct ovsdb_idl_row *row,
+                            const struct ovsdb_cs_binary_row_update *ru,
+                            enum ovsdb_idl_change change)
+{
+    struct ovsdb_idl_table *table = row->table;
+    const struct ovsdb_idl_table_class *class = table->class_;
+    bool changed = false;
+
+    for (size_t i = 0; i < ru->n_columns; i++) {
+        const struct ovsdb_cs_binary_column *bc = &ru->columns[i];
+        const struct ovsdb_idl_column *column =
+            shash_find_data(&table->columns, bc->col_name);
+        if (!column) {
+            continue;
+        }
+
+        unsigned int column_idx = column - class->columns;
+        struct ovsdb_datum *old = &row->old_datum[column_idx];
+
+        struct ovsdb_datum new_datum;
+        ovsdb_datum_clone(&new_datum, &bc->datum);
+
+        bool datum_changed = false;
+        if (!ovsdb_datum_equals(old, &new_datum, &column->type)) {
+            ovsdb_datum_swap(old, &new_datum);
+            datum_changed = true;
+        }
+        ovsdb_datum_destroy(&new_datum, &column->type);
+
+        if (datum_changed && table->modes[column_idx] & OVSDB_IDL_ALERT) {
+            changed = true;
+            row->change_seqno[change]
+                = row->table->change_seqno[change]
+                = row->table->idl->change_seqno + 1;
+
+            if (table->modes[column_idx] & OVSDB_IDL_TRACK) {
+                if (ovs_list_is_empty(&row->track_node) &&
+                    ovsdb_idl_track_is_set(row->table)) {
+                    ovs_list_push_back(&row->table->track_list,
+                                       &row->track_node);
+                }
+
+                add_tracked_change_for_references(row);
+                if (!row->updated) {
+                    row->updated = bitmap_allocate(class->n_columns);
+                }
+                bitmap_set1(row->updated, column_idx);
+            }
+        }
+    }
+    return changed;
+}
+
+/* Insert row with pre-deserialized binary datums — no JSON parsing. */
+static void
+ovsdb_idl_binary_insert_row(struct ovsdb_idl_row *row,
+                            const struct ovsdb_cs_binary_row_update *ru)
+{
+    const struct ovsdb_idl_table_class *class = row->table->class_;
+
+    ovs_assert(!row->old_datum && !row->new_datum);
+    size_t datum_size = class->n_columns * sizeof *row->old_datum;
+    row->old_datum = row->new_datum = xmalloc(datum_size);
+    for (size_t i = 0; i < class->n_columns; i++) {
+        ovsdb_datum_init_default(&row->old_datum[i], &class->columns[i].type);
+    }
+    ovsdb_idl_binary_row_change(row, ru, OVSDB_IDL_CHANGE_INSERT);
+    ovsdb_idl_row_parse(row);
+    ovsdb_idl_row_mark_backrefs_for_reparsing(row);
+    ovsdb_idl_add_to_indexes(row);
+}
+
+/* Modify row with pre-deserialized binary datums — no JSON parsing. */
+static bool
+ovsdb_idl_binary_modify_row(struct ovsdb_idl_row *row,
+                            const struct ovsdb_cs_binary_row_update *ru)
+{
+    ovsdb_idl_remove_from_indexes(row);
+    ovsdb_idl_row_unparse(row);
+    ovsdb_idl_row_clear_arcs(row, true);
+    bool changed = ovsdb_idl_binary_row_change(row, ru,
+                                               OVSDB_IDL_CHANGE_MODIFY);
+    ovsdb_idl_row_parse(row);
+    ovsdb_idl_add_to_indexes(row);
+    return changed;
+}
+
+/* Process a single binary row update. */
+static enum update_result
+ovsdb_idl_process_binary_row_update(struct ovsdb_idl_table *table,
+                                    const struct ovsdb_cs_binary_row_update *ru)
+{
+    const struct uuid *uuid = &ru->row_uuid;
+    struct ovsdb_idl_row *row = ovsdb_idl_get_row(table, uuid);
+
+    switch (ru->type) {
+    case OVSDB_CS_ROW_DELETE:
+        if (row && !ovsdb_idl_row_is_orphan(row)) {
+            ovsdb_idl_delete_row(row);
+        } else {
+            VLOG_ERR_RL(&semantic_rl, "cannot delete missing row "UUID_FMT" "
+                        "from table %s", UUID_ARGS(uuid), table->class_->name);
+            return OVSDB_IDL_UPDATE_INCONSISTENT;
+        }
+        break;
+
+    case OVSDB_CS_ROW_INSERT:
+        if (!row) {
+            ovsdb_idl_binary_insert_row(ovsdb_idl_row_create(table, uuid), ru);
+        } else if (ovsdb_idl_row_is_orphan(row)) {
+            ovsdb_idl_row_untrack_change(row);
+            ovsdb_idl_row_clear_changeseqno(row);
+            ovsdb_idl_binary_insert_row(row, ru);
+        } else {
+            VLOG_ERR_RL(&semantic_rl, "cannot add existing row "UUID_FMT" to "
+                        "table %s", UUID_ARGS(uuid), table->class_->name);
+            return OVSDB_IDL_UPDATE_INCONSISTENT;
+        }
+        break;
+
+    case OVSDB_CS_ROW_UPDATE:
+        if (row && !ovsdb_idl_row_is_orphan(row)) {
+            return ovsdb_idl_binary_modify_row(row, ru)
+                   ? OVSDB_IDL_UPDATE_DB_CHANGED
+                   : OVSDB_IDL_UPDATE_NO_CHANGES;
+        } else {
+            VLOG_ERR_RL(&semantic_rl, "cannot modify missing row "UUID_FMT" "
+                        "in table %s", UUID_ARGS(uuid), table->class_->name);
+            return OVSDB_IDL_UPDATE_INCONSISTENT;
+        }
+        break;
+
+    case OVSDB_CS_ROW_XOR:
+        /* XOR (diff-apply) is not yet supported on the binary path.
+         * Phase A only handles ROW_BATCH which uses INSERT exclusively.
+         * When binary UPDATE_BATCH is added (Phase D), this will need
+         * ovsdb_datum_apply_diff_in_place() support. */
+        OVS_NOT_REACHED();
+        break;
+
+    default:
+        OVS_NOT_REACHED();
+    }
+
+    return OVSDB_IDL_UPDATE_DB_CHANGED;
+}
+
+/* Process a binary update event — pre-deserialized datums from the
+ * binary transport, bypassing JSON entirely. */
+static void
+ovsdb_idl_process_binary_update(
+    struct ovsdb_idl *idl,
+    const struct ovsdb_cs_binary_update_event *update)
+{
+    const struct ovsdb_cs_binary_db_update *du = update->du;
+
+    if (update->clear) {
+        ovsdb_idl_clear(idl);
+    }
+
+    for (size_t i = 0; i < du->n; i++) {
+        const struct ovsdb_cs_binary_table_update *tu = &du->table_updates[i];
+        struct ovsdb_idl_table *table =
+            shash_find_data(&idl->table_by_name, tu->table_name);
+        if (!table) {
+            continue;
+        }
+
+        for (size_t j = 0; j < tu->n; j++) {
+            const struct ovsdb_cs_binary_row_update *ru = &tu->row_updates[j];
+            enum update_result result =
+                ovsdb_idl_process_binary_row_update(table, ru);
+            if (result == OVSDB_IDL_UPDATE_DB_CHANGED) {
+                idl->change_seqno++;
+            } else if (result == OVSDB_IDL_UPDATE_INCONSISTENT) {
+                ovsdb_cs_flag_inconsistency(idl->cs);
+                return;
+            }
+        }
     }
 }
 
