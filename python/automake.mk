@@ -25,6 +25,8 @@ ovs_pyfiles = \
 	python/ovs/db/parser.py \
 	python/ovs/db/schema.py \
 	python/ovs/db/types.py \
+	python/ovs/db/binary_codec.py \
+	python/ovs/db/binary_protocol.py \
 	python/ovs/fatal_signal.py \
 	python/ovs/fcntl_win.py \
 	python/ovs/flow/__init__.py \
@@ -61,7 +63,8 @@ ovs_pytests = \
 	python/ovs/tests/test_kv.py \
 	python/ovs/tests/test_list.py \
 	python/ovs/tests/test_odp.py \
-	python/ovs/tests/test_ofp.py
+	python/ovs/tests/test_ofp.py \
+	python/ovs/tests/test_binary.py
 
 # These python files are used at build time but not runtime,
 # so they are not installed.
