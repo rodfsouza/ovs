@@ -133,6 +133,7 @@ DOC_SOURCE = \
 	Documentation/internals/secondary-name-index-plan.md \
 	Documentation/internals/plan-three-layer-data-access.md \
 	Documentation/internals/ovsdb-three-layer-architecture.md \
+	Documentation/internals/ovsdb-binary-transport-architecture.md \
 	Documentation/internals/contributing/index.rst \
 	Documentation/internals/contributing/backporting-patches.rst \
 	Documentation/internals/contributing/inclusive-language.rst \
