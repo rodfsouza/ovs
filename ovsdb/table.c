@@ -305,7 +305,7 @@ ovsdb_table_create(struct ovsdb_table_schema *ts)
     struct ovsdb_table *table;
     size_t i;
 
-    table = xmalloc(sizeof *table);
+    table = xzalloc(sizeof *table);
     table->schema = ts;
     table->txn_table = NULL;
     table->indexes = xmalloc(ts->n_indexes * sizeof *table->indexes);

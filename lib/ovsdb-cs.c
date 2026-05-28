@@ -724,7 +724,7 @@ ovsdb_cs_process_binary_row_batch(struct ovsdb_cs *cs,
     struct ovsdb_cs_event *event = xmalloc(sizeof *event);
     event->type = OVSDB_CS_EVENT_TYPE_BINARY_UPDATE;
     event->binary_update.clear = false;
-    event->binary_update.monitor_reply = cs->binary_initial_pending;
+    event->binary_update.monitor_reply = false;
     event->binary_update.du = du;
     ovs_list_push_back(&cs->data.events, &event->list_node);
 }
