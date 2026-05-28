@@ -611,6 +611,19 @@ ovsdb_cs_process_response(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
     }
 }
 
+/* Emit a zero-row binary update event with monitor_reply=true.
+ * Used as a sentinel when INITIAL_END arrives so the IDL increments
+ * change_seqno even for empty snapshots (mirroring the JSON path). */
+static void
+ovsdb_cs_emit_binary_initial_end_event(struct ovsdb_cs *cs)
+{
+    struct ovsdb_cs_event *event = xzalloc(sizeof *event);
+    event->type = OVSDB_CS_EVENT_TYPE_BINARY_UPDATE;
+    event->binary_update.monitor_reply = true;
+    event->binary_update.du = xzalloc(sizeof *event->binary_update.du);
+    ovs_list_push_back(&cs->data.events, &event->list_node);
+}
+
 /* Process a binary ROW_BATCH frame: deserialize binary rows directly
  * into ovsdb_datum values and emit a BINARY_UPDATE event, skipping
  * the JSON intermediate representation entirely. */
@@ -760,23 +773,7 @@ ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
             }
             if (cs->binary_initial_pending) {
                 cs->binary_initial_pending = false;
-
-                /* Emit a sentinel event so the IDL increments
-                 * change_seqno even when the initial snapshot
-                 * contains zero rows.  This mirrors the JSON path
-                 * where ovsdb_idl_parse_update() always bumps
-                 * seqno for monitor_reply=true. */
-                struct ovsdb_cs_event *end_event =
-                    xzalloc(sizeof *end_event);
-                end_event->type = OVSDB_CS_EVENT_TYPE_BINARY_UPDATE;
-                end_event->binary_update.clear = false;
-                end_event->binary_update.monitor_reply = true;
-                end_event->binary_update.du =
-                    xzalloc(sizeof *end_event->binary_update.du);
-                end_event->binary_update.du->n = 0;
-                end_event->binary_update.du->table_updates = NULL;
-                ovs_list_push_back(&cs->data.events,
-                                   &end_event->list_node);
+                ovsdb_cs_emit_binary_initial_end_event(cs);
             }
             VLOG_INFO("received binary initial snapshot complete");
         } else if (msg->binary_msg_type == OVSDB_BIN_UPDATE_BATCH

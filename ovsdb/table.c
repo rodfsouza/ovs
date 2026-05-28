@@ -318,8 +318,11 @@ ovsdb_table_create(struct ovsdb_table_schema *ts)
     table->disk_store = NULL;
     table->bloom = NULL;
     table->name_index = NULL;
+
+    /* Three-layer data access (Phase 4). */
     table->storage_engine = NULL;
     table->index_set = NULL;
+
     table->db = NULL;
 
     return table;
