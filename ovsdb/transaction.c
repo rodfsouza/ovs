@@ -169,8 +169,14 @@ ovsdb_txn_row_abort(struct ovsdb_txn *txn OVS_UNUSED,
             hmap_remove(&new->table->rows, &new->hmap_node);
         }
     } else if (!new) {
-        hmap_insert(&old->table->rows, &old->hmap_node, ovsdb_row_hash(old));
+        /* Delete abort: re-insert old.  For disk/cache rows that
+         * were never in table->rows, this materializes them. */
+        if (!ovsdb_table_contains_row(old->table, old)) {
+            hmap_insert(&old->table->rows, &old->hmap_node,
+                        ovsdb_row_hash(old));
+        }
     } else {
+        /* Modify abort: new was inserted by modify, replace with old. */
         hmap_replace(&new->table->rows, &new->hmap_node, &old->hmap_node);
     }
 
@@ -1618,7 +1624,17 @@ ovsdb_txn_row_modify(struct ovsdb_txn *txn, const struct ovsdb_row *ro_row_,
             *diff = ovsdb_row_create(table);
         }
         ovsdb_txn_row_create(txn, table, ro_row, *rw_row, diff ? *diff : NULL);
-        hmap_replace(&table->rows, &ro_row->hmap_node, &(*rw_row)->hmap_node);
+
+        /* In disk-store mode, the row may come from cache/disk and
+         * not be in table->rows.  Insert the clone if so; otherwise
+         * replace the original as before. */
+        if (ovsdb_table_contains_row(table, ro_row)) {
+            hmap_replace(&table->rows, &ro_row->hmap_node,
+                         &(*rw_row)->hmap_node);
+        } else {
+            hmap_insert(&table->rows, &(*rw_row)->hmap_node,
+                        ovsdb_row_hash(*rw_row));
+        }
     }
 }
 
@@ -1643,7 +1659,11 @@ ovsdb_txn_row_delete(struct ovsdb_txn *txn, const struct ovsdb_row *row_)
     struct ovsdb_table *table = row->table;
     struct ovsdb_txn_row *txn_row = row->txn_row;
 
-    hmap_remove(&table->rows, &row->hmap_node);
+    /* In disk-store mode, the row may come from cache/disk and
+     * not be in table->rows.  Only remove if present. */
+    if (ovsdb_table_contains_row(table, row)) {
+        hmap_remove(&table->rows, &row->hmap_node);
+    }
 
     if (!txn_row) {
         ovsdb_txn_row_create(txn, table, row, NULL, NULL);

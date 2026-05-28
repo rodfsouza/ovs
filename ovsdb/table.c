@@ -544,6 +544,25 @@ table_rows_contains(const struct ovsdb_table *table,
     return false;
 }
 
+/* Returns true if the exact row pointer 'row' is in table->rows.
+ * Used by the transaction layer to detect disk-store/cached rows
+ * that have not been materialized into the in-memory working set. */
+bool
+ovsdb_table_contains_row(const struct ovsdb_table *table,
+                         const struct ovsdb_row *row)
+{
+    const struct ovsdb_row *r;
+
+    HMAP_FOR_EACH_WITH_HASH (r, hmap_node,
+                             uuid_hash(ovsdb_row_get_uuid(row)),
+                             &table->rows) {
+        if (r == row) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Iterates every row logically present in 'table'.  See the header
  * comment in table.h for the full lifetime contract.
  *
@@ -709,14 +728,19 @@ ovsdb_table_query(struct ovsdb_table *table,
             continue;
         }
 
-        /* Match: yield to callback, then cache. */
+        /* Match: yield to callback, then manage lifecycle. */
         bool cont = cb(disk_row, aux);
 
-        if (table->cache) {
-            size_t n_atoms = ovsdb_row_count_atoms(disk_row);
-            ovsdb_row_cache_insert(table->cache, disk_row, n_atoms);
-        } else {
-            ovsdb_row_destroy(disk_row);
+        /* If the callback claimed the row for a transaction
+         * (modify/delete), the transaction owns disk_row as
+         * txn_row->old.  Don't cache or destroy it. */
+        if (!disk_row->txn_row) {
+            if (table->cache) {
+                size_t n_atoms = ovsdb_row_count_atoms(disk_row);
+                ovsdb_row_cache_insert(table->cache, disk_row, n_atoms);
+            } else {
+                ovsdb_row_destroy(disk_row);
+            }
         }
 
         if (!cont) {
