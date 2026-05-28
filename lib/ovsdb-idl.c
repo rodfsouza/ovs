@@ -1837,6 +1837,13 @@ ovsdb_idl_process_binary_update(
 {
     const struct ovsdb_cs_binary_db_update *du = update->du;
 
+    if (update->monitor_reply) {
+        /* Match the JSON path: always increment change_seqno for the
+         * initial monitor reply so ovsdb_idl_has_ever_connected()
+         * returns true even when the snapshot contains zero rows. */
+        idl->change_seqno++;
+    }
+
     if (update->clear) {
         ovsdb_idl_clear(idl);
     }

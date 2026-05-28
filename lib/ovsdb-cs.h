@@ -118,6 +118,7 @@ struct ovsdb_cs_event {
          * directly from the binary wire format. */
         struct ovsdb_cs_binary_update_event {
             bool clear;
+            bool monitor_reply;
             struct ovsdb_cs_binary_db_update *du;
         } binary_update;
     };

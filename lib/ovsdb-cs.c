@@ -724,6 +724,7 @@ ovsdb_cs_process_binary_row_batch(struct ovsdb_cs *cs,
     struct ovsdb_cs_event *event = xmalloc(sizeof *event);
     event->type = OVSDB_CS_EVENT_TYPE_BINARY_UPDATE;
     event->binary_update.clear = false;
+    event->binary_update.monitor_reply = cs->binary_initial_pending;
     event->binary_update.du = du;
     ovs_list_push_back(&cs->data.events, &event->list_node);
 }
@@ -759,12 +760,23 @@ ovsdb_cs_process_msg(struct ovsdb_cs *cs, struct jsonrpc_msg *msg)
             }
             if (cs->binary_initial_pending) {
                 cs->binary_initial_pending = false;
-                /* All ROW_BATCH events are accumulated in
-                 * cs->data.events.  Now that binary_initial_pending
-                 * is false, the next ovsdb_cs_run() iteration will
-                 * flush them to the caller.  The IDL will then
-                 * process the complete initial snapshot and report
-                 * has_ever_connected to the application. */
+
+                /* Emit a sentinel event so the IDL increments
+                 * change_seqno even when the initial snapshot
+                 * contains zero rows.  This mirrors the JSON path
+                 * where ovsdb_idl_parse_update() always bumps
+                 * seqno for monitor_reply=true. */
+                struct ovsdb_cs_event *end_event =
+                    xzalloc(sizeof *end_event);
+                end_event->type = OVSDB_CS_EVENT_TYPE_BINARY_UPDATE;
+                end_event->binary_update.clear = false;
+                end_event->binary_update.monitor_reply = true;
+                end_event->binary_update.du =
+                    xzalloc(sizeof *end_event->binary_update.du);
+                end_event->binary_update.du->n = 0;
+                end_event->binary_update.du->table_updates = NULL;
+                ovs_list_push_back(&cs->data.events,
+                                   &end_event->list_node);
             }
             VLOG_INFO("received binary initial snapshot complete");
         } else if (msg->binary_msg_type == OVSDB_BIN_UPDATE_BATCH
