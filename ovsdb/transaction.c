@@ -169,14 +169,8 @@ ovsdb_txn_row_abort(struct ovsdb_txn *txn OVS_UNUSED,
             hmap_remove(&new->table->rows, &new->hmap_node);
         }
     } else if (!new) {
-        /* Delete abort: re-insert old.  For disk/cache rows that
-         * were never in table->rows, this materializes them. */
-        if (!ovsdb_table_contains_row(old->table, old)) {
-            hmap_insert(&old->table->rows, &old->hmap_node,
-                        ovsdb_row_hash(old));
-        }
+        hmap_insert(&old->table->rows, &old->hmap_node, ovsdb_row_hash(old));
     } else {
-        /* Modify abort: new was inserted by modify, replace with old. */
         hmap_replace(&new->table->rows, &new->hmap_node, &old->hmap_node);
     }
 
@@ -547,7 +541,11 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
 
         for (i = 0; i < n_indexes; i++) {
             struct hmap_node *node = ovsdb_row_get_index_node(txn_row->old, i);
-            hmap_remove(&txn_row->table->indexes[i], node);
+            /* Skip nodes that were never indexed (materialized rows
+             * from disk/cache have nullified index nodes). */
+            if (!hmap_node_is_null(node)) {
+                hmap_remove(&txn_row->table->indexes[i], node);
+            }
         }
     }
     if (txn_row->new) {
@@ -561,20 +559,14 @@ ovsdb_txn_row_commit(struct ovsdb_txn *txn OVS_UNUSED,
 
     ovsdb_txn_row_log(txn_row);
 
-    /* Phase 1: Update cache FIRST so stale entries are removed
-     * before the disk store marks the row as deleted.  This
-     * prevents a window where cache serves a row that disk
-     * considers deleted. */
-    if (txn_row->table->cache) {
-        if (txn_row->old) {
-            ovsdb_row_cache_unpin(txn_row->table->cache,
-                                  ovsdb_row_get_uuid(txn_row->old));
-            if (!txn_row->new) {
-                ovsdb_row_cache_remove(
-                    txn_row->table->cache,
-                    ovsdb_row_get_uuid(txn_row->old));
-            }
-        }
+    /* Invalidate stale cache entries for both MODIFY and DELETE.
+     * The disk write-back below persists the new value; the next
+     * read will re-populate the cache from disk. */
+    if (txn_row->table->cache && txn_row->old) {
+        ovsdb_row_cache_unpin(txn_row->table->cache,
+                              ovsdb_row_get_uuid(txn_row->old));
+        ovsdb_row_cache_remove(txn_row->table->cache,
+                               ovsdb_row_get_uuid(txn_row->old));
     }
 
     /* Update secondary name index BEFORE disk store write-back.
@@ -1615,12 +1607,9 @@ ovsdb_txn_row_modify(struct ovsdb_txn *txn, const struct ovsdb_row *ro_row_,
     } else {
         struct ovsdb_table *table = ro_row->table;
 
-        /* Pin the row in cache to prevent eviction during
-         * the transaction (Phase 1). */
-        if (table->cache) {
-            ovsdb_row_cache_pin(table->cache,
-                                ovsdb_row_get_uuid(ro_row));
-        }
+        /* Materialize disk/cache rows into table->rows so
+         * hmap_replace and commit cleanup work correctly. */
+        ro_row = ovsdb_table_materialize_row(table, ro_row);
 
         *rw_row = ovsdb_row_clone(ro_row);
         (*rw_row)->n_refs = ro_row->n_refs;
@@ -1628,17 +1617,7 @@ ovsdb_txn_row_modify(struct ovsdb_txn *txn, const struct ovsdb_row *ro_row_,
             *diff = ovsdb_row_create(table);
         }
         ovsdb_txn_row_create(txn, table, ro_row, *rw_row, diff ? *diff : NULL);
-
-        /* In disk-store mode, the row may come from cache/disk and
-         * not be in table->rows.  Insert the clone if so; otherwise
-         * replace the original as before. */
-        if (ovsdb_table_contains_row(table, ro_row)) {
-            hmap_replace(&table->rows, &ro_row->hmap_node,
-                         &(*rw_row)->hmap_node);
-        } else {
-            hmap_insert(&table->rows, &(*rw_row)->hmap_node,
-                        ovsdb_row_hash(*rw_row));
-        }
+        hmap_replace(&table->rows, &ro_row->hmap_node, &(*rw_row)->hmap_node);
     }
 }
 
@@ -1663,11 +1642,10 @@ ovsdb_txn_row_delete(struct ovsdb_txn *txn, const struct ovsdb_row *row_)
     struct ovsdb_table *table = row->table;
     struct ovsdb_txn_row *txn_row = row->txn_row;
 
-    /* In disk-store mode, the row may come from cache/disk and
-     * not be in table->rows.  Only remove if present. */
-    if (ovsdb_table_contains_row(table, row)) {
-        hmap_remove(&table->rows, &row->hmap_node);
-    }
+    /* Materialize disk/cache rows into table->rows. */
+    row = ovsdb_table_materialize_row(table, row);
+
+    hmap_remove(&table->rows, &row->hmap_node);
 
     if (!txn_row) {
         ovsdb_txn_row_create(txn, table, row, NULL, NULL);
