@@ -53,12 +53,6 @@ void ovsdb_row_cache_insert(struct ovsdb_row_cache *,
 void ovsdb_row_cache_remove(struct ovsdb_row_cache *,
                             const struct uuid *);
 
-/* Removes the entry for 'uuid' from the cache and returns the row
- * without destroying it.  Ownership transfers to the caller.
- * Returns NULL if no such entry exists. */
-struct ovsdb_row *ovsdb_row_cache_steal(struct ovsdb_row_cache *,
-                                        const struct uuid *);
-
 /* Pinning (prevents eviction). */
 void ovsdb_row_cache_pin(struct ovsdb_row_cache *,
                          const struct uuid *);

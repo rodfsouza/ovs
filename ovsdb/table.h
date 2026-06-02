@@ -99,8 +99,8 @@ bool ovsdb_table_is_logging_enabled(struct ovsdb_table *table);
 
 const struct ovsdb_row *ovsdb_table_get_row(const struct ovsdb_table *,
                                             const struct uuid *);
-struct ovsdb_row *ovsdb_table_materialize_row(struct ovsdb_table *,
-                                              const struct ovsdb_row *);
+bool ovsdb_table_contains_row(const struct ovsdb_table *,
+                              const struct ovsdb_row *);
 
 /* Row iteration callback.  Return true to continue, false to stop. */
 typedef bool (*ovsdb_table_row_cb)(const struct ovsdb_row *row, void *aux);

@@ -544,59 +544,23 @@ table_rows_contains(const struct ovsdb_table *table,
     return false;
 }
 
-/* Materializes a row from disk/cache into table->rows.
- *
- * If the row is already in table->rows, returns it unchanged.
- * Otherwise: steals the row from cache (if present) or clones it,
- * nullifies its index hmap_nodes (so the commit path can detect
- * them), inserts it into table->rows, and returns the now-owned
- * row pointer.
- *
- * After this call, the row can be safely passed to
- * ovsdb_txn_row_modify() / ovsdb_txn_row_delete(). */
-struct ovsdb_row *
-ovsdb_table_materialize_row(struct ovsdb_table *table,
-                            const struct ovsdb_row *row)
+/* Returns true if the exact row pointer 'row' is in table->rows.
+ * Used by the transaction layer to detect disk-store/cached rows
+ * that have not been materialized into the in-memory working set. */
+bool
+ovsdb_table_contains_row(const struct ovsdb_table *table,
+                         const struct ovsdb_row *row)
 {
-    const struct uuid *uuid = ovsdb_row_get_uuid(row);
-    uint32_t hash = uuid_hash(uuid);
-    struct ovsdb_row *r;
+    const struct ovsdb_row *r;
 
-    /* Already in table->rows? */
-    HMAP_FOR_EACH_WITH_HASH (r, hmap_node, hash, &table->rows) {
+    HMAP_FOR_EACH_WITH_HASH (r, hmap_node,
+                             uuid_hash(ovsdb_row_get_uuid(row)),
+                             &table->rows) {
         if (r == row) {
-            return CONST_CAST(struct ovsdb_row *, row);
+            return true;
         }
     }
-
-    /* Steal from cache (transfers ownership without destroying). */
-    struct ovsdb_row *materialized = NULL;
-    if (table->cache) {
-        materialized = ovsdb_row_cache_steal(table->cache, uuid);
-    }
-
-    /* If not in cache (or no cache), clone. */
-    if (!materialized) {
-        materialized = ovsdb_row_clone(row);
-    }
-
-    /* Nullify index hmap_nodes so the commit path knows this
-     * row was never inserted into table->indexes[]. */
-    {
-        size_t n_fields = shash_count(&table->schema->columns);
-        size_t n_indexes = table->schema->n_indexes;
-        for (size_t i = 0; i < n_indexes; i++) {
-            struct hmap_node *node = (void *) (
-                (char *) materialized
-                + offsetof(struct ovsdb_row, fields)
-                + n_fields * sizeof(struct ovsdb_datum)
-                + i * sizeof(struct hmap_node));
-            hmap_node_nullify(node);
-        }
-    }
-
-    hmap_insert(&table->rows, &materialized->hmap_node, hash);
-    return materialized;
+    return false;
 }
 
 /* Iterates every row logically present in 'table'.  See the header
