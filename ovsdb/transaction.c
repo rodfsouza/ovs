@@ -662,9 +662,13 @@ ovsdb_txn_update_weak_refs(struct ovsdb_txn *txn OVS_UNUSED,
                     ovsdb_table_get_row(weak->dst_table, &weak->dst));
         if (dst_row) {
             dst_weak = ovsdb_row_find_weak_ref(dst_row, weak);
-            hmap_remove(&dst_row->dst_refs, &dst_weak->dst_node);
-            ovs_assert(ovs_list_is_empty(&dst_weak->src_node));
-            ovsdb_weak_ref_destroy(dst_weak);
+            if (dst_weak) {
+                hmap_remove(&dst_row->dst_refs, &dst_weak->dst_node);
+                ovs_assert(ovs_list_is_empty(&dst_weak->src_node));
+                ovsdb_weak_ref_destroy(dst_weak);
+            }
+            /* else: row was reloaded from disk/cache with empty
+             * dst_refs — the weak ref was already lost. */
         }
         ovs_list_remove(&weak->src_node);
         ovs_list_init(&weak->src_node);
