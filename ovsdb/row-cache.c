@@ -843,6 +843,26 @@ ovsdb_row_cache_remove(struct ovsdb_row_cache *cache,
     ovsdb_row_cache_wrunlock_if_needed__(cache, locked);
 }
 
+/* Removes the entry for 'uuid' and returns the row without destroying
+ * it.  Ownership transfers to the caller.  Returns NULL if not found. */
+struct ovsdb_row *
+ovsdb_row_cache_steal(struct ovsdb_row_cache *cache,
+                      const struct uuid *uuid)
+{
+    struct ovsdb_row *row = NULL;
+    bool locked = ovsdb_row_cache_wrlock_if_needed__(cache);
+
+    struct ovsdb_row_cache_entry *entry = ovsdb_row_cache_find__(cache, uuid);
+    if (entry && entry->row) {
+        row = entry->row;
+        entry->row = NULL;  /* Prevent evict_entry__ from destroying it. */
+        ovsdb_row_cache_evict_entry__(cache, entry);
+    }
+
+    ovsdb_row_cache_wrunlock_if_needed__(cache, locked);
+    return row;
+}
+
 /* ------------------------------------------------------------------
  * Pinning.
  * ------------------------------------------------------------------ */
